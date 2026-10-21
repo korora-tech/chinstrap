@@ -60,8 +60,11 @@ impl AppShell {
     /// ("Finalizing…"); the studio closes it on the Idle Snapshot or after 10 s.
     pub fn install_close_handler(&self, window: &mut Window, cx: &mut Context<Self>) {
         let studio = self.studio.clone();
-        window.on_window_should_close(cx, move |_window, cx| {
+        let shell = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
             if studio.read(cx).is_busy() {
+                // The "Finalizing…" overlay lives in the studio: make sure it is on screen.
+                let _ = shell.update(cx, |shell, cx| shell.show(Screen::Studio, window, cx));
                 studio.update(cx, |s, cx| s.request_close(CloseIntent::CloseWindow, cx));
                 false
             } else {
@@ -79,8 +82,10 @@ impl AppShell {
         cx.notify();
     }
 
-    fn quit(&mut self, _: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
+    fn quit(&mut self, _: &Quit, window: &mut Window, cx: &mut Context<Self>) {
         if self.studio.read(cx).is_busy() {
+            // The "Finalizing…" overlay lives in the studio: make sure it is on screen.
+            self.show(Screen::Studio, window, cx);
             self.studio
                 .update(cx, |s, cx| s.request_close(CloseIntent::QuitApp, cx));
         } else {
@@ -142,7 +147,11 @@ impl Render for AppShell {
         };
         div()
             .key_context("Shell")
-            .track_focus(&self.focus_handle)
+            // Only while the explorer is shown: on the Studio screen a click on the header would
+            // otherwise move focus off the studio and silently disable r/c.
+            .when(self.screen == Screen::Explorer, |d| {
+                d.track_focus(&self.focus_handle)
+            })
             .on_action(cx.listener(Self::quit))
             .on_action(
                 cx.listener(|this, _: &ShowStudio, window, cx| {

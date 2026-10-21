@@ -41,6 +41,8 @@ pub struct StudioView {
     focus_handle: FocusHandle,
     scroll: ScrollHandle,
     close_pending: Option<CloseIntent>,
+    /// The Recording segment a close-driven Stop was already sent for (no duplicate Stops).
+    stop_sent_for: Option<u32>,
     _events: Task<()>,
     _ticker: Option<Task<()>>,
 }
@@ -75,6 +77,7 @@ impl StudioView {
             focus_handle: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             close_pending: None,
+            stop_sent_for: None,
             _events,
             _ticker: None,
         }
@@ -97,9 +100,7 @@ impl StudioView {
             _ => CloseIntent::CloseWindow,
         });
         // Stop is only accepted while Recording; Starting/Cutting are followed up in `apply`.
-        if matches!(self.phase(), Some(Phase::Recording { .. })) {
-            self.engine.send(EngineCommand::Stop);
-        }
+        self.send_close_stop();
         if first {
             cx.spawn(async move |this, cx| {
                 cx.background_executor().timer(CLOSE_FALLBACK).await;
@@ -125,6 +126,16 @@ impl StudioView {
         }
     }
 
+    /// Sends Stop for the current Recording segment, at most once per segment.
+    fn send_close_stop(&mut self) {
+        if let Some(Phase::Recording { segment, .. }) = self.phase()
+            && self.stop_sent_for != Some(*segment)
+        {
+            self.stop_sent_for = Some(*segment);
+            self.engine.send(EngineCommand::Stop);
+        }
+    }
+
     fn phase(&self) -> Option<&Phase> {
         self.snap.as_ref().map(|s| &s.phase)
     }
@@ -145,12 +156,13 @@ impl StudioView {
                 let idle = snap.phase == Phase::Idle;
                 self.snap = Some(snap);
                 if idle {
+                    self.stop_sent_for = None;
                     if let Some(intent) = self.close_pending.take() {
                         self.finish_close(intent, cx);
                     }
                 } else if recording && self.close_pending.is_some() {
                     // Close was requested during Starting/Cutting, where Stop is rejected.
-                    self.engine.send(EngineCommand::Stop);
+                    self.send_close_stop();
                 }
             }
             EngineEvent::Notice(notice) => {
