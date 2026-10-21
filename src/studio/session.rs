@@ -56,6 +56,9 @@ pub struct ManifestInput {
     pub capture: Option<u32>,
     pub width: Option<i32>,
     pub height: Option<i32>,
+    /// Recorded frame rate, e.g. "25/1" (video only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub framerate: Option<String>,
     pub first_pts_ns: Option<u64>,
     pub last_pts_ns: Option<u64>,
     /// "starting" | "recording" | "finalizing" | "complete" | "failed"
@@ -234,6 +237,7 @@ mod tests {
                 capture: None,
                 width: Some(1280),
                 height: Some(720),
+                framerate: Some("30/1".into()),
                 first_pts_ns: Some(1),
                 last_pts_ns: Some(2),
                 status: "complete".into(),

@@ -38,10 +38,20 @@ fn even_up(v: f64) -> i32 {
 /// Size lock (§5.2): round down to even, fit within 3840×2160 keeping the aspect ratio, then
 /// scale up (keeping the aspect ratio) so that both sides are at least 128. Always even.
 pub fn lock_size(width: i32, height: i32) -> (i32, i32) {
+    lock_size_within(width, height, MAX_W, MAX_H)
+}
+
+/// As [`lock_size`], fitting within `max_w`×`max_h` instead of 3840×2160 (cameras allow DCI
+/// 4096×2160; an encoder that cannot do 4K lowers it).
+pub fn lock_size_within(width: i32, height: i32, max_w: i32, max_h: i32) -> (i32, i32) {
+    let (max_w, max_h) = (
+        even_down(max_w.max(MIN_SIDE)),
+        even_down(max_h.max(MIN_SIDE)),
+    );
     let (mut w, mut h) = (even_down(width) as f64, even_down(height) as f64);
     let aspect = w / h;
-    if w > MAX_W as f64 || h > MAX_H as f64 {
-        let scale = (MAX_W as f64 / w).min(MAX_H as f64 / h);
+    if w > max_w as f64 || h > max_h as f64 {
+        let scale = (max_w as f64 / w).min(max_h as f64 / h);
         w *= scale;
         h *= scale;
     }
@@ -56,8 +66,8 @@ pub fn lock_size(width: i32, height: i32) -> (i32, i32) {
             w = even_up(MIN_SIDE as f64 * aspect).max(MIN_SIDE);
         }
         // An extreme aspect ratio could exceed the cap again; clamp (letterboxing absorbs it).
-        w = w.min(MAX_W);
-        h = h.min(MAX_H);
+        w = w.min(max_w);
+        h = h.min(max_h);
     }
     (w, h)
 }
@@ -163,9 +173,26 @@ fn running_now(clock: &gst::Clock, base: &AtomicU64) -> Option<u64> {
 }
 
 /// Installs the video stamp probe (§5.0) on a pipewiresrc src pad.
-pub fn install_video(pad: &gst::Pad, clock: gst::Clock, base: Arc<AtomicU64>) {
+///
+/// Buffers flagged CORRUPTED are dropped: pipewiresrc sets the flag for truncated frames (a UVC
+/// camera's first 4K NV12 frames arrive as ~98 KB of a 12.4 MB frame), and vah264enc fails
+/// fatally ("Failed to import the input frame") on them. videorate fills the gap.
+///
+/// `deep_copy` (system-memory camera frames): each frame is copied out of PipeWire's buffer
+/// right here, so the camera's few capture buffers are returned at once. Holding them in the
+/// chain's queues starves a UVC camera at 4K (it then delivers only truncated frames).
+pub fn install_video(pad: &gst::Pad, clock: gst::Clock, base: Arc<AtomicU64>, deep_copy: bool) {
     let state = Mutex::new(VideoStamp::default());
     pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        if info
+            .buffer()
+            .is_some_and(|b| b.flags().contains(gst::BufferFlags::CORRUPTED))
+        {
+            return gst::PadProbeReturn::Drop;
+        }
+        if deep_copy && let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut() {
+            *buffer = buffer.copy_deep().unwrap_or_else(|_| buffer.clone());
+        }
         let Some(running) = running_now(&clock, &base) else {
             return gst::PadProbeReturn::Drop;
         };
@@ -273,6 +300,7 @@ pub fn install_audio(pad: &gst::Pad, clock: gst::Clock, base: Arc<AtomicU64>) {
 pub fn install_size_lock(
     pad: &gst::Pad,
     outcaps: gst::Element,
+    max: (i32, i32),
     make_caps: impl Fn(i32, i32) -> gst::Caps + Send + Sync + 'static,
     locked: SizeSlot,
 ) {
@@ -285,7 +313,7 @@ pub fn install_size_lock(
                 && let Some(s) = c.caps().structure(0)
                 && let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height"))
             {
-                let (lw, lh) = lock_size(w, h);
+                let (lw, lh) = lock_size_within(w, h, max.0, max.1);
                 outcaps.set_property("caps", make_caps(lw, lh));
                 *slot = Some((lw, lh));
             }
@@ -347,6 +375,14 @@ mod tests {
         let (w, h) = lock_size(5000, 1000);
         assert!(w <= MAX_W && h <= MAX_H && w % 2 == 0 && h % 2 == 0);
         assert_eq!(w, 3840);
+    }
+
+    #[test]
+    fn size_lock_within_custom_max() {
+        assert_eq!(lock_size_within(4096, 2160, 4096, 2160), (4096, 2160));
+        assert_eq!(lock_size_within(4096, 2160, 3840, 2160), (3840, 2024));
+        assert_eq!(lock_size_within(3840, 2160, 1920, 1080), (1920, 1080));
+        assert_eq!(lock_size_within(6144, 3456, 4096, 2160), (3840, 2160));
     }
 
     #[test]

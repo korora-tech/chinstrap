@@ -10,78 +10,259 @@ use gstreamer::prelude::*;
 
 use super::types::{DeviceId, DeviceInfo, DeviceKind};
 
-/// How a camera's frames are brought into the video chain.
+/// Largest camera mode recorded without downscaling (DCI 4K width, UHD height).
+pub const CAMERA_MAX_W: i32 = 4096;
+pub const CAMERA_MAX_H: i32 = 2160;
+/// Size picked from a width/height *range* (virtual/loopback sources that accept any size, so
+/// there is no native size): a conservative 1080p rather than making the producer scale to 4K.
+const RANGE_W: i32 = 1920;
+const RANGE_H: i32 = 1080;
+/// Rate picked from a framerate *range* (no native rate): at most 30 fps.
+const RANGE_MAX_FPS: i32 = 30;
+/// Highest frame rate recorded; faster modes are rated down to this.
+pub const CAMERA_MAX_FPS: i32 = 60;
+/// Modes at or above this rate are preferred over any slower mode, whatever its size.
+const SMOOTH_FPS_MILLI: i64 = 23_900;
+
+/// How a camera's frames reach the video chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CameraPath {
+    /// DMA-BUF raw video: GPU convert block.
+    DmaBuf,
+    /// MJPEG: jpegparse ! jpegdec.
+    Jpeg,
+    /// System-memory raw video.
+    Raw,
+}
+
+/// One concrete camera mode: what is recorded, at the camera's native size and rate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CameraMode {
+    pub path: CameraPath,
+    /// Raw `format` (Raw) or `drm-format` (DmaBuf), when the device fixes one.
+    pub format: Option<String>,
+    pub width: i32,
+    pub height: i32,
+    pub fps_n: i32,
+    pub fps_d: i32,
+}
+
+impl CameraMode {
+    fn fps_milli(&self) -> i64 {
+        if self.fps_d <= 0 {
+            return 0;
+        }
+        self.fps_n as i64 * 1000 / self.fps_d as i64
+    }
+
+    /// Capsfilter right after the camera source: exactly this mode.
+    pub fn source_caps(&self) -> String {
+        let mut geometry = format!("width={},height={}", self.width, self.height);
+        if self.fps_n > 0 {
+            geometry.push_str(&format!(",framerate={}/{}", self.fps_n, self.fps_d));
+        }
+        match self.path {
+            CameraPath::Raw => match &self.format {
+                Some(f) => format!("video/x-raw,format={f},{geometry}"),
+                None => format!("video/x-raw,{geometry}"),
+            },
+            CameraPath::Jpeg => format!("image/jpeg,{geometry}"),
+            CameraPath::DmaBuf => match &self.format {
+                Some(f) => {
+                    format!("video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={f},{geometry}")
+                }
+                None => format!("video/x-raw(memory:DMABuf),format=DMA_DRM,{geometry}"),
+            },
+        }
+    }
+
+    /// Recorded frame rate: native, capped at 60 fps (30 fps when the device gives no rate).
+    pub fn output_fps(&self) -> (i32, i32) {
+        if self.fps_n <= 0 {
+            (30, 1)
+        } else if self.fps_milli() > CAMERA_MAX_FPS as i64 * 1000 {
+            (CAMERA_MAX_FPS, 1)
+        } else {
+            (self.fps_n, self.fps_d.max(1))
+        }
+    }
+
+    /// Recorded size: native, fitted within 4096×2160 only when larger.
+    pub fn output_size(&self) -> (i32, i32) {
+        super::stamp::lock_size_within(self.width, self.height, CAMERA_MAX_W, CAMERA_MAX_H)
+    }
+
+    /// UI label, e.g. "3840×2160 @25 · NV12" or "1920×1080 @30 · MJPEG".
+    pub fn label(&self) -> String {
+        let (w, h) = self.output_size();
+        let (n, d) = self.output_fps();
+        let fps = if d == 1 {
+            format!("{n}")
+        } else {
+            format!("{:.2}", n as f64 / d as f64)
+        };
+        let what = match (self.path, &self.format) {
+            (CameraPath::Raw, Some(f)) => f.clone(),
+            (CameraPath::Raw, None) => "raw".into(),
+            (CameraPath::Jpeg, _) => "MJPEG".into(),
+            (CameraPath::DmaBuf, Some(f)) => format!("DMA-BUF {f}"),
+            (CameraPath::DmaBuf, None) => "DMA-BUF".into(),
+        };
+        format!("{w}×{h} @{fps} · {what}")
+    }
+}
+
+/// How a camera is recorded: the chosen mode, or why it cannot be.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CameraClass {
-    /// Plain raw video. `any_rate`: rule 3 (no 720p24 mode, use whatever it offers).
-    Raw {
-        any_rate: bool,
-    },
-    Jpeg,
-    DmaBuf,
+    Usable(CameraMode),
     Unsupported(String),
 }
 
 impl CameraClass {
-    /// Capsfilter right after the camera source.
-    pub fn source_caps(&self) -> Option<&'static str> {
+    pub fn mode(&self) -> Option<&CameraMode> {
         match self {
-            CameraClass::Raw { any_rate: false } => {
-                Some("video/x-raw,width=[1,1920],height=[1,1080],framerate=[24/1,30/1]")
-            }
-            CameraClass::Raw { any_rate: true } => {
-                Some("video/x-raw,width=[1,1920],height=[1,1080],framerate=[1/1,30/1]")
-            }
-            CameraClass::Jpeg => Some("image/jpeg,width=[1,1920],height=[1,1080]"),
-            CameraClass::DmaBuf => Some("video/x-raw(memory:DMABuf),format=DMA_DRM; video/x-raw"),
+            CameraClass::Usable(m) => Some(m),
             CameraClass::Unsupported(_) => None,
         }
     }
 }
 
-fn int_max(v: &glib::SendValue) -> Option<i32> {
+/// Candidate values of an int field: fixed values and list entries as-is; a range contributes
+/// its largest value not above `target` (or its minimum when the whole range is above it).
+fn int_candidates(v: &glib::SendValue, target: i32) -> Vec<i32> {
     if let Ok(i) = v.get::<i32>() {
-        return Some(i);
+        return vec![i];
     }
     if let Ok(r) = v.get::<gst::IntRange<i32>>() {
-        return Some(r.max());
+        let step = r.step().max(1);
+        let pick = if r.max() <= target {
+            r.max()
+        } else if r.min() <= target {
+            r.min() + (target - r.min()) / step * step
+        } else {
+            r.min()
+        };
+        return vec![pick];
     }
     if let Ok(l) = v.get::<gst::List>() {
-        return l.iter().filter_map(int_max).max();
+        return l.iter().flat_map(|x| int_candidates(x, target)).collect();
     }
-    None
+    Vec::new()
 }
 
-fn frac_max(v: &glib::SendValue) -> Option<f64> {
-    let f = |x: gst::Fraction| {
-        if x.denom() == 0 {
-            0.0
-        } else {
-            x.numer() as f64 / x.denom() as f64
-        }
-    };
-    if let Ok(x) = v.get::<gst::Fraction>() {
-        return Some(f(x));
+/// Candidate frame rates: fixed values and list entries as-is; a range (no native rate)
+/// contributes its largest rate not above 30 fps (or its minimum when the whole range is faster).
+fn fps_candidates(v: &glib::SendValue) -> Vec<(i32, i32)> {
+    let as_pair = |f: gst::Fraction| (f.numer(), f.denom());
+    if let Ok(f) = v.get::<gst::Fraction>() {
+        return vec![as_pair(f)];
     }
     if let Ok(r) = v.get::<gst::FractionRange>() {
-        return Some(f(r.max()));
+        let cap = gst::Fraction::new(RANGE_MAX_FPS, 1);
+        let pick = if r.max() <= cap {
+            r.max()
+        } else if r.min() <= cap {
+            cap
+        } else {
+            r.min()
+        };
+        return vec![as_pair(pick)];
     }
     if let Ok(l) = v.get::<gst::List>() {
-        return l.iter().filter_map(frac_max).reduce(f64::max);
+        return l.iter().flat_map(fps_candidates).collect();
     }
-    None
+    Vec::new()
 }
 
 fn is_system_memory(features: &gst::CapsFeaturesRef) -> bool {
     features.is_empty() || features.contains("memory:SystemMemory")
 }
 
-/// Max (width, height, fps) of one structure, where present.
-fn structure_limits(s: &gst::StructureRef) -> (Option<i32>, Option<i32>, Option<f64>) {
+/// Raw formats that cannot be converted (placeholders some providers advertise).
+fn bad_format(f: &str) -> bool {
+    matches!(f, "UNKNOWN" | "ENCODED")
+}
+
+/// Every concrete mode the device caps offer (unusable structures skipped).
+pub fn camera_modes(caps: &gst::CapsRef) -> Vec<CameraMode> {
+    let mut out = Vec::new();
+    for (s, f) in caps.iter_with_features() {
+        let fixed_format = s.get::<&str>("format").ok();
+        let (path, format) = match s.name().as_str() {
+            "video/x-raw" if f.contains("memory:DMABuf") => {
+                if fixed_format != Some("DMA_DRM") {
+                    continue;
+                }
+                (
+                    CameraPath::DmaBuf,
+                    s.get::<&str>("drm-format").ok().map(String::from),
+                )
+            }
+            "video/x-raw" if is_system_memory(f) => {
+                if fixed_format.is_some_and(bad_format) {
+                    continue;
+                }
+                (CameraPath::Raw, fixed_format.map(String::from))
+            }
+            "image/jpeg" if is_system_memory(f) => (CameraPath::Jpeg, None),
+            _ => continue,
+        };
+        let widths = s
+            .value("width")
+            .map(|v| int_candidates(v, RANGE_W))
+            .unwrap_or_default();
+        let heights = s
+            .value("height")
+            .map(|v| int_candidates(v, RANGE_H))
+            .unwrap_or_default();
+        // No framerate field (some virtual sources): an unknown rate, recorded at 30 fps.
+        let rates = match s.value("framerate") {
+            Ok(v) => fps_candidates(v),
+            Err(_) => vec![(0, 1)],
+        };
+        for &w in &widths {
+            for &h in &heights {
+                for &(n, d) in &rates {
+                    if w <= 0 || h <= 0 || n < 0 || d <= 0 {
+                        continue;
+                    }
+                    let m = CameraMode {
+                        path,
+                        format: format.clone(),
+                        width: w,
+                        height: h,
+                        fps_n: n,
+                        fps_d: d,
+                    };
+                    if !out.contains(&m) {
+                        out.push(m);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Preference key (larger is better), SPEC §5.4 as revised for 4K:
+/// 1. modes within 4096×2160 over larger ones (larger ones are downscaled);
+/// 2. modes of at least ~24 fps over slower ones;
+/// 3. the highest resolution (within 4K), or the smallest one above 4K;
+/// 4. the highest frame rate up to 60 fps, then a mode that needs no rate reduction;
+/// 5. raw over MJPEG over DMA-BUF at an otherwise equal mode.
+fn mode_rank(m: &CameraMode) -> (bool, bool, i64, i64, bool, CameraPath) {
+    let within = m.width <= CAMERA_MAX_W && m.height <= CAMERA_MAX_H;
+    let area = m.width as i64 * m.height as i64;
+    let fps = m.fps_milli();
+    let cap = CAMERA_MAX_FPS as i64 * 1000;
     (
-        s.value("width").ok().and_then(int_max),
-        s.value("height").ok().and_then(int_max),
-        s.value("framerate").ok().and_then(frac_max),
+        within,
+        fps >= SMOOTH_FPS_MILLI,
+        if within { area } else { -area },
+        fps.min(cap),
+        fps <= cap,
+        m.path,
     )
 }
 
@@ -111,68 +292,30 @@ pub fn caps_summary(caps: &gst::CapsRef) -> String {
     out
 }
 
-/// True when the (system-memory) structure `s` can satisfy `filter`.
-fn structure_fits(s: &gst::StructureRef, filter: &gst::Caps) -> bool {
-    let mut one = gst::Caps::new_empty();
-    if let Some(c) = one.get_mut() {
-        c.append_structure(s.to_owned());
-    }
-    one.can_intersect(filter)
-}
-
 /// Camera classification (§5.4), a pure function over the device caps.
 #[cfg(test)]
 pub fn classify_camera(caps: &gst::CapsRef, gpu_convert: bool) -> CameraClass {
     classify_camera_with(caps, gpu_convert, true)
 }
 
-/// As [`classify_camera`]; `jpeg_ok` is false when jpegparse/jpegdec are missing, so MJPEG is
-/// not chosen (rule 2 is skipped).
+/// As [`classify_camera`]; `jpeg_ok` is false when jpegparse/jpegdec are missing (MJPEG modes
+/// are not chosen), `gpu_convert` false when no GPU path exists (DMA-BUF modes are not chosen).
 pub fn classify_camera_with(caps: &gst::CapsRef, gpu_convert: bool, jpeg_ok: bool) -> CameraClass {
-    // A raw structure only counts if it can pass the capsfilter the class will use (§5.4).
-    // Rule 1 needs a mode of at least 720p24 that the rule-1 capsfilter (≤1080p30) still admits.
-    let good_filter = "video/x-raw,width=[1280,1920],height=[720,1080],framerate=[24/1,30/1]"
-        .parse::<gst::Caps>()
-        .ok();
-    let any_filter = CameraClass::Raw { any_rate: true }
-        .source_caps()
-        .and_then(|c| c.parse::<gst::Caps>().ok());
-    let mut raw_good = false;
-    let mut raw_any = false;
-    let mut jpeg = false;
-    let mut dmabuf = false;
-    for (s, f) in caps.iter_with_features() {
-        match s.name().as_str() {
-            "video/x-raw" if f.contains("memory:DMABuf") => dmabuf = true,
-            "video/x-raw" if is_system_memory(f) => {
-                if any_filter.as_ref().is_some_and(|c| structure_fits(s, c)) {
-                    raw_any = true;
-                }
-                let (w, h, fps) = structure_limits(s);
-                if w.is_some_and(|w| w >= 1280)
-                    && h.is_some_and(|h| h >= 720)
-                    && fps.is_some_and(|r| r >= 24.0 - 1e-6)
-                    && good_filter.as_ref().is_some_and(|c| structure_fits(s, c))
-                {
-                    raw_good = true;
-                }
-            }
-            "image/jpeg" => jpeg = true,
-            _ => {}
+    let modes = camera_modes(caps);
+    let best = modes
+        .iter()
+        .filter(|m| match m.path {
+            CameraPath::Raw => true,
+            CameraPath::Jpeg => jpeg_ok,
+            CameraPath::DmaBuf => gpu_convert,
+        })
+        .max_by_key(|m| mode_rank(m));
+    match best {
+        Some(m) => CameraClass::Usable(m.clone()),
+        None if modes.iter().any(|m| m.path == CameraPath::Jpeg) && !jpeg_ok => {
+            CameraClass::Unsupported("MJPEG needs jpegparse and jpegdec, which are missing".into())
         }
-    }
-    if raw_good {
-        CameraClass::Raw { any_rate: false }
-    } else if jpeg && jpeg_ok {
-        CameraClass::Jpeg
-    } else if raw_any {
-        CameraClass::Raw { any_rate: true }
-    } else if dmabuf && gpu_convert {
-        CameraClass::DmaBuf
-    } else if jpeg {
-        CameraClass::Unsupported("MJPEG needs jpegparse and jpegdec, which are missing".into())
-    } else {
-        CameraClass::Unsupported(format!("no usable format: {}", caps_summary(caps)))
+        None => CameraClass::Unsupported(format!("no usable format: {}", caps_summary(caps))),
     }
 }
 
@@ -204,9 +347,12 @@ pub struct Entry {
 
 impl Entry {
     /// Creates the source element (`device.create_element`, else `pipewiresrc target-object`).
+    /// The provider targets the node by `object.serial`, which is correct; the stream is also
+    /// marked `node.dont-fallback` so a vanished device fails loudly instead of WirePlumber
+    /// linking the default Video/Source in its place.
     pub fn create_source(&self, name: &str) -> Result<gst::Element, String> {
-        match self.device.create_element(Some(name)) {
-            Ok(e) => Ok(e),
+        let el = match self.device.create_element(Some(name)) {
+            Ok(e) => e,
             Err(err) => {
                 let serial = self
                     .serial
@@ -216,9 +362,13 @@ impl Entry {
                     .name(name)
                     .property_from_str("target-object", &serial)
                     .build()
-                    .map_err(|e| format!("cannot create pipewiresrc: {e}"))
+                    .map_err(|e| format!("cannot create pipewiresrc: {e}"))?
             }
+        };
+        if el.factory().is_some_and(|f| f.name() == "pipewiresrc") {
+            super::recorder::set_no_fallback(&el);
         }
+        Ok(el)
     }
 }
 
@@ -305,15 +455,7 @@ impl Devices {
             if device.has_classes("Video/Source") {
                 let class = classify_camera_with(&caps, gpu_convert, self.jpeg_ok);
                 let detail = match &class {
-                    CameraClass::Jpeg => {
-                        let (w, h) = max_size(&caps, "image/jpeg");
-                        format!("{origin} · MJPEG ≤{w}×{h}")
-                    }
-                    CameraClass::Raw { .. } => {
-                        let (w, h) = max_size(&caps, "video/x-raw");
-                        format!("{origin} · raw ≤{w}×{h}")
-                    }
-                    CameraClass::DmaBuf => format!("{origin} · DMA-BUF"),
+                    CameraClass::Usable(m) => format!("{origin} · {}", m.label()),
                     CameraClass::Unsupported(_) => origin.clone(),
                 };
                 let unsupported = match &class {
@@ -398,17 +540,6 @@ fn same(a: &[Entry], b: &[Entry]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.info == y.info)
 }
 
-fn max_size(caps: &gst::CapsRef, name: &str) -> (i32, i32) {
-    caps.iter()
-        .filter(|s| s.name() == name)
-        .map(|s| {
-            let (w, h, _) = structure_limits(s);
-            (w.unwrap_or(0).min(1920), h.unwrap_or(0).min(1080))
-        })
-        .max_by_key(|(w, h)| (*w as i64) * (*h as i64))
-        .unwrap_or((0, 0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,61 +550,169 @@ mod tests {
         gst::Caps::from_str(s).unwrap()
     }
 
+    fn usable(c: CameraClass) -> CameraMode {
+        match c {
+            CameraClass::Usable(m) => m,
+            other => panic!("expected a usable mode, got {other:?}"),
+        }
+    }
+
+    /// The exact caps of the Sony ILCE-7CM2 (uvcvideo) as PipeWire reports them.
+    const ILCE_7CM2: &str = "video/x-raw(memory:DMABuf), drm-format=NV12, format=DMA_DRM, \
+        interlace-mode=progressive, width=3840, height=2160, framerate=25/1, colorimetry=bt709; \
+        video/x-raw, format=NV12, interlace-mode=progressive, width=3840, height=2160, \
+        framerate=25/1, colorimetry=bt709; \
+        image/jpeg, width=3840, height=2160, framerate=25/1, colorimetry=bt709";
+
     #[test]
-    fn mjpeg_beats_slow_yuy2() {
-        let c = caps(
-            "video/x-raw,format=YUY2,width=1920,height=1080,framerate=5/1; \
-             image/jpeg,width=1920,height=1080,framerate=30/1",
+    fn ilce_7cm2_records_native_4k25_raw() {
+        let c = caps(ILCE_7CM2);
+        let m = usable(classify_camera(&c, true));
+        assert_eq!(m.path, CameraPath::Raw);
+        assert_eq!(m.format.as_deref(), Some("NV12"));
+        assert_eq!((m.width, m.height), (3840, 2160));
+        assert_eq!((m.fps_n, m.fps_d), (25, 1));
+        assert_eq!(m.output_fps(), (25, 1), "25 fps must not be rated to 30");
+        assert_eq!(m.output_size(), (3840, 2160));
+        assert_eq!(
+            m.source_caps(),
+            "video/x-raw,format=NV12,width=3840,height=2160,framerate=25/1"
         );
-        assert_eq!(classify_camera(&c, true), CameraClass::Jpeg);
+        assert_eq!(m.label(), "3840×2160 @25 · NV12");
+        // The source capsfilter admits exactly the advertised raw structure.
+        let filter = gst::Caps::from_str(&m.source_caps()).unwrap();
+        assert!(filter.can_intersect(&c));
+        // Same result without a GPU path; without MJPEG support too.
+        assert_eq!(usable(classify_camera_with(&c, false, false)), m);
     }
 
     #[test]
-    fn raw_720p30() {
-        let c = caps("video/x-raw,format=YUY2,width=1280,height=720,framerate=30/1");
-        assert_eq!(
-            classify_camera(&c, false),
-            CameraClass::Raw { any_rate: false }
-        );
+    fn ilce_7cm2_fallbacks() {
+        // Raw dropped: MJPEG at the same mode beats the DMA-BUF path.
         let c = caps(
-            "video/x-raw,format=YUY2,width=[1,1280],height=[1,720],framerate={ (fraction)15/1, (fraction)30/1 }",
+            "video/x-raw(memory:DMABuf), drm-format=NV12, format=DMA_DRM, width=3840, height=2160, framerate=25/1; \
+             image/jpeg, width=3840, height=2160, framerate=25/1",
         );
+        let m = usable(classify_camera(&c, true));
+        assert_eq!(m.path, CameraPath::Jpeg);
         assert_eq!(
-            classify_camera(&c, false),
-            CameraClass::Raw { any_rate: false }
+            m.source_caps(),
+            "image/jpeg,width=3840,height=2160,framerate=25/1"
         );
-    }
-
-    #[test]
-    fn slow_raw_only_is_raw_any_rate() {
-        let c = caps("video/x-raw,format=YUY2,width=640,height=480,framerate=15/1");
-        assert_eq!(
-            classify_camera(&c, false),
-            CameraClass::Raw { any_rate: true }
-        );
-    }
-
-    #[test]
-    fn raw_only_above_1080p_or_30fps_is_not_rule1() {
-        // 4K30 and 720p60 raw modes cannot pass the rule-1 capsfilter; MJPEG wins.
+        // Only DMA-BUF works: use it when a GPU path exists.
         let c = caps(
-            "video/x-raw,format=YUY2,width=3840,height=2160,framerate=30/1; \
-             video/x-raw,format=YUY2,width=1280,height=720,framerate=60/1; \
-             video/x-raw,format=YUY2,width=640,height=480,framerate=15/1; \
-             image/jpeg,width=1920,height=1080,framerate=30/1",
+            "video/x-raw(memory:DMABuf), drm-format=NV12, format=DMA_DRM, width=3840, height=2160, framerate=25/1",
         );
-        assert_eq!(classify_camera(&c, true), CameraClass::Jpeg);
-        // Without MJPEG support the slow raw mode is used (rule 3).
+        let m = usable(classify_camera(&c, true));
+        assert_eq!(m.path, CameraPath::DmaBuf);
         assert_eq!(
-            classify_camera_with(&c, true, false),
-            CameraClass::Raw { any_rate: true }
+            m.source_caps(),
+            "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12,width=3840,height=2160,framerate=25/1"
         );
-        // Only a 4K raw mode: nothing passes any raw filter.
-        let c = caps("video/x-raw,format=YUY2,width=3840,height=2160,framerate=30/1");
         assert!(matches!(
             classify_camera(&c, false),
             CameraClass::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn typical_webcam_mjpeg_1080p30_beats_slow_yuy2() {
+        // C920-style: YUY2 only at low rates for large sizes, MJPEG 1080p30.
+        let c = caps(
+            "video/x-raw,format=YUY2,width=1920,height=1080,framerate={ (fraction)5/1 }; \
+             video/x-raw,format=YUY2,width=1280,height=720,framerate={ (fraction)10/1, (fraction)5/1 }; \
+             video/x-raw,format=YUY2,width=640,height=480,framerate={ (fraction)30/1, (fraction)15/1 }; \
+             image/jpeg,width=1920,height=1080,framerate={ (fraction)30/1, (fraction)24/1, (fraction)15/1 }; \
+             image/jpeg,width=1280,height=720,framerate={ (fraction)30/1, (fraction)15/1 }",
+        );
+        let m = usable(classify_camera(&c, true));
+        assert_eq!(m.path, CameraPath::Jpeg);
+        assert_eq!((m.width, m.height, m.fps_n, m.fps_d), (1920, 1080, 30, 1));
+        assert_eq!(m.label(), "1920×1080 @30 · MJPEG");
+        // Without MJPEG decoders: the best smooth raw mode (640×480@30) wins over 1080p5.
+        let m = usable(classify_camera_with(&c, true, false));
+        assert_eq!(m.path, CameraPath::Raw);
+        assert_eq!((m.width, m.height, m.fps_n), (640, 480, 30));
+    }
+
+    #[test]
+    fn raw_preferred_when_it_matches_mjpeg() {
+        let c = caps(
+            "image/jpeg,width=1920,height=1080,framerate=30/1; \
+             video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1",
+        );
+        let m = usable(classify_camera(&c, true));
+        assert_eq!(m.path, CameraPath::Raw);
+        assert_eq!(m.format.as_deref(), Some("YUY2"));
+    }
+
+    #[test]
+    fn highest_resolution_then_fps_up_to_4k() {
+        let c = caps(
+            "video/x-raw,format=YUY2,width=1280,height=720,framerate=60/1; \
+             image/jpeg,width=3840,height=2160,framerate=30/1; \
+             image/jpeg,width=1920,height=1080,framerate=60/1; \
+             image/jpeg,width=4096,height=2160,framerate=30/1",
+        );
+        let m = usable(classify_camera(&c, true));
+        assert_eq!((m.width, m.height, m.fps_n), (4096, 2160, 30));
+        assert_eq!(m.output_size(), (4096, 2160), "DCI 4K is recorded unscaled");
+        // A faster mode at the same size wins.
+        let c =
+            caps("image/jpeg,width=3840,height=2160,framerate={ (fraction)30/1, (fraction)60/1 }");
+        assert_eq!(usable(classify_camera(&c, true)).fps_n, 60);
+        // 120 fps is capped to 60, and a native 60 fps mode is preferred over it.
+        let c = caps("image/jpeg,width=1920,height=1080,framerate={ (fraction)120/1 }");
+        assert_eq!(usable(classify_camera(&c, true)).output_fps(), (60, 1));
+        let c =
+            caps("image/jpeg,width=1920,height=1080,framerate={ (fraction)120/1, (fraction)60/1 }");
+        assert_eq!(usable(classify_camera(&c, true)).fps_n, 60);
+        // NTSC rates are kept exactly.
+        let c = caps("video/x-raw,format=NV12,width=1920,height=1080,framerate=30000/1001");
+        let m = usable(classify_camera(&c, false));
+        assert_eq!(m.output_fps(), (30000, 1001));
+        assert_eq!(m.label(), "1920×1080 @29.97 · NV12");
+    }
+
+    #[test]
+    fn above_4k_is_downscaled_and_smaller_modes_win() {
+        let c = caps("video/x-raw,format=NV12,width=6144,height=3456,framerate=30/1");
+        let m = usable(classify_camera(&c, false));
+        assert_eq!((m.width, m.height), (6144, 3456));
+        let (w, h) = m.output_size();
+        assert!(w <= CAMERA_MAX_W && h <= CAMERA_MAX_H, "{w}×{h}");
+        assert_eq!((w, h), (3840, 2160));
+        let c = caps(
+            "video/x-raw,format=NV12,width=6144,height=3456,framerate=30/1; \
+             video/x-raw,format=NV12,width=3840,height=2160,framerate=30/1",
+        );
+        assert_eq!(usable(classify_camera(&c, false)).width, 3840);
+    }
+
+    #[test]
+    fn ranges_pick_conservative_1080p30() {
+        // Any-size sources (v4l2loopback, virtual cameras) are not pushed to 4K60.
+        let c =
+            caps("video/x-raw,format=YUY2,width=[2,8192],height=[1,8192],framerate=[1/1,120/1]");
+        let m = usable(classify_camera(&c, false));
+        assert_eq!((m.width, m.height, m.fps_n, m.fps_d), (1920, 1080, 30, 1));
+        assert_eq!(m.label(), "1920×1080 @30 · YUY2");
+        // A range entirely above the defaults uses its minimum.
+        let c = caps(
+            "video/x-raw,format=YUY2,width=[2560,8192],height=[1440,8192],framerate=[50/1,120/1]",
+        );
+        let m = usable(classify_camera(&c, false));
+        assert_eq!((m.width, m.height, m.fps_n), (2560, 1440, 50));
+        let c = caps("video/x-raw,format=YUY2,width=[2,1280],height=[1,720],framerate=[1/1,30/1]");
+        let m = usable(classify_camera(&c, false));
+        assert_eq!((m.width, m.height, m.fps_n), (1280, 720, 30));
+    }
+
+    #[test]
+    fn slow_raw_only_is_still_usable() {
+        let c = caps("video/x-raw,format=YUY2,width=640,height=480,framerate=15/1");
+        let m = usable(classify_camera(&c, false));
+        assert_eq!((m.width, m.height, m.fps_n), (640, 480, 15));
     }
 
     #[test]
@@ -486,11 +725,22 @@ mod tests {
     }
 
     #[test]
-    fn dmabuf_only() {
+    fn dmabuf_range_without_rate() {
+        // The v4l2loopback dummy shape: ranges, no framerate field, placeholder formats.
         let c = caps(
-            "video/x-raw(memory:DMABuf),drm-format=XR24,format=DMA_DRM,width=[2,8192],height=[1,8192]",
+            "video/x-raw(memory:DMABuf),drm-format=XR24,format=DMA_DRM,width=[2,8192],height=[1,8192]; \
+             video/x-raw(memory:DMABuf),format=UNKNOWN,width=[2,8192],height=[1,8192]; \
+             video/x-raw,format=UNKNOWN,width=[2,8192],height=[1,8192]",
         );
-        assert_eq!(classify_camera(&c, true), CameraClass::DmaBuf);
+        let m = usable(classify_camera(&c, true));
+        assert_eq!(m.path, CameraPath::DmaBuf);
+        assert_eq!((m.width, m.height), (1920, 1080));
+        assert_eq!(m.output_fps(), (30, 1));
+        assert!(
+            !m.source_caps().contains("framerate"),
+            "{}",
+            m.source_caps()
+        );
         match classify_camera(&c, false) {
             CameraClass::Unsupported(r) => assert!(r.starts_with("no usable format:"), "{r}"),
             other => panic!("expected Unsupported, got {other:?}"),
@@ -499,7 +749,7 @@ mod tests {
 
     #[test]
     fn nothing_usable() {
-        let c = caps("video/x-bayer,format=rggb,width=640,height=480");
+        let c = caps("video/x-bayer,format=rggb,width=640,height=480,framerate=30/1");
         assert!(matches!(
             classify_camera(&c, true),
             CameraClass::Unsupported(_)

@@ -19,7 +19,7 @@ pub struct DeviceInfo {
     pub id: DeviceId,
     pub kind: DeviceKind,
     pub name: String,                  // gst Device display_name
-    pub detail: String,                // "pipewire #61 · 48 kHz · 2 ch" / "pipewire #80 · MJPEG ≤1920×1080" / "· DMA-BUF"
+    pub detail: String,                // "pipewire #61 · 48 kHz · 2 ch" / "pipewire #2148 · 3840×2160 @25 · NV12"
     pub unsupported: Option<String>,   // Some(reason) => listed, not selectable
 }
 

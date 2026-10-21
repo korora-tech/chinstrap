@@ -12,4 +12,6 @@ mod session;
 mod stamp;
 
 pub use engine::{EngineConfig, EngineError, EngineHandle, start};
+pub use recorder::{check_targeting, provide_test_node, test_size};
+pub use stamp::lock_size;
 pub use types::*;

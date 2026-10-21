@@ -98,6 +98,44 @@ struct FileCheck {
     width: Option<u32>,
     height: Option<u32>,
     duration: Option<Duration>,
+    /// Frame rate (num, den) and H.264 profile/level, video only.
+    fps: Option<(i32, i32)>,
+    profile: Option<String>,
+    level: Option<String>,
+}
+
+/// Parses "W×H @F" out of a camera detail label ("pipewire #2148 · 3840×2160 @25 · NV12").
+fn detail_mode(detail: &str) -> Option<(u32, u32, f64)> {
+    let part = detail
+        .split(" · ")
+        .find(|p| p.contains('×') && p.contains('@'))?;
+    let (size, rate) = part.split_once(" @")?;
+    let (w, h) = size.trim().split_once('×')?;
+    Some((w.parse().ok()?, h.parse().ok()?, rate.trim().parse().ok()?))
+}
+
+/// The camera's PipeWire object id (for the targeting check), by display-name substring.
+fn camera_object_id(substring: &str) -> Option<(String, u32)> {
+    let monitor = gst::DeviceMonitor::new();
+    monitor.add_filter(Some("Video/Source"), None);
+    monitor.start().ok()?;
+    let want = substring.to_lowercase();
+    let found = monitor.devices().into_iter().find_map(|d| {
+        let name = d.display_name().to_string();
+        if !name.to_lowercase().contains(&want) {
+            return None;
+        }
+        let props = d.properties()?;
+        let v = props.value("object.id").ok()?;
+        let id = v
+            .get::<u32>()
+            .ok()
+            .or_else(|| v.get::<i32>().ok().map(|i| i as u32))
+            .or_else(|| v.get::<String>().ok().and_then(|s| s.parse().ok()))?;
+        Some((name, id))
+    });
+    monitor.stop();
+    found
 }
 
 fn discover(disc: &pbutils::Discoverer, path: &Path) -> Result<pbutils::DiscovererInfo, String> {
@@ -124,10 +162,16 @@ fn check_video(disc: &pbutils::Discoverer, path: &Path) -> Result<FileCheck, Str
     if w % 2 != 0 || h % 2 != 0 || w < 128 || h < 128 {
         return Err(format!("bad size {w}×{h}"));
     }
+    let s = caps.structure(0);
+    let field = |k: &str| s.and_then(|s| s.get::<String>(k).ok());
+    let rate = v.framerate();
     Ok(FileCheck {
         width: Some(w),
         height: Some(h),
         duration: info.duration().map(|d| Duration::from_nanos(d.nseconds())),
+        fps: (rate.numer() > 0).then(|| (rate.numer(), rate.denom())),
+        profile: field("profile"),
+        level: field("level"),
     })
 }
 
@@ -153,6 +197,9 @@ fn check_audio(disc: &pbutils::Discoverer, path: &Path) -> Result<FileCheck, Str
         width: None,
         height: None,
         duration: info.duration().map(|d| Duration::from_nanos(d.nseconds())),
+        fps: None,
+        profile: None,
+        level: None,
     })
 }
 
@@ -219,18 +266,50 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     }
     if !h.errors.is_empty() {
         engine.shutdown_blocking(Duration::from_secs(5));
-        return Ok(summary(&h, &caps, &[], &warnings));
+        return Ok(summary(&h, &caps, &[], &warnings, serde_json::Value::Null));
     }
 
     // 2. Inputs. (Re-assert the output root through the command path as well.)
     engine.send(EngineCommand::SetOutputRoot(dir.clone()));
     // CHINSTRAP_SELFTEST_NO_CAMERA=1 skips the camera (e.g. a loopback dummy with no producer).
-    let camera = first
-        .cameras
-        .iter()
-        .find(|c| c.unsupported.is_none())
-        .map(|c| c.id)
-        .filter(|_| std::env::var_os("CHINSTRAP_SELFTEST_NO_CAMERA").is_none());
+    // CHINSTRAP_SELFTEST_CAMERA=<substring> picks that camera and makes its file critical.
+    let want_camera = std::env::var("CHINSTRAP_SELFTEST_CAMERA")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let camera_info = match &want_camera {
+        Some(want) => {
+            let w = want.to_lowercase();
+            let found = first
+                .cameras
+                .iter()
+                .find(|c| c.name.to_lowercase().contains(&w));
+            let problem = match found {
+                None => Some(format!("no camera matching {want:?}")),
+                Some(c) => c
+                    .unsupported
+                    .as_ref()
+                    .map(|r| format!("camera {:?} is unsupported: {r}", c.name)),
+            };
+            if let Some(p) = problem {
+                engine.shutdown_blocking(Duration::from_secs(5));
+                return Err(p);
+            }
+            found.cloned()
+        }
+        None => first
+            .cameras
+            .iter()
+            .find(|c| c.unsupported.is_none())
+            .filter(|_| std::env::var_os("CHINSTRAP_SELFTEST_NO_CAMERA").is_none())
+            .cloned(),
+    };
+    let camera = camera_info.as_ref().map(|c| c.id);
+    let camera_critical = want_camera.is_some();
+    let camera_expect = camera_info.as_ref().and_then(|c| detail_mode(&c.detail));
+    let mut targeting_json = serde_json::json!(null);
+    if gst::ElementFactory::find("pipewiresrc").is_some() {
+        targeting_json = check_targeting(&mut h, &mut warnings, want_camera.as_deref());
+    }
     engine.send(EngineCommand::SelectCamera(camera));
     let mic = first.microphones.first().map(|m| m.id);
     engine.send(EngineCommand::SelectMicrophone(mic));
@@ -291,7 +370,12 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     let session = done.session.clone().ok_or("no session after Stop")?;
     eprintln!("selftest: session {}", session.dir.display());
 
-    // 6. Validate files.
+    // 6. Validate files. The test file keeps the first caps size (CHINSTRAP_TEST_SIZE).
+    let (test_w, test_h) = {
+        let (w, h) = studio::test_size();
+        let (w, h) = studio::lock_size(w, h);
+        (w as u32, h as u32)
+    };
     let disc = pbutils::Discoverer::new(gst::ClockTime::from_seconds(5))
         .map_err(|e| format!("Discoverer: {e}"))?;
     let mut seg_json = Vec::new();
@@ -302,7 +386,7 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
             h.fail(format!("segment {} status {:?}", seg.index, seg.status));
         }
         for f in &seg.files {
-            let critical = f.input == test_key;
+            let critical = f.input == test_key || (camera_critical && f.input == InputKey::Camera);
             let mut problem: Option<String> = None;
             if f.status != InputStatus::Complete {
                 problem = Some(format!("status {:?}", f.status));
@@ -331,18 +415,35 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
                             if fc.duration.is_none() {
                                 problem = Some("no duration".into());
                             }
-                            if critical
+                            if f.input == test_key
                                 && seg.index == 1
-                                && (fc.width, fc.height) != (Some(1280), Some(720))
+                                && (fc.width, fc.height) != (Some(test_w), Some(test_h))
                             {
                                 problem = Some(format!(
-                                    "test file is {:?}×{:?}, expected the first caps size 1280×720",
+                                    "test file is {:?}×{:?}, expected the first caps size {test_w}×{test_h}",
                                     fc.width, fc.height
                                 ));
+                            }
+                            if f.input == InputKey::Camera
+                                && let Some((ew, eh, efps)) = camera_expect
+                            {
+                                let fps = fc.fps.map(|(n, d)| n as f64 / d.max(1) as f64);
+                                if (fc.width, fc.height) != (Some(ew), Some(eh)) {
+                                    problem = Some(format!(
+                                        "camera file is {:?}×{:?}, expected the native {ew}×{eh}",
+                                        fc.width, fc.height
+                                    ));
+                                } else if fps.is_none_or(|f| (f - efps).abs() > 0.05) {
+                                    problem = Some(format!(
+                                        "camera file is {fps:?} fps, expected the native {efps}"
+                                    ));
+                                }
                             }
                             files_json.push(serde_json::json!({
                                 "file": f.path.file_name().map(|n| n.to_string_lossy().to_string()),
                                 "width": fc.width, "height": fc.height,
+                                "framerate": fc.fps.map(|(n, d)| format!("{n}/{d}")),
+                                "profile": fc.profile, "level": fc.level,
                                 "duration_s": fc.duration.map(|d| d.as_secs_f64()),
                             }));
                         }
@@ -376,10 +477,12 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     // 7. Manifest.
     let manifest_ok = check_manifest(
         &mut h,
+        &mut warnings,
         &session.manifest,
         &session.dir,
         test_id.0,
         mic.is_some(),
+        camera.is_some(),
     );
     let _ = manifest_ok;
 
@@ -432,7 +535,114 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     if mic.is_some() && h.levels == 0 {
         warnings.push("no Level events while recording".into());
     }
-    Ok(summary(&h, &caps, &seg_json, &warnings))
+    Ok(summary(&h, &caps, &seg_json, &warnings, targeting_json))
+}
+
+/// PipeWire targeting regression (portal `target-object` bug):
+/// - a missing node id must fail with WirePlumber's "target not found"; any other error (for
+///   example EBUSY from a fallback to the busy default camera) fails the selftest, unless
+///   PipeWire itself is unreachable;
+/// - a temporary Video/Source node's *object id* must be the only node linked (always runs, so
+///   the positive check never depends on a camera being attached);
+/// - with `camera`, that camera's object id must be the only node linked.
+fn check_targeting(
+    h: &mut Harness,
+    warnings: &mut Vec<String>,
+    camera: Option<&str>,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    match studio::check_targeting(999_999_999, Duration::from_secs(10)) {
+        Ok(c) => h.fail(format!(
+            "targeting a missing node fell back to another node (linked {:?}, caps {})",
+            c.linked_from, c.caps
+        )),
+        Err(e) if e.contains("target not found") => {
+            eprintln!("selftest: targeting a missing node fails loudly: {e}");
+            out.insert("missing_node".into(), "fails".into());
+        }
+        Err(e) if pipewire_unreachable(&e) => {
+            warnings.push(format!(
+                "targeting check skipped: PipeWire unreachable: {e}"
+            ));
+            out.insert("missing_node".into(), format!("skipped: {e}").into());
+            out.insert("test_node".into(), "skipped: PipeWire unreachable".into());
+            return out.into();
+        }
+        Err(e) => h.fail(format!(
+            "targeting a missing node failed with {e:?} instead of \"target not found\" \
+             (did it fall back to another node?)"
+        )),
+    }
+    match studio::provide_test_node(Duration::from_secs(5)) {
+        Ok(node) => {
+            let value = linked_check(h, warnings, "test node", node.id);
+            out.insert("test_node".into(), value);
+        }
+        Err(e) => {
+            warnings.push(format!(
+                "targeting: positive check skipped (no test node: {e})"
+            ));
+            out.insert("test_node".into(), format!("skipped: {e}").into());
+        }
+    }
+    let Some(want) = camera else {
+        out.insert("camera".into(), "skipped: no camera named".into());
+        return out.into();
+    };
+    let Some((name, id)) = camera_object_id(want) else {
+        h.fail(format!("no PipeWire object.id for camera {want:?}"));
+        return out.into();
+    };
+    let value = linked_check(h, warnings, &name, id);
+    out.insert("camera".into(), value);
+    out.into()
+}
+
+/// pipewiresrc errors that mean the daemon could not be reached at all.
+fn pipewire_unreachable(e: &str) -> bool {
+    e.contains("Failed to connect") || e.contains("can't create stream")
+}
+
+/// Targets object id `id` and checks that it is the only node linked.
+fn linked_check(
+    h: &mut Harness,
+    warnings: &mut Vec<String>,
+    name: &str,
+    id: u32,
+) -> serde_json::Value {
+    match studio::check_targeting(id, Duration::from_secs(10)) {
+        Ok(c) => {
+            eprintln!(
+                "selftest: targeting {name} (object.id {id}) linked {:?}, caps {}",
+                c.linked_from, c.caps
+            );
+            let verdict = match &c.linked_from {
+                Some(l) if l == &vec![id] => "ok",
+                Some(l) => {
+                    h.fail(format!(
+                        "targeting {name} (object.id {id}) linked {l:?} instead of only {id}"
+                    ));
+                    "wrong node"
+                }
+                None => {
+                    warnings.push(format!(
+                        "pw-dump unavailable: linked node for {name} not verified"
+                    ));
+                    "unverified"
+                }
+            };
+            serde_json::json!({
+                "object_id": id,
+                "linked_from": c.linked_from,
+                "caps": c.caps,
+                "result": verdict,
+            })
+        }
+        Err(e) => {
+            h.fail(format!("targeting {name} (object.id {id}) failed: {e}"));
+            serde_json::json!({ "object_id": id, "result": format!("failed: {e}") })
+        }
+    }
 }
 
 fn studio_manifest(path: &Path) -> Result<serde_json::Value, String> {
@@ -440,7 +650,15 @@ fn studio_manifest(path: &Path) -> Result<serde_json::Value, String> {
     serde_json::from_slice(&bytes).map_err(|e| e.to_string())
 }
 
-fn check_manifest(h: &mut Harness, path: &Path, dir: &Path, test_id: u32, mic: bool) -> bool {
+fn check_manifest(
+    h: &mut Harness,
+    warnings: &mut Vec<String>,
+    path: &Path,
+    dir: &Path,
+    test_id: u32,
+    mic: bool,
+    camera: bool,
+) -> bool {
     let before = h.errors.len();
     let m = match studio_manifest(path) {
         Ok(m) => m,
@@ -521,6 +739,34 @@ fn check_manifest(h: &mut Harness, path: &Path, dir: &Path, test_id: u32, mic: b
                 }
             }
         }
+        // The camera's first frame includes its real start-up latency (skip-to-first), so it
+        // is reported, and only warned about above 500 ms.
+        if camera && let (Some(t), Some(c)) = (first(&test_key), first("camera")) {
+            let skew = t.abs_diff(c);
+            eprintln!(
+                "selftest: segment {idx} first_pts camera={:.3}s skew to test={:.1}ms",
+                c as f64 / 1e9,
+                skew as f64 / 1e6
+            );
+            if skew >= 500_000_000 {
+                warnings.push(format!(
+                    "segment {idx}: camera first_pts skew {:.1} ms",
+                    skew as f64 / 1e6
+                ));
+            }
+        }
+        for i in &inputs {
+            if i["codec"] == "h264" {
+                eprintln!(
+                    "selftest: segment {idx} {}: {}×{} @{} via {}",
+                    i["key"].as_str().unwrap_or("?"),
+                    i["width"],
+                    i["height"],
+                    i["framerate"].as_str().unwrap_or("?"),
+                    i["encoder"].as_str().unwrap_or("?")
+                );
+            }
+        }
     }
     h.errors.len() == before
 }
@@ -530,12 +776,15 @@ fn summary(
     caps: &studio::Capabilities,
     segments: &[serde_json::Value],
     warnings: &[String],
+    targeting: serde_json::Value,
 ) -> bool {
     let ok = h.errors.is_empty();
     let out = serde_json::json!({
         "ok": ok,
         "encoder": caps.h264_encoder.map(|e| e.element_name()),
         "convert": caps.gpu_convert.map(|c| format!("{c:?}").to_lowercase()),
+        "test_size": format!("{}×{}", studio::test_size().0, studio::test_size().1),
+        "targeting": targeting,
         "segments": segments,
         "warnings": warnings,
         "errors": h.errors,

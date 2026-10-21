@@ -88,14 +88,14 @@ impl FakeEngine {
                 id: DeviceId(1),
                 kind: DeviceKind::Camera,
                 name: "Fake HD Webcam".into(),
-                detail: "fake #80 · MJPEG ≤1920×1080".into(),
+                detail: "fake #80 · 1920×1080 @30 · MJPEG".into(),
                 unsupported: None,
             },
             DeviceInfo {
                 id: DeviceId(2),
                 kind: DeviceKind::Camera,
                 name: "Fake Loopback Dummy".into(),
-                detail: "fake #81 · DMA-BUF".into(),
+                detail: "fake #81 · 3840×2160 @25 · DMA-BUF NV12".into(),
                 unsupported: Some("no usable format: video/x-raw(memory:DMABuf)".into()),
             },
         ];

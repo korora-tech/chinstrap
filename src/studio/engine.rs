@@ -18,13 +18,13 @@ use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::*;
 
-use super::devices::{CameraClass, Devices};
+use super::devices::{self, CameraClass, CameraPath, Devices};
 use super::encoders::{self, Role};
 use super::fake;
 use super::portal::{self, PortalCmd, PortalOutcome};
 use super::recorder::{self, InputPipeline, VideoSource};
 use super::session::{self, Manifest, ManifestInput, ManifestSegment};
-use super::stamp::{SizeSlot, UNSET};
+use super::stamp::{self, SizeSlot, UNSET};
 use super::types::*;
 
 #[derive(Clone, Debug)]
@@ -330,6 +330,13 @@ struct Engine {
     tx: mpsc::Sender<Msg>,
     events: async_channel::Sender<EngineEvent>,
     caps: Capabilities,
+    /// Verified encoders, preference order (first = `caps.h264_encoder`); picked per input.
+    encoders: Vec<encoders::EncoderCap>,
+    /// Encoders whose GPU convert path (`caps.gpu_convert`) passed its probe; DMA-BUF inputs
+    /// (portal sources, DMA-BUF cameras) are only given one of these.
+    gpu_encoders: Vec<H264Encoder>,
+    /// Screen/window/test frame rate (`CHINSTRAP_SCREEN_FPS`, default 30, max 60).
+    screen_fps: i32,
     devices: Devices,
     selected_camera: Option<DeviceId>,
     selected_microphone: Option<DeviceId>,
@@ -476,11 +483,13 @@ impl Engine {
         let jpeg_ok = encoders::class_ok(&missing, InputClass::MjpegCamera);
 
         // §5.6 encoder selection, §5.2 GPU path probe. The only accepted blocking period.
-        let (h264, enc_notes) = if encoders::class_ok(&missing, InputClass::Video) {
-            encoders::select_encoder(cfg.preferred_encoder)
+        let screen_fps = encoders::screen_fps();
+        let (encoder_table, enc_notes) = if encoders::class_ok(&missing, InputClass::Video) {
+            encoders::select_encoders(cfg.preferred_encoder, screen_fps.max(30))
         } else {
-            (None, Vec::new())
+            (Vec::new(), Vec::new())
         };
+        let h264 = encoder_table.first().map(|c| c.enc);
         for n in enc_notes {
             note(Severity::Info, n);
         }
@@ -494,6 +503,35 @@ impl Engine {
         for n in gpu_notes {
             note(Severity::Info, n);
         }
+        // The GPU path was probed with the default encoder; probe it with every other encoder an
+        // input may be given, so a DMA-BUF input never gets an encoder its path was not checked
+        // with.
+        let gpu_encoders: Vec<H264Encoder> = match gpu {
+            Some(convert) => encoder_table
+                .iter()
+                .map(|c| c.enc)
+                .filter(|&e| {
+                    Some(e) == h264
+                        || match encoders::run_probe(
+                            &encoders::gpu_probe_launch(convert, e),
+                            encoders::PROBE_TIMEOUT,
+                        ) {
+                            Ok(()) => true,
+                            Err(err) => {
+                                note(
+                                    Severity::Info,
+                                    format!(
+                                        "GPU convert {convert:?} with {} failed its probe: {err}",
+                                        e.element_name()
+                                    ),
+                                );
+                                false
+                            }
+                        }
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         if gpu.is_none() {
             note(
                 Severity::Error,
@@ -523,6 +561,9 @@ impl Engine {
                 missing_elements: missing,
                 portal: portal_state,
             },
+            encoders: encoder_table,
+            gpu_encoders,
+            screen_fps,
             devices,
             selected_camera: None,
             selected_microphone,
@@ -749,13 +790,13 @@ impl Engine {
                 };
                 e.info.unsupported.is_none()
                     && self.video_ok()
-                    && match &e.class {
-                        Some(CameraClass::Raw { .. }) => true,
-                        Some(CameraClass::Jpeg) => {
+                    && match e.class.as_ref().and_then(CameraClass::mode).map(|m| m.path) {
+                        Some(CameraPath::Raw) => true,
+                        Some(CameraPath::Jpeg) => {
                             encoders::class_ok(missing, InputClass::MjpegCamera)
                         }
-                        Some(CameraClass::DmaBuf) => self.caps.gpu_convert.is_some(),
-                        _ => false,
+                        Some(CameraPath::DmaBuf) => self.caps.gpu_convert.is_some(),
+                        None => false,
                     }
             }
             InputKey::Microphone => {
@@ -1195,6 +1236,7 @@ impl Engine {
                     capture: capture.map(|c| c.0),
                     width: None,
                     height: None,
+                    framerate: None,
                     first_pts_ns: None,
                     last_pts_ns: None,
                     status: "starting".into(),
@@ -1215,6 +1257,10 @@ impl Engine {
             match built {
                 Ok(ip) => {
                     rec.meta.convert = encoders::convert_name(ip.convert);
+                    if let Some(e) = ip.encoder {
+                        rec.meta.encoder = Some(e.element_name().to_string());
+                    }
+                    rec.meta.framerate = ip.fps.map(|(n, d)| format!("{n}/{d}"));
                     rec.first = Some(ip.first_pts.clone());
                     rec.last = Some(ip.last_pts.clone());
                     rec.size = Some(ip.size.clone());
@@ -1280,9 +1326,39 @@ impl Engine {
         self.gap_from = pending_gap;
     }
 
+    /// Picks the encoder for a video input needing `w`×`h` at `fps` and the size it may record
+    /// at most (`limit` capped by what that encoder was verified to do). `gpu`: the input takes
+    /// the GPU convert path, so only encoders that path was probed with qualify.
+    fn video_target(
+        &self,
+        need: (i32, i32),
+        fps: (i32, i32),
+        limit: (i32, i32),
+        gpu: bool,
+    ) -> Result<(H264Encoder, recorder::VideoTarget), String> {
+        let rate = fps.0 as f64 / fps.1.max(1) as f64;
+        let table: Vec<encoders::EncoderCap> = self
+            .encoders
+            .iter()
+            .filter(|c| !gpu || self.gpu_encoders.contains(&c.enc))
+            .cloned()
+            .collect();
+        let (enc, max) = encoders::pick_encoder(&table, need.0, need.1, rate).ok_or(if gpu {
+            "no H.264 encoder works with the GPU convert path"
+        } else {
+            "no H.264 encoder"
+        })?;
+        Ok((
+            enc,
+            recorder::VideoTarget {
+                fps,
+                max: (limit.0.min(max.0), limit.1.min(max.1)),
+            },
+        ))
+    }
+
     fn build_input(&self, key: InputKey, seg: u32, path: &Path) -> Result<InputPipeline, String> {
         let name = format!("seg{seg:03}-{}", key_string(key).replace(':', "-"));
-        let enc = self.caps.h264_encoder;
         match key {
             InputKey::Microphone => {
                 let e = self
@@ -1297,12 +1373,24 @@ impl Engine {
                     .and_then(|id| self.devices.camera(id))
                     .ok_or("the camera is gone")?;
                 let class = e.class.clone().ok_or("camera not classified")?;
+                let mode = class.mode().ok_or("camera is not usable")?;
+                // Native size and rate (≤60 fps); downscaled only above 4096×2160.
+                let (enc, target) = self.video_target(
+                    mode.output_size(),
+                    mode.output_fps(),
+                    (devices::CAMERA_MAX_W, devices::CAMERA_MAX_H),
+                    mode.path == CameraPath::DmaBuf,
+                )?;
                 recorder::build_video(
                     &name,
-                    VideoSource::Camera { entry: e, class },
+                    VideoSource::Camera {
+                        entry: e,
+                        class: class.clone(),
+                    },
                     self.caps.gpu_convert,
-                    enc.ok_or("no H.264 encoder")?,
+                    enc,
                     Role::Camera,
+                    target,
                     &self.clock,
                     path,
                 )
@@ -1314,8 +1402,11 @@ impl Engine {
                     .find(|s| s.info.id == id)
                     .ok_or("the source is gone")?;
                 let convert = s.convert.or(self.caps.gpu_convert);
-                let source = match s.info.kind {
-                    SourceKind::TestPattern => VideoSource::Test,
+                let (source, need) = match s.info.kind {
+                    SourceKind::TestPattern => (
+                        VideoSource::Test,
+                        stamp::lock_size(recorder::test_size().0, recorder::test_size().1),
+                    ),
                     _ => {
                         let fd = s
                             .info
@@ -1324,18 +1415,32 @@ impl Engine {
                             .and_then(|c| c.fd.as_ref())
                             .ok_or("the screen share is gone")?
                             .as_raw_fd();
-                        VideoSource::Portal {
-                            fd,
-                            node: s.node.ok_or("no PipeWire node")?,
-                        }
+                        // The physical size is only known from the first caps (HiDPI outputs
+                        // are larger than the portal's logical size): plan for UHD.
+                        (
+                            VideoSource::Portal {
+                                fd,
+                                node: s.node.ok_or("no PipeWire node")?,
+                            },
+                            encoders::UHD,
+                        )
                     }
                 };
+                // Portal sources and the test pattern both take the §5.2 GPU convert chain.
+                let gpu = convert.is_some();
+                let (enc, target) = self.video_target(
+                    need,
+                    (self.screen_fps, 1),
+                    (stamp::MAX_W, stamp::MAX_H),
+                    gpu,
+                )?;
                 recorder::build_video(
                     &name,
                     source,
                     convert,
-                    enc.ok_or("no H.264 encoder")?,
+                    enc,
                     Role::Screen,
+                    target,
                     &self.clock,
                     path,
                 )
