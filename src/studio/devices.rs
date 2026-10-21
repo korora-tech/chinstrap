@@ -111,8 +111,32 @@ pub fn caps_summary(caps: &gst::CapsRef) -> String {
     out
 }
 
+/// True when the (system-memory) structure `s` can satisfy `filter`.
+fn structure_fits(s: &gst::StructureRef, filter: &gst::Caps) -> bool {
+    let mut one = gst::Caps::new_empty();
+    if let Some(c) = one.get_mut() {
+        c.append_structure(s.to_owned());
+    }
+    one.can_intersect(filter)
+}
+
 /// Camera classification (§5.4), a pure function over the device caps.
+#[cfg(test)]
 pub fn classify_camera(caps: &gst::CapsRef, gpu_convert: bool) -> CameraClass {
+    classify_camera_with(caps, gpu_convert, true)
+}
+
+/// As [`classify_camera`]; `jpeg_ok` is false when jpegparse/jpegdec are missing, so MJPEG is
+/// not chosen (rule 2 is skipped).
+pub fn classify_camera_with(caps: &gst::CapsRef, gpu_convert: bool, jpeg_ok: bool) -> CameraClass {
+    // A raw structure only counts if it can pass the capsfilter the class will use (§5.4).
+    // Rule 1 needs a mode of at least 720p24 that the rule-1 capsfilter (≤1080p30) still admits.
+    let good_filter = "video/x-raw,width=[1280,1920],height=[720,1080],framerate=[24/1,30/1]"
+        .parse::<gst::Caps>()
+        .ok();
+    let any_filter = CameraClass::Raw { any_rate: true }
+        .source_caps()
+        .and_then(|c| c.parse::<gst::Caps>().ok());
     let mut raw_good = false;
     let mut raw_any = false;
     let mut jpeg = false;
@@ -121,11 +145,14 @@ pub fn classify_camera(caps: &gst::CapsRef, gpu_convert: bool) -> CameraClass {
         match s.name().as_str() {
             "video/x-raw" if f.contains("memory:DMABuf") => dmabuf = true,
             "video/x-raw" if is_system_memory(f) => {
-                raw_any = true;
+                if any_filter.as_ref().is_some_and(|c| structure_fits(s, c)) {
+                    raw_any = true;
+                }
                 let (w, h, fps) = structure_limits(s);
                 if w.is_some_and(|w| w >= 1280)
                     && h.is_some_and(|h| h >= 720)
                     && fps.is_some_and(|r| r >= 24.0 - 1e-6)
+                    && good_filter.as_ref().is_some_and(|c| structure_fits(s, c))
                 {
                     raw_good = true;
                 }
@@ -136,12 +163,14 @@ pub fn classify_camera(caps: &gst::CapsRef, gpu_convert: bool) -> CameraClass {
     }
     if raw_good {
         CameraClass::Raw { any_rate: false }
-    } else if jpeg {
+    } else if jpeg && jpeg_ok {
         CameraClass::Jpeg
     } else if raw_any {
         CameraClass::Raw { any_rate: true }
     } else if dmabuf && gpu_convert {
         CameraClass::DmaBuf
+    } else if jpeg {
+        CameraClass::Unsupported("MJPEG needs jpegparse and jpegdec, which are missing".into())
     } else {
         CameraClass::Unsupported(format!("no usable format: {}", caps_summary(caps)))
     }
@@ -200,6 +229,8 @@ pub struct Devices {
     next_id: u32,
     pub cameras: Vec<Entry>,
     pub microphones: Vec<Entry>,
+    /// jpegparse/jpegdec are present (MJPEG cameras are usable).
+    jpeg_ok: bool,
 }
 
 fn rate_label(rate: i32) -> String {
@@ -228,7 +259,12 @@ impl Devices {
             next_id: 1,
             cameras: Vec::new(),
             microphones: Vec::new(),
+            jpeg_ok: true,
         }
+    }
+
+    pub fn set_jpeg_ok(&mut self, ok: bool) {
+        self.jpeg_ok = ok;
     }
 
     pub fn stop(&self) {
@@ -267,7 +303,7 @@ impl Devices {
             };
             let caps = device.caps().unwrap_or_else(gst::Caps::new_empty);
             if device.has_classes("Video/Source") {
-                let class = classify_camera(&caps, gpu_convert);
+                let class = classify_camera_with(&caps, gpu_convert, self.jpeg_ok);
                 let detail = match &class {
                     CameraClass::Jpeg => {
                         let (w, h) = max_size(&caps, "image/jpeg");
@@ -415,6 +451,38 @@ mod tests {
             classify_camera(&c, false),
             CameraClass::Raw { any_rate: true }
         );
+    }
+
+    #[test]
+    fn raw_only_above_1080p_or_30fps_is_not_rule1() {
+        // 4K30 and 720p60 raw modes cannot pass the rule-1 capsfilter; MJPEG wins.
+        let c = caps(
+            "video/x-raw,format=YUY2,width=3840,height=2160,framerate=30/1; \
+             video/x-raw,format=YUY2,width=1280,height=720,framerate=60/1; \
+             video/x-raw,format=YUY2,width=640,height=480,framerate=15/1; \
+             image/jpeg,width=1920,height=1080,framerate=30/1",
+        );
+        assert_eq!(classify_camera(&c, true), CameraClass::Jpeg);
+        // Without MJPEG support the slow raw mode is used (rule 3).
+        assert_eq!(
+            classify_camera_with(&c, true, false),
+            CameraClass::Raw { any_rate: true }
+        );
+        // Only a 4K raw mode: nothing passes any raw filter.
+        let c = caps("video/x-raw,format=YUY2,width=3840,height=2160,framerate=30/1");
+        assert!(matches!(
+            classify_camera(&c, false),
+            CameraClass::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn mjpeg_without_decoder_is_unsupported() {
+        let c = caps("image/jpeg,width=1920,height=1080,framerate=30/1");
+        match classify_camera_with(&c, true, false) {
+            CameraClass::Unsupported(r) => assert!(r.contains("jpegparse"), "{r}"),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     #[test]

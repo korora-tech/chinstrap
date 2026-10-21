@@ -206,6 +206,15 @@ async fn pick_flow(
             );
         }
     };
+    // Subscribe to Closed right after start() (§4.1), so a share that ends during the rest of
+    // the setup is still seen; the subscription is dropped on every early return below.
+    let closed = match session.receive_closed().await {
+        Ok(c) => c,
+        Err(e) => {
+            close_session(&session).await;
+            return fail(format!("cannot watch the portal session: {e}"), false);
+        }
+    };
     let fd = match proxy
         .open_pipe_wire_remote(&session, Default::default())
         .await
@@ -232,14 +241,6 @@ async fn pick_flow(
         close_session(&session).await;
         return fail("the portal returned no streams".into(), false);
     }
-    // Subscribe to Closed BEFORE announcing the capture (§4.1).
-    let closed = match session.receive_closed().await {
-        Ok(c) => c,
-        Err(e) => {
-            close_session(&session).await;
-            return fail(format!("cannot watch the portal session: {e}"), false);
-        }
-    };
     let mut closed = std::pin::pin!(closed);
     let (release_tx, release_rx) = async_channel::bounded::<()>(1);
     watchers.borrow_mut().insert(capture, release_tx);

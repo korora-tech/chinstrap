@@ -148,7 +148,7 @@ impl FakeEngine {
                 Ok(Msg::Cmd(cmd)) => self.command(cmd),
                 Ok(Msg::Shutdown { deadline: _, ack }) => {
                     self.shutdown();
-                    let _ = ack.send(());
+                    let _ = ack.send(true);
                     return;
                 }
                 #[allow(unreachable_patterns)]

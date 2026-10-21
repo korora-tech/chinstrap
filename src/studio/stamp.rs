@@ -84,6 +84,8 @@ impl VideoStamp {
 pub struct AudioStamp {
     t0: Option<u64>,
     samples: u64,
+    /// A buffer was dropped; the next kept buffer carries DISCONT.
+    dropped: bool,
 }
 
 /// Result of stamping one audio buffer.
@@ -92,6 +94,8 @@ pub struct AudioStampOut {
     pub pts: u64,
     pub duration: u64,
     pub discont: bool,
+    /// Drop this buffer: the sample-counted timeline is more than 40 ms ahead of arrival.
+    pub drop: bool,
 }
 
 fn samples_to_ns(samples: u64, rate: u64) -> u64 {
@@ -101,10 +105,15 @@ fn samples_to_ns(samples: u64, rate: u64) -> u64 {
 impl AudioStamp {
     /// `arrival_ns` is the running time at which the buffer arrived (its end); `frames` its
     /// sample count; `rate` the sample rate.
+    ///
+    /// Output PTS never goes backwards. Falling more than 40 ms behind arrival re-anchors forward
+    /// (a gap, DISCONT). Running more than 40 ms ahead (a fast device clock, or a burst after a
+    /// stall) drops whole buffers until the timeline is back within 40 ms, instead of re-anchoring
+    /// backwards into overlapping timestamps; the next kept buffer carries DISCONT.
     pub fn next(&mut self, arrival_ns: u64, frames: u64, rate: u64) -> AudioStampOut {
         let duration = samples_to_ns(frames, rate);
         let estimate = arrival_ns.saturating_sub(duration);
-        let mut discont = false;
+        let mut discont = std::mem::take(&mut self.dropped);
         let t0 = match self.t0 {
             None => {
                 self.samples = 0;
@@ -112,7 +121,16 @@ impl AudioStamp {
             }
             Some(t0) => {
                 let pts = t0 + samples_to_ns(self.samples, rate);
-                if pts.abs_diff(estimate) > REANCHOR_NS {
+                if pts > estimate + REANCHOR_NS {
+                    self.dropped = true;
+                    return AudioStampOut {
+                        pts,
+                        duration,
+                        discont: false,
+                        drop: true,
+                    };
+                }
+                if estimate > pts + REANCHOR_NS {
                     discont = true;
                     self.samples = 0;
                     estimate
@@ -128,6 +146,7 @@ impl AudioStamp {
             pts,
             duration,
             discont,
+            drop: false,
         }
     }
 }
@@ -234,6 +253,9 @@ pub fn install_audio(pad: &gst::Pad, clock: gst::Clock, base: Arc<AtomicU64>) {
             Ok(mut s) => s.next(arrival, frames, fmt.rate),
             Err(_) => return gst::PadProbeReturn::Ok,
         };
+        if out.drop {
+            return gst::PadProbeReturn::Drop;
+        }
         let b = buffer.make_mut();
         b.set_pts(gst::ClockTime::from_nseconds(out.pts));
         b.set_dts(gst::ClockTime::NONE);
@@ -367,6 +389,33 @@ mod tests {
         let d = s.next(200_000_000 + 10_000_000, 480, rate);
         assert_eq!(d.pts, 200_000_000);
         assert!(!d.discont);
+    }
+
+    #[test]
+    fn audio_never_goes_backwards() {
+        let rate = 48_000;
+        let mut s = AudioStamp::default();
+        // A burst: buffers arrive faster than real time, so the sample count runs ahead.
+        let mut end = 0u64;
+        let mut dropped = 0;
+        let mut saw_discont = false;
+        for i in 0..20u64 {
+            let o = s.next(20_000_000 + i * 1_000_000, 480, rate);
+            if o.drop {
+                dropped += 1;
+                continue;
+            }
+            assert!(o.pts >= end, "pts {} before previous end {end}", o.pts);
+            assert!(o.pts <= 20_000_000 + i * 1_000_000 + REANCHOR_NS);
+            saw_discont |= o.discont;
+            end = o.pts + o.duration;
+        }
+        assert!(dropped > 0);
+        // Arrival catches up: buffers are kept again, the first one marked DISCONT.
+        let o = s.next(400_000_000, 480, rate);
+        assert!(!o.drop);
+        assert!(o.discont || saw_discont);
+        assert!(o.pts >= end);
     }
 
     #[test]

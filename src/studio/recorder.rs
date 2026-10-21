@@ -234,7 +234,11 @@ pub fn build_video(
             mid.push(queue()?);
             let (block, missing) = convert_block(None, encoders::encoder_format(enc))?;
             mid.extend(block);
-            mid.push(make("videorate")?);
+            // skip-to-first: no frames are invented before the camera's first real frame, so
+            // the muxer's first_pts_ns reports the camera's real start latency.
+            let rate = make("videorate")?;
+            set_prop(&rate, "skip-to-first", "true");
+            mid.push(rate);
             (missing, None)
         }
         Some(CameraClass::Unsupported(r)) => return Err(r.clone()),

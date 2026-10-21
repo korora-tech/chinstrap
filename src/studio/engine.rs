@@ -106,7 +106,8 @@ pub(super) enum Msg {
     Worker(WorkerResult),
     Shutdown {
         deadline: Instant,
-        ack: SyncSender<()>,
+        /// Receives true when every active segment was finalized before the deadline.
+        ack: SyncSender<bool>,
     },
 }
 
@@ -119,7 +120,7 @@ struct Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         // Do not rely on tx disconnect: other threads hold Sender clones. Never wait here.
-        let (ack, _ack_rx) = mpsc::sync_channel(1);
+        let (ack, _ack_rx) = mpsc::sync_channel::<bool>(1);
         let _ = self.tx.send(Msg::Shutdown {
             deadline: Instant::now() + Duration::from_secs(5),
             ack,
@@ -150,14 +151,16 @@ impl EngineHandle {
         }
         let (ack, ack_rx) = mpsc::sync_channel(1);
         let deadline = Instant::now() + timeout.saturating_sub(Duration::from_millis(250));
-        let result = match self.inner.tx.send(Msg::Shutdown { deadline, ack }) {
-            Ok(()) => ack_rx.recv_timeout(timeout).is_ok(),
+        // Ok(false): the engine acked but ran out of time, so some file may lack its index.
+        let acked = match self.inner.tx.send(Msg::Shutdown { deadline, ack }) {
+            Ok(()) => ack_rx.recv_timeout(timeout).ok(),
             // The thread exited without acknowledging a shutdown (e.g. it panicked).
-            Err(_) => false,
+            Err(_) => None,
         };
+        let result = acked == Some(true);
         let mut join = self.inner.join.lock().unwrap_or_else(|e| e.into_inner());
         // Join only after an ack, or when the thread has already finished (join cannot block).
-        if (result || join.as_ref().is_some_and(|h| h.is_finished()))
+        if (acked.is_some() || join.as_ref().is_some_and(|h| h.is_finished()))
             && let Some(handle) = join.take()
         {
             let _ = handle.join();
@@ -210,6 +213,8 @@ const NULL_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const SIZE_EVERY: Duration = Duration::from_secs(1);
 const LEVEL_EVERY: Duration = Duration::from_millis(100);
+/// A recording mic whose newest muxed buffer is this far behind the clock has stopped (§5.0).
+const MIC_STALL: Duration = Duration::from_secs(3);
 const NOT_FINALIZED: &str = "not finalized: file may lack index";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -266,6 +271,11 @@ struct Pipe {
     /// Gave up waiting on its Null transition; kept only for the capture fd invariant.
     abandoned: bool,
     last_error: Option<String>,
+    /// Target of the worker `set_state` currently running for this pipeline, if any.
+    in_flight: Option<gst::State>,
+    /// Null was requested while an up-transition was in flight; it is spawned once that
+    /// transition's worker reports back, so the two never race for the state lock.
+    null_pending: bool,
 }
 
 impl Pipe {
@@ -340,7 +350,9 @@ struct Engine {
     /// stop_clock of the previous segment, for the next segment's gap_before.
     gap_from: Option<u64>,
     finalize_deadline: Option<Instant>,
-    shutdown: Option<(Instant, Vec<SyncSender<()>>)>,
+    shutdown: Option<(Instant, Vec<SyncSender<bool>>)>,
+    /// False once a shutdown left some input of the active segment unfinalized.
+    shutdown_clean: bool,
     resize_after: Option<Duration>,
     last_sizes: Instant,
     last_level: Instant,
@@ -440,13 +452,28 @@ impl Engine {
 
         // §5.7 element checks.
         let missing = encoders::check_elements();
-        for (name, _, pkg) in &missing {
-            note(
-                Severity::Error,
-                format!("Missing GStreamer element {name} (package {pkg})"),
-            );
+        for (name, class, pkg) in &missing {
+            if *class == InputClass::TestOptional {
+                // §5.3: skipped when missing; nothing becomes unrecordable.
+                note(
+                    Severity::Info,
+                    format!(
+                        "Optional GStreamer element {name} (package {pkg}) is missing; the test pattern has no clock overlay"
+                    ),
+                );
+            } else {
+                note(
+                    Severity::Error,
+                    format!("Missing GStreamer element {name} (package {pkg})"),
+                );
+            }
         }
-        let missing: Vec<String> = missing.iter().map(|(n, _, _)| n.to_string()).collect();
+        let missing: Vec<String> = missing
+            .iter()
+            .filter(|(_, class, _)| *class != InputClass::TestOptional)
+            .map(|(n, _, _)| n.to_string())
+            .collect();
+        let jpeg_ok = encoders::class_ok(&missing, InputClass::MjpegCamera);
 
         // §5.6 encoder selection, §5.2 GPU path probe. The only accepted blocking period.
         let (h264, enc_notes) = if encoders::class_ok(&missing, InputClass::Video) {
@@ -475,6 +502,7 @@ impl Engine {
         }
 
         let mut devices = Devices::start();
+        devices.set_jpeg_ok(jpeg_ok);
         devices.enumerate(gpu.is_some());
         let selected_microphone = devices.microphones.first().map(|m| m.info.id);
         let portal_state = if portal.is_some() {
@@ -513,6 +541,7 @@ impl Engine {
             gap_from: None,
             finalize_deadline: None,
             shutdown: None,
+            shutdown_clean: true,
             resize_after: recorder::test_resize_after(),
             last_sizes: now,
             last_level: now,
@@ -1031,6 +1060,20 @@ impl Engine {
             }
         }
         let inputs = self.frozen_inputs();
+        if self.selected_camera.is_some() && !inputs.contains(&InputKey::Camera) {
+            self.notice(
+                Severity::Warning,
+                Some(InputKey::Camera),
+                "The selected camera cannot record; recording without it",
+            );
+        }
+        if self.selected_microphone.is_some() && !inputs.contains(&InputKey::Microphone) {
+            self.notice(
+                Severity::Warning,
+                Some(InputKey::Microphone),
+                "The selected microphone cannot record; recording without it",
+            );
+        }
         self.start_segment(inputs, None);
     }
 
@@ -1229,6 +1272,8 @@ impl Engine {
                 outcome: None,
                 abandoned: false,
                 last_error: None,
+                in_flight: None,
+                null_pending: false,
             });
             self.spawn_state(id, pipeline, gst::State::Paused);
         }
@@ -1392,11 +1437,19 @@ impl Engine {
         }
         p.stage = Stage::Nulling;
         p.deadline = Some(deadline);
+        if p.in_flight.is_some_and(|s| s != gst::State::Null) {
+            // Never race an in-flight Paused/Playing worker (§4.1: closed only once Null).
+            p.null_pending = true;
+            return;
+        }
         let pipeline = p.pipeline.clone();
         self.spawn_state(id, pipeline, gst::State::Null);
     }
 
-    fn spawn_state(&self, id: u64, pipeline: gst::Pipeline, target: gst::State) {
+    fn spawn_state(&mut self, id: u64, pipeline: gst::Pipeline, target: gst::State) {
+        if let Some(p) = self.pipes.iter_mut().find(|p| p.id == id) {
+            p.in_flight = Some(target);
+        }
         let tx = self.tx.clone();
         spawn_named(format!("chinstrap-gst-worker-{id}"), move || {
             let result = pipeline
@@ -1457,8 +1510,24 @@ impl Engine {
     }
 
     fn worker_result(&mut self, w: WorkerResult) {
+        if let Some(p) = self.pipes.iter_mut().find(|p| p.id == w.id)
+            && p.in_flight == Some(w.target)
+        {
+            p.in_flight = None;
+        }
         // Pick up an error message posted during the transition, for a better reason.
         self.drain_bus(w.id);
+        // A Null deferred behind this transition runs now.
+        if w.target != gst::State::Null
+            && let Some(p) = self.pipes.iter_mut().find(|p| p.id == w.id)
+            && p.null_pending
+            && p.in_flight.is_none()
+        {
+            p.null_pending = false;
+            let pipeline = p.pipeline.clone();
+            self.spawn_state(w.id, pipeline, gst::State::Null);
+            return;
+        }
         let Some(p) = self.pipes.iter().find(|p| p.id == w.id) else {
             return;
         };
@@ -1887,6 +1956,8 @@ impl Engine {
                     outcome: None,
                     abandoned: false,
                     last_error: None,
+                    in_flight: None,
+                    null_pending: false,
                 });
                 self.spawn_state(id, pipeline, gst::State::Playing);
             }
@@ -1928,11 +1999,9 @@ impl Engine {
                 s.convert = Some(convert);
             }
             Err(e) => {
-                if convert == GpuConvert::Va
-                    && gl_ok
-                    && !s.gl_retry
-                    && (e.contains("not-negotiated") || e.contains("not negotiated"))
-                {
+                // Any VA failure is retried with GL: a DMA-BUF modifier mismatch surfaces first
+                // as "no more input formats", before the not-negotiated flow error (§5.2).
+                if convert == GpuConvert::Va && gl_ok && !s.gl_retry {
                     // Retried by tick() once no pipeline of this capture is out of Null.
                     s.gl_retry = true;
                 } else {
@@ -2067,6 +2136,9 @@ impl Engine {
                         );
                         if let Some(g) = self.seg_mut(seg) {
                             g.timed_out = true;
+                        }
+                        if self.shutdown.is_some() {
+                            self.shutdown_clean = false;
                         }
                     }
                     self.request_null(id, Some(Outcome::Failed(NOT_FINALIZED.into())));
@@ -2268,6 +2340,7 @@ impl Engine {
             return;
         }
         self.last_sizes = now;
+        self.check_mic_stall();
         let Some(seg) = self.current_seg() else {
             return;
         };
@@ -2293,9 +2366,46 @@ impl Engine {
         }
     }
 
+    /// §5.0: a mic that stops delivering data (e.g. its node suspended after CLOCK_LOST and never
+    /// resumed) is finalized as Failed rather than silently recorded short.
+    fn check_mic_stall(&mut self) {
+        if !matches!(self.phase, Phase::Recording { .. }) {
+            return;
+        }
+        let now_ns = self.clock.time().nseconds();
+        let stalled: Vec<u64> = self
+            .pipes
+            .iter()
+            .filter(|p| !p.abandoned)
+            .filter_map(|p| match (&p.kind, &p.stage) {
+                (
+                    PipeKind::Input {
+                        key: InputKey::Microphone,
+                        rec,
+                        ..
+                    },
+                    Stage::Running { since },
+                ) if since.elapsed() >= MIC_STALL => {
+                    let base = rec.base.load(Ordering::Acquire);
+                    if base == UNSET {
+                        return None;
+                    }
+                    let running = now_ns.saturating_sub(base);
+                    let last = rec.last_pts.load(Ordering::Acquire);
+                    let last = if last == UNSET { 0 } else { last };
+                    (running.saturating_sub(last) >= MIC_STALL.as_nanos() as u64).then_some(p.id)
+                }
+                _ => None,
+            })
+            .collect();
+        for id in stalled {
+            self.fail_input(id, "microphone stopped delivering data".into());
+        }
+    }
+
     // ---- shutdown ----------------------------------------------------------------------------
 
-    fn begin_shutdown(&mut self, deadline: Instant, ack: Option<SyncSender<()>>) {
+    fn begin_shutdown(&mut self, deadline: Instant, ack: Option<SyncSender<bool>>) {
         let first = self.shutdown.is_none();
         match &mut self.shutdown {
             Some((d, acks)) => {
@@ -2306,6 +2416,15 @@ impl Engine {
         }
         if !first {
             return;
+        }
+        if let Some(seg) = self.current_seg()
+            && self
+                .session
+                .as_ref()
+                .and_then(|s| s.segs.iter().find(|g| g.index == seg))
+                .is_some_and(|g| g.timed_out)
+        {
+            self.shutdown_clean = false;
         }
         // Stop probes; their results no longer matter.
         let probes: Vec<u64> = self
@@ -2367,21 +2486,35 @@ impl Engine {
                 .map(|p| p.id)
                 .collect();
             for id in ids {
-                let input = self
-                    .pipes
-                    .iter()
-                    .find(|p| p.id == id)
-                    .and_then(|p| p.input());
+                let Some(p) = self.pipes.iter().find(|p| p.id == id) else {
+                    continue;
+                };
+                let input = p.input();
+                // A pipe already Nulling with a recorded outcome reached EOS (or failed) before
+                // the deadline: its file is as finalized as it will get, so keep that outcome.
+                let settled = match (&p.stage, &p.outcome) {
+                    (Stage::Nulling, Some(Outcome::Complete)) => Some(InputStatus::Complete),
+                    (Stage::Nulling, Some(Outcome::Failed(r) | Outcome::Discard(r))) => {
+                        Some(InputStatus::Failed { reason: r.clone() })
+                    }
+                    _ => None,
+                };
                 if let Some((s, k)) = input {
-                    self.set_file_status(
-                        s,
-                        k,
-                        InputStatus::Failed {
-                            reason: NOT_FINALIZED.into(),
-                        },
-                    );
-                    if let Some(g) = self.seg_mut(s) {
-                        g.timed_out = true;
+                    match settled {
+                        Some(status) => self.set_file_status(s, k, status),
+                        None => {
+                            self.set_file_status(
+                                s,
+                                k,
+                                InputStatus::Failed {
+                                    reason: NOT_FINALIZED.into(),
+                                },
+                            );
+                            if let Some(g) = self.seg_mut(s) {
+                                g.timed_out = true;
+                            }
+                            self.shutdown_clean = false;
+                        }
                     }
                 }
                 self.request_null(id, None);
@@ -2409,8 +2542,9 @@ impl Engine {
         self.phase = Phase::Idle;
         self.write_manifest();
         self.snapshot();
+        let clean = self.shutdown_clean;
         for ack in acks {
-            let _ = ack.send(());
+            let _ = ack.send(clean);
         }
     }
 }
