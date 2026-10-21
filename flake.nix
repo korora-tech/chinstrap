@@ -23,6 +23,7 @@
           libxcb
           libxkbcommon
           vulkan-loader
+          vulkan-headers
           wayland
           glib
         ])
@@ -43,6 +44,20 @@
           gst-plugins-ugly
         ])
         ++ [ pkgs.pipewire ];
+
+      # Nix sets SOURCE_DATE_EPOCH, which makes ggml default GGML_NATIVE=OFF *and* every SIMD flag OFF.
+      # Pin an x86-64-v3 baseline (whisper-rs-sys forwards GGML_* env vars to cmake).
+      ggmlEnv =
+        pkgs:
+        pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isx86_64 {
+          GGML_NATIVE = "OFF";
+          GGML_SSE42 = "ON";
+          GGML_AVX = "ON";
+          GGML_AVX2 = "ON";
+          GGML_BMI2 = "ON";
+          GGML_FMA = "ON";
+          GGML_F16C = "ON";
+        };
 
       gstPluginPath = pkgs: pkgs.lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" (gstPlugins pkgs);
 
@@ -69,6 +84,8 @@
               ./Cargo.toml
               ./Cargo.lock
               ./src
+              # Integration tests (worker orphan protection) run in checkPhase too.
+              (pkgs.lib.fileset.maybeMissing ./tests)
             ];
           };
 
@@ -80,7 +97,14 @@
           nativeBuildInputs = with pkgs; [
             makeWrapper
             pkg-config
+            # whisper-rs-sys: cmake builds whisper.cpp/ggml; bindgen needs libclang; glslc compiles ggml-vulkan shaders.
+            cmake
+            shaderc
+            rustPlatform.bindgenHook
           ];
+          # cmake is only for whisper-rs-sys's build.rs; keep its setup hook out of configurePhase.
+          dontUseCmakeConfigure = true;
+          env = ggmlEnv pkgs;
           buildInputs = buildInputs pkgs ++ gstPlugins pkgs;
 
           postFixup = ''
@@ -121,6 +145,7 @@
             gst_all_1.gst-plugins-base
           ];
           LD_LIBRARY_PATH = runtimeLibraryPath pkgs;
+          env = ggmlEnv pkgs;
           GST_PLUGIN_SYSTEM_PATH_1_0 = gstPluginPath pkgs;
         };
       });

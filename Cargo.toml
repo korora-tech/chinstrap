@@ -16,6 +16,14 @@ smol = "2"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+gstreamer-app = { version = "0.25", features = ["v1_26"] } # appsink: transcription decode
+# Transcription (SPEC §12): whisper.cpp with the Vulkan backend. "raw-api" re-exports whisper-rs-sys
+# for the ggml backend query and log hooks (§12.3, T3); inference only runs in --transcribe-worker.
+whisper-rs = { version = "=0.16.0", features = ["vulkan", "raw-api"] }
+# Explicit model download only: blocking HTTPS with rustls (ring, webpki-roots); no tokio.
+ureq = { version = "=3.4.2", default-features = false, features = ["rustls"] }
+sha2 = "0.10.9"
+libc = "0.2" # setpriority, prctl, getppid, kill, flock
 
 [profile.release]
 lto = "thin"
