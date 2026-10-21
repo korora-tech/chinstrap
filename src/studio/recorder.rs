@@ -130,6 +130,27 @@ fn leaky_queue() -> Result<gst::Element, String> {
     Ok(q)
 }
 
+/// The constant-rate repeater for portal sources: a live aggregator that outputs a frame every
+/// `fps` period from the first input frame until EOS, repeating the last input frame.
+/// Compositors only send frames on damage, so a static window would otherwise stop recording
+/// after its first frame, and videorate only duplicates once a newer frame arrives.
+fn repeater(va: bool, fps: (i32, i32)) -> Result<gst::Element, String> {
+    let factory = if va { "vacompositor" } else { "compositor" };
+    let agg = gst::ElementFactory::make(factory)
+        .property("force-live", true)
+        .build()
+        .map_err(|e| format!("cannot create {factory}: {e}"))?;
+    set_prop(&agg, "background", "black");
+    // Output starts at the first input frame: an aggregate with no input yet fails on radeonsi
+    // (vacompositor: "vaEndPicture: operation failed"), and the first frame's running time is
+    // the input's real start (`first_pts_ns`), as for the camera.
+    set_prop(&agg, "start-time-selection", "first");
+    // One frame of slack for the convert step before an output frame is due.
+    let frame_ns = 1_000_000_000u64 * fps.1.max(1) as u64 / fps.0.max(1) as u64;
+    set_prop(&agg, "latency", &frame_ns.to_string());
+    Ok(agg)
+}
+
 /// The `<CONVERT>` block. Returns the elements and whether `add-borders` was missing.
 ///
 /// Deviation from §5.2 (GL row): `glcolorconvert` converts to the encoder's raw `format` on
@@ -246,7 +267,10 @@ pub fn portal_source(name: &str, fd: Option<RawFd>, node: u32) -> Result<gst::El
         src.set_property("target-object", target.target_object.as_deref());
     }
     set_stream_properties(&src, &target.stream_properties);
-    set_prop(&src, "keepalive-time", "1000");
+    // No `keepalive-time`: it holds the last PipeWire buffer, and a stream returns at most one
+    // buffer to the producer per graph cycle (PipeWire 1.6.9 stream.c). niri only cycles when it
+    // renders damage, so every buffer still held at the next frame is lost to it for good and
+    // the cast starves ("no available buffer in pw stream"). The repeater fills gaps instead.
     set_prop(&src, "provide-clock", "false");
     Ok(src)
 }
@@ -344,6 +368,9 @@ pub fn build_video(
 
     // Middle: source capsfilter, decode/convert, rate.
     let mut mid: Vec<gst::Element> = Vec::new();
+    // Portal sources: the converter scales to the locked size (no frame rate) ahead of the
+    // repeater, which then outputs at the target rate.
+    let mut repeat_caps = None;
     let format = encoders::encoder_format(enc);
     let (add_borders_missing, effective_convert) = match &camera_mode {
         Some(mode) if mode.path != CameraPath::DmaBuf => {
@@ -373,9 +400,18 @@ pub fn build_video(
             let (block, missing) = convert_block(convert, format)?;
             mid.extend(block);
             mid.push(leaky_queue()?);
-            let rate = make("videorate")?;
-            set_prop(&rate, "skip-to-first", "true");
-            mid.push(rate);
+            if matches!(source, VideoSource::Portal { .. }) {
+                let caps = make("capsfilter")?;
+                repeat_caps = Some(caps.clone());
+                mid.push(caps);
+                // VAMemory end to end exactly when outcaps carries it (encoders::outcaps_string).
+                let va = matches!((convert, enc), (Some(GpuConvert::Va), H264Encoder::Va));
+                mid.push(repeater(va, target.fps)?);
+            } else {
+                let rate = make("videorate")?;
+                set_prop(&rate, "skip-to-first", "true");
+                mid.push(rate);
+            }
             (missing, convert)
         }
     };
@@ -412,6 +448,7 @@ pub fn build_video(
         clock.clone(),
         base.clone(),
         deep_copy,
+        matches!(source, VideoSource::Portal { .. }),
     );
     let size = Arc::new(Mutex::new(None));
     let fps = target.fps;
@@ -422,8 +459,17 @@ pub fn build_video(
         move |w, h| {
             // The bitrate follows the locked size; the encoder has not seen caps yet.
             encoders::set_bitrate(&encoder, enc, encoders::bitrate_kbps(role, w, h, fps));
-            gst::Caps::from_str(&encoders::outcaps_string(enc, effective_convert, w, h, fps))
-                .unwrap_or_else(|_| gst::Caps::new_any())
+            let caps =
+                gst::Caps::from_str(&encoders::outcaps_string(enc, effective_convert, w, h, fps))
+                    .unwrap_or_else(|_| gst::Caps::new_any());
+            if let Some(filter) = &repeat_caps {
+                let mut unrated = caps.clone();
+                if let Some(s) = unrated.make_mut().structure_mut(0) {
+                    s.remove_field("framerate");
+                }
+                filter.set_property("caps", unrated);
+            }
+            caps
         },
         size.clone(),
     );

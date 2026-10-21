@@ -181,7 +181,17 @@ fn running_now(clock: &gst::Clock, base: &AtomicU64) -> Option<u64> {
 /// `deep_copy` (system-memory camera frames): each frame is copied out of PipeWire's buffer
 /// right here, so the camera's few capture buffers are returned at once. Holding them in the
 /// chain's queues starves a UVC camera at 4K (it then delivers only truncated frames).
-pub fn install_video(pad: &gst::Pad, clock: gst::Clock, base: Arc<AtomicU64>, deep_copy: bool) {
+///
+/// `hold_early` (portal sources): a frame arriving after the base time is set but before it is
+/// reached is stamped 0 instead of dropped. Compositors render a window once when the cast
+/// starts and then only on damage, so dropping that frame leaves a static window with none.
+pub fn install_video(
+    pad: &gst::Pad,
+    clock: gst::Clock,
+    base: Arc<AtomicU64>,
+    deep_copy: bool,
+    hold_early: bool,
+) {
     let state = Mutex::new(VideoStamp::default());
     pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
         if info
@@ -193,8 +203,10 @@ pub fn install_video(pad: &gst::Pad, clock: gst::Clock, base: Arc<AtomicU64>, de
         if deep_copy && let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut() {
             *buffer = buffer.copy_deep().unwrap_or_else(|_| buffer.clone());
         }
-        let Some(running) = running_now(&clock, &base) else {
-            return gst::PadProbeReturn::Drop;
+        let running = match running_now(&clock, &base) {
+            Some(running) => running,
+            None if hold_early && base.load(Ordering::Acquire) != UNSET => 0,
+            None => return gst::PadProbeReturn::Drop,
         };
         let pts = state.lock().map(|mut s| s.next(running)).unwrap_or(running);
         if let Some(buffer) = info.buffer_mut() {
