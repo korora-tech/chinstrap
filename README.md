@@ -12,4 +12,6 @@ This app uses the upstream GPUI and `gpui_platform` crates from a pinned Zed rev
 cargo run
 ```
 
+With Nix, `nix run` builds and launches the app, and `nix develop` provides a shell with the toolchain and native dependencies.
+
 Both X11 and Wayland backends are enabled.
