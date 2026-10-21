@@ -13,8 +13,8 @@ use gstreamer_pbutils as pbutils;
 use gstreamer_pbutils::prelude::*;
 
 use crate::studio::{
-    self, EngineCommand, EngineEvent, InputKey, InputStatus, Phase, SegmentStatus, Severity,
-    Snapshot, SourceKind, SourceState,
+    self, EngineCommand, EngineEvent, InputKey, InputStatus, ModelState, Phase, SegmentStatus,
+    Severity, Snapshot, SourceKind, SourceState, TranscriptStatus,
 };
 
 const DURATION_TOLERANCE: Duration = Duration::from_millis(600);
@@ -266,7 +266,14 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     }
     if !h.errors.is_empty() {
         engine.shutdown_blocking(Duration::from_secs(5));
-        return Ok(summary(&h, &caps, &[], &warnings, serde_json::Value::Null));
+        return Ok(summary(
+            &h,
+            &caps,
+            &[],
+            &warnings,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+        ));
     }
 
     // 2. Inputs. (Re-assert the output root through the command path as well.)
@@ -486,6 +493,9 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     );
     let _ = manifest_ok;
 
+    // 7b. Transcription (§12.12), through the worker child like the app.
+    let transcription_json = check_transcription(&mut h, &mut warnings, &engine, &session.manifest);
+
     // 8. Finalize-on-quit. The Discoverer is dropped first: its in-process VA decoder session
     // must not share the GPU with the next segment's encoder.
     drop(disc);
@@ -535,7 +545,160 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     if mic.is_some() && h.levels == 0 {
         warnings.push("no Level events while recording".into());
     }
-    Ok(summary(&h, &caps, &seg_json, &warnings, targeting_json))
+    Ok(summary(
+        &h,
+        &caps,
+        &seg_json,
+        &warnings,
+        targeting_json,
+        transcription_json,
+    ))
+}
+
+/// Segment 1's mic transcript through the engine (only when the model is already present; the
+/// selftest never downloads), plus `CHINSTRAP_SELFTEST_SPEECH=<mkv>:<ref.txt>` through the CLI
+/// driver with a WER gate.
+fn check_transcription(
+    h: &mut Harness,
+    warnings: &mut Vec<String>,
+    engine: &studio::EngineHandle,
+    manifest: &Path,
+) -> serde_json::Value {
+    use studio::transcribe::{model, wer};
+    let mut out = serde_json::Map::new();
+    let require = std::env::var("CHINSTRAP_SELFTEST_REQUIRE_MODEL").is_ok_and(|v| v == "1");
+    // The startup check hashes the model once (about 2 s) unless its sidecar is current.
+    let snap = h.wait_for(Duration::from_secs(60), |s| {
+        s.transcription.model != ModelState::Checking
+    });
+    let usable = snap
+        .as_ref()
+        .is_some_and(|s| s.transcription.model.usable());
+    if !usable {
+        let state = snap.map(|s| format!("{:?}", s.transcription.model));
+        let msg = format!("transcription skipped: model not downloaded ({state:?})");
+        if require {
+            h.fail(msg.clone());
+        } else {
+            warnings.push(msg.clone());
+        }
+        out.insert("segment_1".into(), msg.into());
+    } else {
+        let seg1 = |s: &Snapshot| {
+            s.session
+                .as_ref()
+                .and_then(|x| x.segments.iter().find(|g| g.index == 1))
+                .map(|g| g.transcript.clone())
+        };
+        if let Some(s) = &h.snap
+            && matches!(
+                seg1(s),
+                Some(TranscriptStatus::None | TranscriptStatus::Failed { .. })
+            )
+        {
+            engine.send(EngineCommand::Transcribe { segment: 1 });
+        }
+        let t0 = Instant::now();
+        let done = h.wait_for(Duration::from_secs(60), |s| {
+            matches!(
+                seg1(s),
+                Some(TranscriptStatus::Done { .. } | TranscriptStatus::Failed { .. })
+            )
+        });
+        match done.as_ref().and_then(seg1) {
+            Some(TranscriptStatus::Done {
+                json,
+                srt,
+                vtt,
+                language,
+                words,
+                backend,
+            }) => {
+                eprintln!(
+                    "selftest: segment 1 transcript: {words} words, language {language:?}, {backend:?}, {:.1}s",
+                    t0.elapsed().as_secs_f64()
+                );
+                let parsed: Option<serde_json::Value> = std::fs::read(&json)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok());
+                match &parsed {
+                    Some(v) if v["format"] == "chinstrap-transcript" && v["version"] == 1 => {}
+                    _ => h.fail(format!("{}: not a chinstrap-transcript v1", json.display())),
+                }
+                let vtt_ok = std::fs::read_to_string(&vtt).is_ok_and(|t| t.starts_with("WEBVTT"));
+                if !srt.is_file() || !vtt_ok {
+                    h.fail("segment 1: SRT/VTT missing or malformed");
+                }
+                if words > 0 {
+                    warnings.push(format!(
+                        "segment 1 (room-noise mic) transcribed to {words} words: {:?}",
+                        parsed.as_ref().map(|v| v["text"].clone())
+                    ));
+                }
+                let status = studio_manifest(manifest).ok().and_then(|m| {
+                    m["segments"][0]["inputs"]
+                        .as_array()?
+                        .iter()
+                        .find(|i| i["key"] == "mic")
+                        .map(|i| i["transcript"]["status"].clone())
+                });
+                if status != Some(serde_json::json!("done")) {
+                    h.fail(format!(
+                        "manifest: segment 1 mic transcript status is {status:?}"
+                    ));
+                }
+                out.insert(
+                    "segment_1".into(),
+                    serde_json::json!({
+                        "words": words, "language": language,
+                        "backend": format!("{backend:?}").to_lowercase(),
+                        "seconds": t0.elapsed().as_secs_f64(),
+                        "rtf": parsed.as_ref().map(|v| v["timing"]["rtf"].clone()),
+                        "speech_spans": parsed.as_ref().map(|v| v["speech"].as_array().map_or(0, |a| a.len())),
+                    }),
+                );
+            }
+            Some(TranscriptStatus::Failed { reason }) => {
+                h.fail(format!("segment 1 transcription failed: {reason}"))
+            }
+            other => h.fail(format!(
+                "segment 1 transcription did not finish within 60 s ({other:?})"
+            )),
+        }
+    }
+    if let Ok(spec) = std::env::var("CHINSTRAP_SELFTEST_SPEECH")
+        && let Some((mkv, reference)) = spec.rsplit_once(':')
+    {
+        let (resolved, _) = model::resolve_env();
+        let reference_text = std::fs::read_to_string(reference).unwrap_or_default();
+        match studio::transcribe::transcribe_file(Path::new(mkv), &resolved, None, false, true) {
+            Ok(r) => {
+                let text = std::fs::read(&r.json)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                    .and_then(|v| v["text"].as_str().map(String::from))
+                    .unwrap_or_default();
+                let (e, n) = wer::wer(&reference_text, &text);
+                let rate = wer::wer_rate(&reference_text, &text);
+                eprintln!("selftest: speech WER {e}/{n} = {rate:.3} ({})", r.backend);
+                if rate > 0.10 {
+                    h.fail(format!("speech WER {rate:.3} > 0.10: {text:?}"));
+                }
+                out.insert(
+                    "speech".into(),
+                    serde_json::json!({"wer": rate, "errors": e, "words": n, "backend": r.backend, "rtf": r.rtf}),
+                );
+            }
+            Err((_, msg)) => {
+                if require || usable {
+                    h.fail(format!("speech transcription failed: {msg}"));
+                } else {
+                    warnings.push(format!("speech check skipped: {msg}"));
+                }
+            }
+        }
+    }
+    out.into()
 }
 
 /// PipeWire targeting regression (portal `target-object` bug):
@@ -777,6 +940,7 @@ fn summary(
     segments: &[serde_json::Value],
     warnings: &[String],
     targeting: serde_json::Value,
+    transcription: serde_json::Value,
 ) -> bool {
     let ok = h.errors.is_empty();
     let out = serde_json::json!({
@@ -785,6 +949,7 @@ fn summary(
         "convert": caps.gpu_convert.map(|c| format!("{c:?}").to_lowercase()),
         "test_size": format!("{}×{}", studio::test_size().0, studio::test_size().1),
         "targeting": targeting,
+        "transcription": transcription,
         "segments": segments,
         "warnings": warnings,
         "errors": h.errors,

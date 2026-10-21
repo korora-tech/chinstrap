@@ -25,6 +25,8 @@ use super::portal::{self, PortalCmd, PortalOutcome};
 use super::recorder::{self, InputPipeline, VideoSource};
 use super::session::{self, Manifest, ManifestInput, ManifestSegment};
 use super::stamp::{self, SizeSlot, UNSET};
+use super::transcribe::control::{JobKey, ModelEvent, SegView, Transcription, TxConfig};
+use super::transcribe::worker::WorkerEvent;
 use super::types::*;
 
 #[derive(Clone, Debug)]
@@ -104,6 +106,10 @@ pub(super) enum Msg {
     Cmd(EngineCommand),
     Portal(PortalOutcome),
     Worker(WorkerResult),
+    /// Transcription worker thread (§12.3).
+    Transcribe(WorkerEvent),
+    /// Model check/download thread (§12.5).
+    Model(ModelEvent),
     Shutdown {
         deadline: Instant,
         /// Receives true when every active segment was finalized before the deadline.
@@ -367,6 +373,8 @@ struct Engine {
     manifest_dirty: bool,
     warned: HashSet<String>,
     pending_notices: Vec<Notice>,
+    /// Transcription state (§12.3); this thread is its only owner.
+    transcription: Transcription,
 }
 
 fn kind_name(kind: SourceKind) -> &'static str {
@@ -551,6 +559,21 @@ impl Engine {
             }
         };
         let now = Instant::now();
+        let (wtx, mtx) = (Mutex::new(tx.clone()), Mutex::new(tx.clone()));
+        let transcription = Transcription::new(TxConfig::from_env(
+            Arc::new(move |e| {
+                let _ = wtx
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .send(Msg::Transcribe(e));
+            }),
+            Arc::new(move |e| {
+                let _ = mtx
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .send(Msg::Model(e));
+            }),
+        ));
         Self {
             output_root: cfg.output_root.clone(),
             tx,
@@ -590,6 +613,7 @@ impl Engine {
             manifest_dirty: false,
             warned: HashSet::new(),
             pending_notices: notices,
+            transcription,
         }
     }
 
@@ -698,10 +722,15 @@ impl Engine {
                         },
                         gap_before: g.gap_ns.map(Duration::from_nanos),
                         files: g.files.iter().map(|f| f.file.clone()).collect(),
+                        transcript: self.transcription.status(&JobKey {
+                            session_dir: s.dir.clone(),
+                            segment: g.index,
+                        }),
                     })
                     .collect(),
             }),
             can_record: self.can_record(),
+            transcription: self.transcription.info(),
         };
         let _ = self
             .events
@@ -709,6 +738,15 @@ impl Engine {
     }
 
     fn flush(&mut self) {
+        for (severity, message) in self.transcription.take_notices() {
+            self.notice(severity, None, message);
+        }
+        if self.transcription.take_manifest_dirty() {
+            self.manifest_dirty = true;
+        }
+        if self.transcription.take_dirty() {
+            self.dirty = true;
+        }
         if self.manifest_dirty {
             self.write_manifest();
         }
@@ -759,6 +797,12 @@ impl Engine {
                         {
                             mi.width = Some(w);
                             mi.height = Some(h);
+                        }
+                        if f.file.input == InputKey::Microphone {
+                            mi.transcript = self.transcription.manifest_entry(&JobKey {
+                                session_dir: s.dir.clone(),
+                                segment: g.index,
+                            });
                         }
                         mi
                     })
@@ -889,6 +933,11 @@ impl Engine {
             Msg::Cmd(cmd) => self.command(cmd),
             Msg::Portal(outcome) => self.portal_outcome(outcome),
             Msg::Worker(w) => self.worker_result(w),
+            Msg::Transcribe(e) => self.transcription.on_worker(e),
+            Msg::Model(e) => {
+                let segs = self.seg_views();
+                self.transcription.on_model(e, &segs);
+            }
             Msg::Shutdown { deadline, ack } => self.begin_shutdown(deadline, Some(ack)),
         }
     }
@@ -1009,9 +1058,20 @@ impl Engine {
                 }
             }
             EngineCommand::EndSession => {
-                if self.session.take().is_none() {
+                if self.session.is_none() {
                     self.reject(&cmd, "no open session");
                 } else {
+                    // Changes handled earlier in this batch (a transcription Done, cancel or
+                    // failure) are only marked dirty; write them while the session is open.
+                    if self.transcription.take_manifest_dirty() {
+                        self.manifest_dirty = true;
+                    }
+                    if self.manifest_dirty {
+                        self.write_manifest();
+                    }
+                    self.session = None;
+                    // Its transcription jobs keep running (§12.3 policy 11).
+                    self.transcription.set_session(None);
                     self.dirty = true;
                 }
             }
@@ -1023,7 +1083,40 @@ impl Engine {
                 _ => self.reject(&cmd, "the engine is busy"),
             },
             EngineCommand::Cut => self.cut(&cmd),
+            EngineCommand::DownloadModel
+            | EngineCommand::CancelModelDownload
+            | EngineCommand::SetAutoTranscribe(_)
+            | EngineCommand::Transcribe { .. }
+            | EngineCommand::CancelTranscription { .. }
+            | EngineCommand::CancelOtherSessionTranscriptions => {
+                let segs = self.seg_views();
+                if let Err(why) = self.transcription.command(&cmd, &segs) {
+                    self.reject(&cmd, why.as_str());
+                }
+            }
         }
+    }
+
+    /// The current session's segments as the transcription state needs them.
+    fn seg_views(&self) -> Vec<SegView> {
+        let Some(s) = &self.session else {
+            return Vec::new();
+        };
+        s.segs
+            .iter()
+            .map(|g| SegView {
+                index: g.index,
+                mic: g
+                    .files
+                    .iter()
+                    .find(|f| {
+                        f.file.input == InputKey::Microphone
+                            && f.file.status == InputStatus::Complete
+                    })
+                    .map(|f| f.file.path.clone()),
+                recording: g.status == SegmentStatus::Recording,
+            })
+            .collect()
     }
 
     fn refresh_devices(&mut self) {
@@ -1079,6 +1172,7 @@ impl Engine {
         if self.session.is_none() {
             match session::create_session_dir(&self.output_root, &session::session_name_now()) {
                 Ok((name, dir)) => {
+                    self.transcription.set_session(Some(dir.clone()));
                     self.session = Some(Session {
                         name,
                         dir,
@@ -1242,6 +1336,7 @@ impl Engine {
                     status: "starting".into(),
                     error: None,
                     device,
+                    transcript: None,
                 },
                 first: None,
                 last: None,
@@ -2158,6 +2253,7 @@ impl Engine {
         self.start_gl_retries();
         self.release_idle_captures();
         self.periodic();
+        self.transcription.tick(self.phase.is_busy());
     }
 
     fn check_deadlines(&mut self) {
@@ -2396,6 +2492,19 @@ impl Engine {
                 SegmentStatus::Complete
             };
         }
+        // §12.3 policy 1: auto-transcribe the finished mic file.
+        if let Some(sess) = &self.session {
+            let key = JobKey {
+                session_dir: sess.dir.clone(),
+                segment,
+            };
+            let mic = self
+                .seg_views()
+                .into_iter()
+                .find(|v| v.index == segment)
+                .and_then(|v| v.mic);
+            self.transcription.segment_completed(key, mic);
+        }
         self.manifest_dirty = true;
         self.dirty = true;
         self.finalize_deadline = None;
@@ -2522,6 +2631,8 @@ impl Engine {
         if !first {
             return;
         }
+        // Never waits on transcription or a download (§12.3 policy 9).
+        self.transcription.shutdown();
         if let Some(seg) = self.current_seg()
             && self
                 .session
@@ -2638,6 +2749,10 @@ impl Engine {
             }
         }
         self.devices.stop();
+        self.transcription.shutdown();
+        if self.transcription.take_manifest_dirty() {
+            self.manifest_dirty = true;
+        }
         // fds still used by pipelines that never reached Null stay open (fd invariant).
         for (id, c) in self.captures.drain() {
             if self.pipes.iter().any(|p| p.capture == Some(id)) {

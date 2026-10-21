@@ -15,6 +15,20 @@ use ui::{Cut, Quit, ShowExplorer, ShowStudio, ToggleRecord};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Transcription (SPEC §12.11), handled before anything else starts.
+    match args.get(1).map(String::as_str) {
+        Some("--transcribe-worker") => std::process::exit(studio::transcribe::run_worker()),
+        Some("--transcribe") => std::process::exit(studio::transcribe::run_cli(&args[2..])),
+        Some("--download-model") => {
+            let name = args.get(2).map(String::as_str);
+            if args.len() > 3 || name.is_some_and(|n| n.starts_with('-')) {
+                eprintln!("usage: chinstrap --download-model [name]");
+                std::process::exit(2);
+            }
+            std::process::exit(studio::transcribe::download_cli(name));
+        }
+        _ => {}
+    }
     let arg_value = |flag: &str| -> Option<Option<String>> {
         args.iter()
             .position(|a| a == flag)

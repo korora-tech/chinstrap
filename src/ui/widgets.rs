@@ -10,7 +10,7 @@ use gpui::{
 use super::theme::*;
 use crate::studio::{
     InputFile, InputStatus, Notice, SegmentStatus, SegmentSummary, Severity, SourceInfo,
-    SourceKind, SourceState,
+    SourceKind, SourceState, TranscribeStage, TranscriptStatus, WhisperBackend,
 };
 
 pub type OnClick = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
@@ -206,6 +206,82 @@ pub fn radio_row(
             .on_click(handler);
     }
     row
+}
+
+/// A checkbox-style variant of `radio_row`: a square box with a tick when `checked`.
+pub fn checkbox_row(
+    id: impl Into<ElementId>,
+    title: impl Into<SharedString>,
+    checked: bool,
+    on_click: Option<OnClick>,
+) -> Stateful<Div> {
+    let enabled = on_click.is_some();
+    let bx = div()
+        .size(px(14.0))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(if checked { ACCENT } else { 0x3a4150 }))
+        .bg(rgb(if checked { ACCENT } else { SIDEBAR }))
+        .when(checked, |d| {
+            d.child(
+                div()
+                    .text_size(px(10.0))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(0x11111a))
+                    .child("✓"),
+            )
+        });
+    let mut row = div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .rounded_md()
+        .px_2()
+        .py(px(6.0))
+        .child(bx)
+        .child(
+            div()
+                .text_size(px(11.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(match (checked, enabled) {
+                    (_, false) => DISABLED,
+                    (true, true) => TEXT,
+                    (false, true) => SECONDARY,
+                }))
+                .child(title.into()),
+        );
+    if let Some(handler) = on_click {
+        row = row
+            .hover(|s| s.bg(rgb(HOVER)).cursor_pointer())
+            .on_click(handler);
+    }
+    row
+}
+
+/// A thin progress bar on the level-meter track; `fraction` is clamped to 0..1.
+pub fn progress_bar(fraction: f32) -> Div {
+    div()
+        .relative()
+        .h(px(6.0))
+        .w_full()
+        .rounded_full()
+        .bg(rgb(PANEL_RAISED))
+        .overflow_hidden()
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .h_full()
+                .w(relative(fraction.clamp(0.0, 1.0)))
+                .rounded_full()
+                .bg(rgb(ACCENT)),
+        )
 }
 
 /// Maps dBFS to a 0..1 meter fraction over a 60 dB range.
@@ -444,7 +520,136 @@ fn file_line(file: &InputFile) -> Div {
         })
 }
 
-pub fn segment_row(seg: &SegmentSummary) -> Div {
+/// Per-segment transcript actions. `None` hides (or disables) the matching control.
+#[derive(Default)]
+pub struct SegmentActions {
+    /// "Transcribe" (no transcript) and "Retry" (failed).
+    pub transcribe: Option<OnClick>,
+    /// "Cancel" while queued or transcribing.
+    pub cancel: Option<OnClick>,
+    /// Reveal the SRT file once done.
+    pub open: Option<OnClick>,
+}
+
+fn backend_label(b: WhisperBackend) -> &'static str {
+    match b {
+        WhisperBackend::Vulkan => "Vulkan",
+        WhisperBackend::Cpu => "CPU",
+    }
+}
+
+fn transcript_line(index: u32, status: &TranscriptStatus, actions: SegmentActions) -> Div {
+    let id = index as usize;
+    let mut row = div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .pt(px(4.0))
+        .border_t_1()
+        .border_color(rgb(0x1d222b))
+        .child(
+            div()
+                .w(px(110.0))
+                .flex_shrink_0()
+                .text_size(px(11.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(SECONDARY))
+                .child("Transcript"),
+        );
+    let cancel = |a: Option<OnClick>| icon_button(("cancel-transcript", id), "Cancel", a);
+    match status {
+        TranscriptStatus::None => {
+            row = match actions.transcribe {
+                Some(click) => {
+                    row.child(icon_button(("transcribe", id), "Transcribe", Some(click)))
+                }
+                None => row.child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(MUTED))
+                        .child("No transcript"),
+                ),
+            };
+        }
+        TranscriptStatus::Queued { deferred } => {
+            row = row
+                .child(badge(
+                    if *deferred {
+                        "Queued · after recording"
+                    } else {
+                        "Queued"
+                    },
+                    MUTED,
+                ))
+                .child(cancel(actions.cancel));
+        }
+        TranscriptStatus::Running {
+            stage,
+            percent,
+            paused,
+        } => {
+            let label = match stage {
+                TranscribeStage::Starting => "Starting…".to_string(),
+                TranscribeStage::Decoding => "Decoding…".to_string(),
+                _ => format!("Transcribing {percent}%"),
+            };
+            row = row
+                .child(badge(label, ACCENT))
+                .when(*paused, |d| d.child(badge("Paused", AMBER)))
+                .child(cancel(actions.cancel));
+        }
+        TranscriptStatus::Done {
+            srt,
+            language,
+            words,
+            backend,
+            ..
+        } => {
+            let name = srt
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let detail = format!(
+                "{name} · {language} · {words} words · {}",
+                backend_label(*backend)
+            );
+            let mut link = div()
+                .id(("open-transcript", id))
+                .min_w(px(0.0))
+                .text_size(px(10.0))
+                .text_color(rgb(SECONDARY))
+                .truncate()
+                .child(detail);
+            if let Some(open) = actions.open {
+                link = link
+                    .hover(|s| s.text_color(rgb(ACCENT_TEXT)).cursor_pointer())
+                    .on_click(open);
+            }
+            row = row.child(badge("Transcript", GREEN)).child(link);
+        }
+        TranscriptStatus::Failed { reason } => {
+            let first = reason.lines().next().unwrap_or_default().to_string();
+            row = row
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(10.0))
+                        .text_color(rgb(RED))
+                        .truncate()
+                        .child(format!("Failed: {first}")),
+                )
+                .child(icon_button(
+                    ("retry-transcript", id),
+                    "Retry",
+                    actions.transcribe,
+                ));
+        }
+    }
+    row
+}
+
+pub fn segment_row(seg: &SegmentSummary, actions: SegmentActions) -> Div {
     let (status, color, reason) = match &seg.status {
         SegmentStatus::Recording => ("Recording", RED, None),
         SegmentStatus::Complete => ("Complete", GREEN, None),
@@ -499,6 +704,7 @@ pub fn segment_row(seg: &SegmentSummary) -> Div {
             )
         })
         .children(seg.files.iter().map(file_line))
+        .child(transcript_line(seg.index, &seg.transcript, actions))
 }
 
 pub fn notice_row(index: usize, notice: &Notice, on_dismiss: OnClick) -> Div {

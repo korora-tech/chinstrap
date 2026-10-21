@@ -12,13 +12,16 @@ use gpui::{
 
 use super::theme::*;
 use super::widgets::{
-    ButtonStyle, OnClick, badge, button, caption, format_duration, icon_button, level_meter,
-    notice_row, radio_row, segment_row, source_row,
+    ButtonStyle, OnClick, SegmentActions, badge, button, caption, checkbox_row, format_bytes,
+    format_duration, icon_button, level_meter, notice_row, progress_bar, radio_row, segment_row,
+    source_row,
 };
 use super::{Cut, ToggleRecord};
 use crate::studio::{
-    CaptureId, DeviceId, DeviceInfo, DeviceKind, EngineCommand, EngineEvent, EngineHandle, Notice,
-    Phase, PortalAvailability, Snapshot, SourceInfo, SourceKind, SourceState,
+    CaptureId, DeviceId, DeviceInfo, DeviceKind, EngineCommand, EngineEvent, EngineHandle,
+    InputKey, InputStatus, ModelState, Notice, Phase, PortalAvailability, SegmentStatus,
+    SegmentSummary, Snapshot, SourceInfo, SourceKind, SourceState, TranscriptStatus,
+    WhisperBackend,
 };
 
 const NOTICE_CAP: usize = 50;
@@ -694,7 +697,217 @@ impl StudioView {
             )
     }
 
-    fn segments_section(&self, snap: &Snapshot) -> Div {
+    /// "Whisper large-v3-turbo · q8_0" for the configured model (a label only; the engine
+    /// resolves the model itself).
+    fn model_label(model: &ModelState) -> String {
+        let id = match model {
+            ModelState::Ready { id, .. } | ModelState::External { id, .. } => id.clone(),
+            _ => crate::studio::transcribe::model::resolve_env().0.id(),
+        };
+        match id.rsplit_once('-') {
+            Some((base, q)) if q.starts_with('q') => format!("Whisper {base} · {q}"),
+            _ => format!("Whisper {id}"),
+        }
+    }
+
+    fn transcription_section(&self, snap: &Snapshot, cx: &mut Context<Self>) -> Div {
+        let t = &snap.transcription;
+        let muted = |text: String| div().text_size(px(10.0)).text_color(rgb(MUTED)).child(text);
+        let state: Div = match &t.model {
+            ModelState::Checking => div().child(muted("Checking…".into())),
+            ModelState::Missing { download_bytes } => div().child(button(
+                "download-model",
+                format!("Download model ({})", format_bytes(*download_bytes)),
+                None,
+                ButtonStyle::Primary,
+                Some(self.send_on_click(EngineCommand::DownloadModel, cx)),
+            )),
+            ModelState::Downloading { received, total } => div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .w_full()
+                .child(progress_bar(*received as f32 / (*total).max(1) as f32))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(muted(format!(
+                            "{} / {}",
+                            format_bytes(*received),
+                            format_bytes(*total)
+                        )))
+                        .child(icon_button(
+                            "cancel-download",
+                            "Cancel",
+                            Some(self.send_on_click(EngineCommand::CancelModelDownload, cx)),
+                        )),
+                ),
+            ModelState::Cancelling => div().child(muted("Cancelling…".into())),
+            ModelState::Verifying => div().child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(SECONDARY))
+                    .child("Verifying…"),
+            ),
+            ModelState::Ready { vad_download, .. } => {
+                let backend = t.backend.map(|b| match b {
+                    WhisperBackend::Vulkan => "· Vulkan",
+                    WhisperBackend::Cpu => "· CPU",
+                });
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(badge("Ready", GREEN))
+                    .when_some(backend, |d, b| d.child(muted(b.into())))
+                    .when_some(*vad_download, |d, bytes| {
+                        d.child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(rgb(AMBER))
+                                .child("· no VAD"),
+                        )
+                        .child(button(
+                            "download-vad",
+                            format!("Download VAD ({})", format_bytes(bytes)),
+                            None,
+                            ButtonStyle::Secondary,
+                            Some(self.send_on_click(EngineCommand::DownloadModel, cx)),
+                        ))
+                    })
+            }
+            ModelState::External { .. } => div().child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(ACCENT_TEXT))
+                    .child("custom model"),
+            ),
+            ModelState::Failed { reason, .. } => div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(RED))
+                        .child(reason.clone()),
+                )
+                .child(div().child(button(
+                    "retry-download",
+                    "Retry download",
+                    None,
+                    ButtonStyle::Secondary,
+                    Some(self.send_on_click(EngineCommand::DownloadModel, cx)),
+                ))),
+        };
+        let others = t.other_sessions.as_ref().map(|o| {
+            let mut text = format!("Earlier sessions: {} queued", o.queued);
+            if let Some(p) = o.running_percent {
+                text.push_str(&format!(" · transcribing {p}%"));
+            }
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(muted(text))
+                .child(icon_button(
+                    "cancel-other-sessions",
+                    "Cancel",
+                    Some(self.send_on_click(EngineCommand::CancelOtherSessionTranscriptions, cx)),
+                ))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(caption("TRANSCRIPTION"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(PANEL))
+                    .px_3()
+                    .py_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(TEXT))
+                                    .child(Self::model_label(&t.model)),
+                            )
+                            .child(state),
+                    )
+                    .child(checkbox_row(
+                        "auto-transcribe",
+                        "Transcribe segments automatically",
+                        t.auto,
+                        Some(self.send_on_click(EngineCommand::SetAutoTranscribe(!t.auto), cx)),
+                    ))
+                    .when(t.vulkan_broken, |d| {
+                        d.child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(rgb(AMBER))
+                                .child("Vulkan unavailable: using CPU (paused while recording)"),
+                        )
+                    })
+                    .when_some(others, |d, o| d.child(o)),
+            )
+    }
+
+    fn segment_actions(
+        &self,
+        snap: &Snapshot,
+        seg: &SegmentSummary,
+        cx: &mut Context<Self>,
+    ) -> SegmentActions {
+        let mic_complete = seg
+            .files
+            .iter()
+            .any(|f| f.input == InputKey::Microphone && f.status == InputStatus::Complete);
+        let can_transcribe = snap.transcription.model.usable()
+            && seg.status != SegmentStatus::Recording
+            && mic_complete;
+        let segment = seg.index;
+        match &seg.transcript {
+            TranscriptStatus::None | TranscriptStatus::Failed { .. } => SegmentActions {
+                transcribe: can_transcribe
+                    .then(|| self.send_on_click(EngineCommand::Transcribe { segment }, cx)),
+                ..Default::default()
+            },
+            TranscriptStatus::Queued { .. } | TranscriptStatus::Running { .. } => SegmentActions {
+                cancel: Some(
+                    self.send_on_click(EngineCommand::CancelTranscription { segment }, cx),
+                ),
+                ..Default::default()
+            },
+            TranscriptStatus::Done { srt, .. } => {
+                let srt = srt.clone();
+                SegmentActions {
+                    open: Some(Box::new(
+                        cx.listener(move |_, _: &ClickEvent, _, cx| cx.reveal_path(&srt)),
+                    )),
+                    ..Default::default()
+                }
+            }
+        }
+    }
+
+    fn segments_section(&self, snap: &Snapshot, cx: &mut Context<Self>) -> Div {
         let mut section = div().flex().flex_col().gap_2().child(
             div()
                 .flex()
@@ -712,7 +925,13 @@ impl StudioView {
         );
         match &snap.session {
             Some(session) if !session.segments.is_empty() => {
-                section = section.children(session.segments.iter().rev().map(segment_row));
+                let rows: Vec<Div> = session
+                    .segments
+                    .iter()
+                    .rev()
+                    .map(|seg| segment_row(seg, self.segment_actions(snap, seg, cx)))
+                    .collect();
+                section = section.children(rows);
             }
             _ => {
                 section = section.child(
@@ -849,7 +1068,8 @@ impl Render for StudioView {
             .gap_6()
             .child(self.sources_section(&snap, cx))
             .child(self.output_section(&snap))
-            .child(self.segments_section(&snap));
+            .child(self.transcription_section(&snap, cx))
+            .child(self.segments_section(&snap, cx));
 
         root.when_some(self.banner(&snap), |d, b| d.child(b))
             .child(self.transport(&snap, cx))

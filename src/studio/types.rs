@@ -119,6 +119,7 @@ pub struct SegmentSummary {
     pub duration: Option<Duration>,     // stop_clock - B; None while recording
     pub gap_before: Option<Duration>,   // None for first segment of a session
     pub files: Vec<InputFile>,
+    pub transcript: TranscriptStatus,   // tracks the segment's mic file (§12.2)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -144,6 +145,50 @@ pub struct Snapshot {
     /// Computed by the engine: Idle && !portal_busy && no source Checking && >=1 selected input
     /// is Ready/selectable with its elements present (and h264_encoder / gpu_convert where needed).
     pub can_record: bool,
+    pub transcription: TranscriptionInfo,
+}
+
+// ---- Transcription (SPEC §12.2) ----------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WhisperBackend { Vulkan, Cpu }
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelState {
+    Checking,                                        // startup hash/sidecar check in progress
+    Missing  { download_bytes: u64 },                // UI: "Download model (834.5 MiB)"
+    Downloading { received: u64, total: u64 },       // total = bytes of the files still missing
+    Cancelling,                                      // cancel requested; download thread not yet exited
+    Verifying,
+    Ready    { id: String, path: PathBuf, vad_download: Option<u64> }, // Some(bytes) => VAD missing, downloadable
+    Failed   { reason: String, download_bytes: u64 },// retry = DownloadModel again (resumes .part)
+    External { id: String, path: PathBuf },          // CHINSTRAP_WHISPER_MODEL=<path>: no hash check, no download
+}
+impl ModelState { pub fn usable(&self) -> bool { matches!(self, Self::Ready { .. } | Self::External { .. }) } }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TranscribeStage { Starting, Decoding, Detecting, Transcribing, Writing }
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TranscriptStatus {
+    None,                                            // not requested / no complete mic file
+    Queued   { deferred: bool },                     // deferred: CPU backend waiting for recording to stop
+    Running  { stage: TranscribeStage, percent: u8, paused: bool },
+    Done     { json: PathBuf, srt: PathBuf, vtt: PathBuf, language: String, words: u32, backend: WhisperBackend },
+    Failed   { reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OtherSessionJobs { pub queued: u32, pub running_percent: Option<u8> }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TranscriptionInfo {
+    pub model: ModelState,
+    pub auto: bool,                                  // default true
+    pub backend: Option<WhisperBackend>,             // last backend a job actually used
+    pub vulkan_broken: bool,                         // latched per §12.3 policy 7 => CPU for rest of process
+    pub queued: u32,                                 // all sessions
+    pub other_sessions: Option<OtherSessionJobs>,    // jobs belonging to ended sessions; None if none
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +216,13 @@ pub enum EngineCommand {
     ToggleRecord,         // Record if Idle, Stop if Recording, else rejected
     Cut,
     EndSession,           // Idle only
+    // Transcription (§12.2): contract extension; existing variants unchanged.
+    DownloadModel,                 // Missing|Failed, or Ready{vad_download:Some}; downloads only missing files; resumes
+    CancelModelDownload,           // Downloading|Verifying only
+    SetAutoTranscribe(bool),
+    Transcribe { segment: u32 },   // manual + retry; segment's mic Complete, segment not being recorded
+    CancelTranscription { segment: u32 },
+    CancelOtherSessionTranscriptions,
 }
 
 #[derive(Clone, Debug)]

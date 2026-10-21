@@ -10,6 +10,7 @@ mod portal;
 mod recorder;
 mod session;
 mod stamp;
+pub mod transcribe;
 
 pub use engine::{EngineConfig, EngineError, EngineHandle, start};
 pub use recorder::{check_targeting, provide_test_node, test_size};

@@ -3,7 +3,7 @@
 //! Layout: `<root>/<session>/session.json` and `<root>/<session>/segment-NNN/*.mkv`.
 //! Session and segment directories are created non-recursively with mode 0700, so an existing
 //! directory is never clobbered. Manifest writes are atomic: tmp → write → fsync → rename →
-//! fsync(dir).
+//! fsync(dir), via `write_atomic`, which the transcription outputs use too (§12.7).
 
 use std::fs::{self, DirBuilder, File};
 use std::io::{self, Write};
@@ -65,6 +65,52 @@ pub struct ManifestInput {
     pub status: String,
     pub error: Option<String>,
     pub device: Option<String>,
+    /// Mic only (§12.7). Absent in manifests written before transcription existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<ManifestTranscript>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ManifestTranscript {
+    /// "queued" | "running" | "done" | "failed" | "cancelled" | "interrupted"
+    pub status: String,
+    /// Relative to the segment directory.
+    pub json: Option<String>,
+    pub srt: Option<String>,
+    pub vtt: Option<String>,
+    pub model: Option<String>,
+    pub backend: Option<String>,
+    pub language: Option<String>,
+    pub words: Option<u32>,
+    pub error: Option<String>,
+    /// `wall_now()` of the last change.
+    pub updated: String,
+}
+
+impl ManifestTranscript {
+    pub fn status_only(status: &str) -> Self {
+        Self {
+            status: status.into(),
+            json: None,
+            srt: None,
+            vtt: None,
+            model: None,
+            backend: None,
+            language: None,
+            words: None,
+            error: None,
+            updated: wall_now(),
+        }
+    }
+
+    /// §12.3 policy 10: a `queued`/`running` status with no live job behind it is a leftover
+    /// of a process that ended mid-job, and reads as `interrupted`.
+    pub fn effective_status(&self, live_job: bool) -> &str {
+        match self.status.as_str() {
+            "queued" | "running" if !live_job => "interrupted",
+            s => s,
+        }
+    }
 }
 
 impl Manifest {
@@ -141,23 +187,44 @@ pub fn create_segment_dir(session_dir: &Path, index: u32) -> io::Result<PathBuf>
     Ok(dir)
 }
 
-/// Atomic manifest write: `session.json.tmp` → write → fsync → rename → fsync(dir).
-pub fn write_manifest(session_dir: &Path, manifest: &Manifest) -> io::Result<()> {
-    let tmp = session_dir.join(format!("{MANIFEST_NAME}.tmp"));
-    let dst = session_dir.join(MANIFEST_NAME);
-    let json = serde_json::to_vec_pretty(manifest).map_err(io::Error::other)?;
-    {
+/// The hidden temporary name `write_atomic` uses for `path` in process `pid`.
+pub fn atomic_tmp_path(path: &Path, pid: u32) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{name}.tmp-{pid}"))
+}
+
+/// Atomic write: hidden `.<name>.tmp-<pid>` → write → fsync → rename → fsync(dir). The tmp file
+/// is removed if any step before the rename fails.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = atomic_tmp_path(path, std::process::id());
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let written = (|| {
         let mut f = File::create(&tmp)?;
-        f.write_all(&json)?;
-        f.write_all(b"\n")?;
+        f.write_all(bytes)?;
         f.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    fs::rename(&tmp, &dst)?;
-    File::open(session_dir)?.sync_all()?;
+    File::open(&dir)?.sync_all()?;
     Ok(())
 }
 
-#[cfg(test)]
+/// Atomic manifest write (pretty JSON plus a trailing newline) through `write_atomic`.
+pub fn write_manifest(session_dir: &Path, manifest: &Manifest) -> io::Result<()> {
+    let mut json = serde_json::to_vec_pretty(manifest).map_err(io::Error::other)?;
+    json.push(b'\n');
+    write_atomic(&session_dir.join(MANIFEST_NAME), &json)
+}
+
 pub fn read_manifest(path: &Path) -> io::Result<Manifest> {
     let bytes = fs::read(path)?;
     serde_json::from_slice(&bytes).map_err(io::Error::other)
@@ -243,6 +310,7 @@ mod tests {
                 status: "complete".into(),
                 error: None,
                 device: None,
+                transcript: None,
             }],
         });
         write_manifest(&dir, &m).unwrap();
@@ -256,7 +324,108 @@ mod tests {
             json["segments"][0]["gap_before_ns"],
             serde_json::Value::Null
         );
-        assert!(!dir.join("session.json.tmp").exists());
+        assert!(no_tmp_files(&dir), "write_atomic leaves no tmp files");
+        // Without a transcript the key is omitted entirely (additive, version stays 1).
+        assert!(json["segments"][0]["inputs"][0].get("transcript").is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn no_tmp_files(dir: &Path) -> bool {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .all(|e| !e.file_name().to_string_lossy().contains(".tmp"))
+    }
+
+    #[test]
+    fn manifest_transcript_round_trip_and_old_manifests() {
+        let dir = scratch("transcript");
+        let mut m = Manifest::new("s", wall_now());
+        let mut input = ManifestInput {
+            key: "mic".into(),
+            kind: "microphone".into(),
+            label: "Microphone".into(),
+            file: "mic.mkv".into(),
+            codec: "opus".into(),
+            encoder: None,
+            convert: None,
+            capture: None,
+            width: None,
+            height: None,
+            framerate: None,
+            first_pts_ns: Some(0),
+            last_pts_ns: Some(1),
+            status: "complete".into(),
+            error: None,
+            device: None,
+            transcript: None,
+        };
+        input.transcript = Some(ManifestTranscript {
+            status: "done".into(),
+            json: Some("transcript.json".into()),
+            srt: Some("mic.srt".into()),
+            vtt: Some("mic.vtt".into()),
+            model: Some("large-v3-turbo-q8_0".into()),
+            backend: Some("vulkan".into()),
+            language: Some("en".into()),
+            words: Some(12),
+            error: None,
+            updated: wall_now(),
+        });
+        m.segments.push(ManifestSegment {
+            index: 1,
+            dir: segment_dir_name(1),
+            status: "complete".into(),
+            reason: None,
+            base_time_ns: Some(1),
+            stop_clock_ns: Some(2),
+            duration_ns: Some(1),
+            gap_before_ns: None,
+            started_wall: None,
+            inputs: vec![input],
+        });
+        write_manifest(&dir, &m).unwrap();
+        let back = read_manifest(&dir.join(MANIFEST_NAME)).unwrap();
+        assert_eq!(back, m);
+        assert!(no_tmp_files(&dir));
+
+        // A manifest written before transcription existed still deserializes.
+        let mut old: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join(MANIFEST_NAME)).unwrap()).unwrap();
+        old["segments"][0]["inputs"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("transcript");
+        let old: Manifest = serde_json::from_value(old).unwrap();
+        assert_eq!(old.segments[0].inputs[0].transcript, None);
+
+        // Leftover non-terminal states read as interrupted without a live job.
+        let t = ManifestTranscript::status_only("running");
+        assert_eq!(t.effective_status(false), "interrupted");
+        assert_eq!(t.effective_status(true), "running");
+        assert_eq!(
+            ManifestTranscript::status_only("queued").effective_status(false),
+            "interrupted"
+        );
+        assert_eq!(
+            ManifestTranscript::status_only("done").effective_status(false),
+            "done"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_atomic_replaces_and_cleans_up() {
+        let dir = scratch("atomic");
+        let p = dir.join("a.srt");
+        write_atomic(&p, b"one").unwrap();
+        write_atomic(&p, b"two").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"two");
+        assert!(no_tmp_files(&dir));
+        // A failing write (missing directory) leaves nothing behind.
+        assert!(write_atomic(&dir.join("missing").join("x"), b"x").is_err());
+        assert!(no_tmp_files(&dir));
+        assert_eq!(atomic_tmp_path(&p, 42), dir.join(".a.srt.tmp-42"));
         fs::remove_dir_all(dir).unwrap();
     }
 }

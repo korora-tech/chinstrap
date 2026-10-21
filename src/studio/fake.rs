@@ -2,6 +2,9 @@
 //! (`CHINSTRAP_FAKE_ENGINE=1`). It touches no devices, portals or files: every path it
 //! reports is synthetic. It follows the same command rules as the real engine (§3.1):
 //! out-of-phase commands are rejected with a Warning notice, never queued.
+//!
+//! Transcription is simulated too (§12): the model starts Missing, `DownloadModel` "downloads"
+//! it in about 4 s, and each finished segment is "transcribed" in about 2 s.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -20,6 +23,9 @@ const PICKER_DELAY: Duration = Duration::from_secs(2);
 const CLOSE_AFTER: Duration = Duration::from_secs(10);
 const LEVEL_EVERY: Duration = Duration::from_millis(100);
 const BYTES_EVERY: Duration = Duration::from_secs(1);
+const FAKE_MODEL_BYTES: u64 = 874_188_075;
+const FAKE_VAD_BYTES: u64 = 885_098;
+const TX_STEP: Duration = Duration::from_millis(200);
 
 pub(super) fn spawn(
     config: EngineConfig,
@@ -66,6 +72,10 @@ struct FakeEngine {
     last_level: Instant,
     last_bytes: Instant,
     level_phase: f32,
+    model: ModelState,
+    auto: bool,
+    cancel_at: Option<Instant>,
+    last_tx_step: Instant,
 }
 
 impl FakeEngine {
@@ -138,6 +148,12 @@ impl FakeEngine {
             last_level: now,
             last_bytes: now,
             level_phase: 0.0,
+            model: ModelState::Missing {
+                download_bytes: FAKE_MODEL_BYTES + FAKE_VAD_BYTES,
+            },
+            auto: true,
+            cancel_at: None,
+            last_tx_step: now,
         }
     }
 
@@ -178,6 +194,24 @@ impl FakeEngine {
             portal_busy: self.portal_busy,
             session: self.session.clone(),
             can_record: self.can_record(),
+            transcription: TranscriptionInfo {
+                model: self.model.clone(),
+                auto: self.auto,
+                backend: self.session.as_ref().and_then(|s| {
+                    s.segments
+                        .iter()
+                        .any(|g| matches!(g.transcript, TranscriptStatus::Done { .. }))
+                        .then_some(WhisperBackend::Vulkan)
+                }),
+                vulkan_broken: false,
+                queued: self.session.as_ref().map_or(0, |s| {
+                    s.segments
+                        .iter()
+                        .filter(|g| matches!(g.transcript, TranscriptStatus::Queued { .. }))
+                        .count() as u32
+                }),
+                other_sessions: None,
+            },
         };
         let _ = self
             .events
@@ -338,6 +372,175 @@ impl FakeEngine {
                 _ => self.reject(&cmd, "engine is busy"),
             },
             EngineCommand::Cut => self.cut(&cmd),
+            EngineCommand::DownloadModel => match self.model {
+                ModelState::Missing { download_bytes }
+                | ModelState::Failed { download_bytes, .. } => {
+                    self.model = ModelState::Downloading {
+                        received: 0,
+                        total: download_bytes,
+                    };
+                    self.snapshot();
+                }
+                _ => self.reject(&cmd, "nothing to download"),
+            },
+            EngineCommand::CancelModelDownload => match self.model {
+                ModelState::Downloading { .. } | ModelState::Verifying => {
+                    self.model = ModelState::Cancelling;
+                    self.cancel_at = Some(Instant::now() + STEP);
+                    self.snapshot();
+                }
+                _ => self.reject(&cmd, "no download is running"),
+            },
+            EngineCommand::SetAutoTranscribe(on) => {
+                self.auto = *on;
+                if *on {
+                    self.backfill();
+                }
+                self.snapshot();
+            }
+            EngineCommand::Transcribe { segment } => {
+                let usable = self.model.usable();
+                match self.segment_mut(*segment) {
+                    None => self.reject(&cmd, "unknown segment"),
+                    Some(_) if !usable => self.reject(&cmd, "the Whisper model is not ready"),
+                    Some(seg) if seg.status == SegmentStatus::Recording => {
+                        self.reject(&cmd, "the segment is still recording")
+                    }
+                    Some(seg)
+                        if matches!(
+                            seg.transcript,
+                            TranscriptStatus::Queued { .. } | TranscriptStatus::Running { .. }
+                        ) =>
+                    {
+                        self.reject(&cmd, "already queued or transcribing")
+                    }
+                    Some(seg) => {
+                        seg.transcript = TranscriptStatus::Queued { deferred: false };
+                        self.snapshot();
+                    }
+                }
+            }
+            EngineCommand::CancelTranscription { segment } => match self.segment_mut(*segment) {
+                Some(seg)
+                    if matches!(
+                        seg.transcript,
+                        TranscriptStatus::Queued { .. } | TranscriptStatus::Running { .. }
+                    ) =>
+                {
+                    seg.transcript = TranscriptStatus::None;
+                    self.snapshot();
+                }
+                _ => self.reject(&cmd, "not queued or transcribing"),
+            },
+            EngineCommand::CancelOtherSessionTranscriptions => {
+                self.reject(&cmd, "no jobs from earlier sessions")
+            }
+        }
+    }
+
+    /// Queues every finished segment with a mic file and no transcript.
+    fn backfill(&mut self) {
+        if !self.auto || !self.model.usable() {
+            return;
+        }
+        if let Some(s) = self.session.as_mut() {
+            for g in &mut s.segments {
+                let mic = g
+                    .files
+                    .iter()
+                    .any(|f| f.input == InputKey::Microphone && f.status == InputStatus::Complete);
+                if mic
+                    && g.status != SegmentStatus::Recording
+                    && g.transcript == TranscriptStatus::None
+                {
+                    g.transcript = TranscriptStatus::Queued { deferred: false };
+                }
+            }
+        }
+    }
+
+    /// Advances the fake download and the fake transcription jobs.
+    fn poll_transcription(&mut self) {
+        let now = Instant::now();
+        if self.model == ModelState::Cancelling && self.cancel_at.is_some_and(|t| now >= t) {
+            self.cancel_at = None;
+            self.model = ModelState::Missing {
+                download_bytes: FAKE_MODEL_BYTES + FAKE_VAD_BYTES,
+            };
+            self.snapshot();
+        }
+        if now.duration_since(self.last_tx_step) < TX_STEP {
+            return;
+        }
+        self.last_tx_step = now;
+        let mut changed = false;
+        if let ModelState::Downloading { received, total } = self.model {
+            let next = received + total / 20;
+            self.model = if next >= total {
+                ModelState::Ready {
+                    id: "large-v3-turbo-q8_0".into(),
+                    path: self
+                        .output_root
+                        .join("fake-models/ggml-large-v3-turbo-q8_0.bin"),
+                    vad_download: None,
+                }
+            } else {
+                ModelState::Downloading {
+                    received: next,
+                    total,
+                }
+            };
+            if self.model.usable() {
+                self.backfill();
+            }
+            changed = true;
+        }
+        if let Some(s) = self.session.as_mut() {
+            let running = s
+                .segments
+                .iter_mut()
+                .find(|g| matches!(g.transcript, TranscriptStatus::Running { .. }));
+            match running {
+                Some(g) => {
+                    if let TranscriptStatus::Running { percent, .. } = g.transcript {
+                        let p = percent.saturating_add(10);
+                        g.transcript = if p >= 100 {
+                            TranscriptStatus::Done {
+                                json: g.dir.join("transcript.json"),
+                                srt: g.dir.join("mic.srt"),
+                                vtt: g.dir.join("mic.vtt"),
+                                language: "en".into(),
+                                words: 42,
+                                backend: WhisperBackend::Vulkan,
+                            }
+                        } else {
+                            TranscriptStatus::Running {
+                                stage: TranscribeStage::Transcribing,
+                                percent: p,
+                                paused: false,
+                            }
+                        };
+                    }
+                    changed = true;
+                }
+                None => {
+                    if let Some(g) = s
+                        .segments
+                        .iter_mut()
+                        .find(|g| matches!(g.transcript, TranscriptStatus::Queued { .. }))
+                    {
+                        g.transcript = TranscriptStatus::Running {
+                            stage: TranscribeStage::Decoding,
+                            percent: 0,
+                            paused: false,
+                        };
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            self.snapshot();
         }
     }
 
@@ -456,6 +659,7 @@ impl FakeEngine {
             duration: None,
             gap_before,
             files,
+            transcript: TranscriptStatus::None,
         });
         index
     }
@@ -510,6 +714,7 @@ impl FakeEngine {
         } else {
             SegmentStatus::Complete
         };
+        self.backfill();
         survivors
     }
 
@@ -529,6 +734,7 @@ impl FakeEngine {
         for t in due {
             self.fire(t);
         }
+        self.poll_transcription();
 
         if let Phase::Recording { segment, .. } = self.phase {
             if now.duration_since(self.last_level) >= LEVEL_EVERY {
