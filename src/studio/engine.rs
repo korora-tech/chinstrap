@@ -287,6 +287,8 @@ const NULL_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const SIZE_EVERY: Duration = Duration::from_secs(1);
 const LEVEL_EVERY: Duration = Duration::from_millis(100);
+/// Why a command is refused while a Record waits for the idle previews to stop.
+const STARTING: &str = "a recording is starting";
 /// A recording mic whose newest muxed buffer is this far behind the clock has stopped (§5.0).
 const MIC_STALL: Duration = Duration::from_secs(3);
 const NOT_FINALIZED: &str = "not finalized: file may lack index";
@@ -1176,7 +1178,12 @@ impl Engine {
             | EngineCommand::SelectCameraMode(_)
                 if busy =>
             {
-                self.reject(&cmd, "not allowed while recording");
+                let why = if self.record_pending {
+                    STARTING
+                } else {
+                    "not allowed while recording"
+                };
+                self.reject(&cmd, why);
             }
             EngineCommand::SetFrameRateMode { source, mode } => match source {
                 None => {
@@ -1352,6 +1359,7 @@ impl Engine {
             EngineCommand::Record => self.record(&cmd),
             EngineCommand::Stop => self.stop(&cmd),
             EngineCommand::ToggleRecord => match self.phase {
+                Phase::Idle if self.record_pending => self.cancel_pending_record(),
                 Phase::Idle => self.record(&cmd),
                 Phase::Recording { .. } => self.stop(&cmd),
                 _ => self.reject(&cmd, "the engine is busy"),
@@ -1433,7 +1441,9 @@ impl Engine {
 
     fn record(&mut self, cmd: &EngineCommand) {
         if !self.can_record() {
-            let why = if self.phase.is_busy() || self.record_pending {
+            let why = if self.record_pending {
+                STARTING
+            } else if self.phase.is_busy() {
                 "the engine is busy"
             } else if self.portal_busy {
                 "the picker is open"
@@ -1482,7 +1492,25 @@ impl Engine {
                 }
             }
         }
-        let inputs = self.frozen_inputs();
+        let (inputs, stuck): (Vec<_>, Vec<_>) = self
+            .frozen_inputs()
+            .into_iter()
+            .partition(|k| !self.preview_stuck(*k));
+        for key in stuck {
+            self.notice(
+                Severity::Warning,
+                Some(key),
+                format!("{key:?}: its preview did not stop, so it may still hold the device; recording without it"),
+            );
+        }
+        if inputs.is_empty() {
+            self.notice(
+                Severity::Error,
+                None,
+                "Recording did not start: every input is still held by a preview that did not stop",
+            );
+            return;
+        }
         if self.selected_camera.is_some() && !inputs.contains(&InputKey::Camera) {
             self.notice(
                 Severity::Warning,
@@ -1501,6 +1529,10 @@ impl Engine {
     }
 
     fn stop(&mut self, cmd: &EngineCommand) {
+        if self.record_pending {
+            self.cancel_pending_record();
+            return;
+        }
         let Phase::Recording { segment, .. } = self.phase else {
             self.reject(cmd, "not recording");
             return;
@@ -1512,7 +1544,12 @@ impl Engine {
 
     fn cut(&mut self, cmd: &EngineCommand) {
         let Phase::Recording { segment, .. } = self.phase else {
-            self.reject(cmd, "not recording");
+            let why = if self.record_pending {
+                STARTING
+            } else {
+                "not recording"
+            };
+            self.reject(cmd, why);
             return;
         };
         self.finalize_segment(segment);
@@ -2895,6 +2932,21 @@ impl Engine {
         }
     }
 
+    /// Stop (or the shortcut again) before a pending Record started: nothing is recorded and the
+    /// idle previews come back.
+    fn cancel_pending_record(&mut self) {
+        self.record_pending = false;
+        self.dirty = true;
+    }
+
+    /// A preview of `key` gave up on reaching Null: its pipeline may still hold the node or
+    /// device until it does.
+    fn preview_stuck(&self, key: InputKey) -> bool {
+        self.pipes.iter().any(|p| {
+            p.abandoned && matches!(&p.kind, PipeKind::Preview { key: k, .. } if *k == key)
+        })
+    }
+
     /// Record accepted while previews ran: starts the segment once every preview is Null.
     fn start_pending_record(&mut self) {
         if !self.record_pending || self.pipes.iter().any(|p| p.is_preview() && !p.abandoned) {
@@ -2988,6 +3040,15 @@ impl Engine {
         }
         for key in keys {
             match self.preview_state.get(&key) {
+                // No new consumer while the old one may still hold the node.
+                _ if idle && self.preview_stuck(key) => {
+                    self.set_preview_state(
+                        key,
+                        PreviewState::Unavailable {
+                            reason: "the previous preview did not stop".into(),
+                        },
+                    );
+                }
                 Some(PreviewState::Starting)
                     if self.previews.generation(key)
                         > self.preview_seen.get(&key).copied().unwrap_or(0) =>
