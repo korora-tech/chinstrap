@@ -232,6 +232,33 @@ fn span_at(speech: Option<&[Span]>, t: f64) -> Option<&Span> {
     speech.and_then(|spans| spans.iter().find(|s| s.start <= t + 1e-6 && t < s.end))
 }
 
+/// A word whose start falls in a VAD gap (silence) moves into speech (§12.7 "Word timing"):
+/// forward to the next speech onset when that still leaves `MIN_WORD_S` before the next word
+/// (`next_t`), else back to just before the end of the previous speech span when that stays
+/// after `floor` (the previous word's start). When a decode window opens on silence, whisper
+/// (DTW and legacy alike) anchors the first word seconds before it is spoken; without this a
+/// caption then shows over the silence.
+fn snap_out_of_gap(t: f64, next_t: Option<f64>, floor: f64, speech: Option<&[Span]>) -> f64 {
+    let Some(spans) = speech else {
+        return t;
+    };
+    if spans.is_empty() || span_at(speech, t).is_some() {
+        return t;
+    }
+    if let Some(s) = spans.iter().find(|s| s.start > t)
+        && next_t.is_none_or(|n| s.start + MIN_WORD_S <= n)
+    {
+        return s.start;
+    }
+    if let Some(p) = spans.iter().rev().find(|s| s.end <= t) {
+        let back = (p.end - MIN_WORD_S).max(p.start);
+        if back > floor + MIN_WORD_S {
+            return back;
+        }
+    }
+    t
+}
+
 /// Length of the longest common subsequence of two key lists.
 fn lcs(a: &[&str], b: &[&str]) -> usize {
     let mut row = vec![0usize; b.len() + 1];
@@ -385,6 +412,8 @@ pub fn assemble(
         let seg_t1 = seg.t1 as f64 / 100.0;
         // (text, token start seconds, probabilities)
         let mut words: Vec<(String, f64, Vec<f32>)> = Vec::new();
+        // Punctuation before the segment's first word (an opening quote or dash) waits for it.
+        let mut lead = String::new();
         for tok in &seg.tokens {
             if tok.id >= eot || tok.text.starts_with("[_") || tok.text.is_empty() {
                 continue;
@@ -393,7 +422,7 @@ pub fn assemble(
             let t = cs.max(0) as f64 / 100.0;
             let punct = is_punctuation(&tok.text);
             // A leading-space token starts a word; punctuation and sub-word pieces attach to
-            // the previous word.
+            // the previous word. Casing and punctuation are kept exactly as whisper wrote them.
             let starts_word = tok.text.starts_with(' ') && !punct;
             match words.last_mut() {
                 Some(last) if !starts_word => {
@@ -402,11 +431,11 @@ pub fn assemble(
                         last.2.push(tok.p);
                     }
                 }
-                _ => words.push((
-                    tok.text.trim().to_string(),
-                    t,
-                    if punct { Vec::new() } else { vec![tok.p] },
-                )),
+                None if punct => lead.push_str(tok.text.trim()),
+                _ => {
+                    let word = format!("{}{}", std::mem::take(&mut lead), tok.text.trim());
+                    words.push((word, t, if punct { Vec::new() } else { vec![tok.p] }))
+                }
             }
         }
         let text = seg.text.trim().to_string();
@@ -483,7 +512,9 @@ pub fn assemble(
         spread_runs(seg, prev_end, next_start, speech, duration);
         let mut built: Vec<Word> = Vec::with_capacity(seg.words.len());
         for (j, w) in seg.words.iter().enumerate() {
-            let mut t = w.t;
+            let next_t = seg.words.get(j + 1).map(|n| n.t).or(next_start);
+            let floor_t = built.last().map_or(prev_end, |b: &Word| b.start);
+            let mut t = snap_out_of_gap(w.t, next_t, floor_t, speech);
             // DTW onsets run late: a segment's first word snaps back to a VAD onset just
             // before it.
             if j == 0
@@ -514,7 +545,12 @@ pub fn assemble(
         for j in 0..built.len() {
             let start = built[j].start;
             let end = match built.get(j + 1) {
-                Some(next) => next.start,
+                // A word ends at the next one, unless silence lies between them: then it ends
+                // with its speech span (plus the usual release).
+                Some(next) => match span_at(speech, start) {
+                    Some(s) if next.start > s.end + 0.3 => s.end + 0.3,
+                    _ => next.start,
+                },
                 None => {
                     let mut end = match span_at(speech, start) {
                         Some(s) => seg_end.min(s.end + 0.3),
@@ -593,6 +629,8 @@ pub fn joined_text(segments: &[Segment]) -> String {
 const CUE_MAX_S: f64 = 7.0;
 const LINE_MAX: usize = 42;
 const CUE_MAX_LINES: usize = 2;
+/// A pause between two words longer than this ends the cue.
+const CUE_PAUSE_S: f64 = 1.0;
 /// Shortest cue, so clamping to the neighbours never leaves an empty one.
 const MIN_CUE_S: f64 = 0.02;
 
@@ -636,10 +674,14 @@ pub fn cues(segments: &[Segment]) -> Vec<Cue> {
             cur.clear();
         };
         for w in &seg.words {
-            if let Some(first) = cur.first() {
+            if let (Some(first), Some(prev)) = (cur.first(), cur.last()) {
                 let mut words: Vec<&str> = cur.iter().map(|w| w.word.as_str()).collect();
                 words.push(&w.word);
-                if w.end - first.start > CUE_MAX_S || wrap(&words).len() > CUE_MAX_LINES {
+                // A pause splits the cue, so no caption stays up over silence.
+                if w.end - first.start > CUE_MAX_S
+                    || wrap(&words).len() > CUE_MAX_LINES
+                    || w.start - prev.end > CUE_PAUSE_S
+                {
                     flush(&mut cur, &mut out);
                 }
             }
@@ -759,6 +801,154 @@ mod tests {
             t0: 0,
             t_dtw: -1,
         }
+    }
+
+    /// segment-001 of the 2026-10-22T10-54-49 recording: whisper put "all" at 5.76 s, in the
+    /// silence between a 1.44-3.65 s noise span and speech at 13.31 s.
+    fn outro_layout() -> (Vec<RawSegment>, Vec<Span>) {
+        let raw = vec![RawSegment {
+            t0: 0,
+            t1: 1987,
+            text: " All right. Thank you for watching.".into(),
+            tokens: vec![
+                special("[_BEG_]"),
+                tok(" All", 100, 576),
+                tok(" right", 512, 1360),
+                tok(".", 1362, 1363),
+                tok(" Thank", 1367, 1398),
+                tok(" you", 1398, 1416),
+                tok(" for", 1416, 1440),
+                tok(" watching", 1440, 1480),
+                tok(".", 1490, 1491),
+            ],
+        }];
+        let speech = vec![
+            Span {
+                start: 1.44,
+                end: 3.65,
+            },
+            Span {
+                start: 13.31,
+                end: 18.85,
+            },
+            Span {
+                start: 19.33,
+                end: 19.87,
+            },
+        ];
+        (raw, speech)
+    }
+
+    #[test]
+    fn first_word_in_a_vad_gap_moves_to_the_next_onset() {
+        let (raw, speech) = outro_layout();
+        let segs = assemble(&raw, EOT, Some(&speech), 21.056);
+        let w = &segs[0].words;
+        assert!(w[0].start >= 13.2, "first word at {}", w[0].start);
+        assert_eq!((w[0].start, w[0].end), (13.31, 13.6));
+        assert_eq!(segs[0].start, 13.31);
+        // Casing and punctuation survive assembly.
+        assert_eq!(w[0].word, "All");
+        assert_eq!(w[1].word, "right.");
+        assert_eq!(segs[0].text, "All right. Thank you for watching.");
+        // No word starts in silence.
+        for w in w {
+            assert!(
+                speech.iter().any(|s| s.start <= w.start && w.start < s.end),
+                "{w:?} starts in silence"
+            );
+        }
+        // The first cue starts with the speech, too.
+        let c = cues(&segs);
+        assert!(c[0].start >= 13.2, "first cue at {}", c[0].start);
+        assert!(render_srt(&c).contains("00:00:13,310 -->"));
+        // Without VAD nothing moves.
+        let segs = assemble(&raw, EOT, None, 21.056);
+        assert_eq!(segs[0].words[0].start, 5.76);
+        // An onset after the next word leaves the word alone.
+        let late = [Span {
+            start: 13.7,
+            end: 18.85,
+        }];
+        let segs = assemble(&raw, EOT, Some(&late), 21.056);
+        assert_eq!(segs[0].words[0].start, 5.76);
+    }
+
+    #[test]
+    fn mid_segment_word_in_silence_moves_back_into_speech() {
+        // "two" is stamped 2 s after its span ended and the next word is in the same gap.
+        let raw = vec![RawSegment {
+            t0: 0,
+            t1: 900,
+            text: " one two three".into(),
+            tokens: vec![
+                tok(" one", 100, 100),
+                tok(" two", 300, 500),
+                tok(" three", 510, 520),
+            ],
+        }];
+        let speech = [
+            Span {
+                start: 1.0,
+                end: 3.0,
+            },
+            Span {
+                start: 8.0,
+                end: 9.0,
+            },
+        ];
+        let segs = assemble(&raw, EOT, Some(&speech), 10.0);
+        let w = &segs[0].words;
+        assert!(w[1].start < 3.0, "{:?}", w[1]);
+        // "three" cannot move forward past nothing and falls back into the first span too.
+        assert!(w[2].start < 3.0 || w[2].start >= 8.0, "{:?}", w[2]);
+    }
+
+    #[test]
+    fn leading_punctuation_attaches_to_the_next_word() {
+        let raw = vec![RawSegment {
+            t0: 0,
+            t1: 300,
+            text: " \"Hi there.\"".into(),
+            tokens: vec![
+                tok(" \"", 0, 10),
+                tok("Hi", 10, 20),
+                tok(" there", 30, 40),
+                tok(".\"", 50, 60),
+            ],
+        }];
+        let segs = assemble(&raw, EOT, None, 3.0);
+        let words: Vec<&str> = segs[0].words.iter().map(|w| w.word.as_str()).collect();
+        assert_eq!(words, vec!["\"Hi", "there.\""]);
+    }
+
+    #[test]
+    fn a_pause_splits_the_cue() {
+        let seg = Segment {
+            id: 0,
+            start: 1.0,
+            end: 6.2,
+            text: "Hello. Again".into(),
+            avg_p: 0.5,
+            words: vec![
+                Word {
+                    word: "Hello.".into(),
+                    start: 1.0,
+                    end: 1.5,
+                    p: 0.5,
+                },
+                Word {
+                    word: "Again".into(),
+                    start: 5.0,
+                    end: 6.2,
+                    p: 0.5,
+                },
+            ],
+        };
+        let c = cues(&[seg]);
+        assert_eq!(c.len(), 2);
+        assert_eq!((c[0].start, c[0].end), (1.0, 1.5));
+        assert_eq!(c[1].start, 5.0);
     }
 
     #[test]

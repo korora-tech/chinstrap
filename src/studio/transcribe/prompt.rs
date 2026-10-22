@@ -172,11 +172,22 @@ pub struct Capped {
     dropped: usize,
 }
 
+/// Starts the prompt's body (after the session hint). Without a prompt, or with one that is all
+/// lower case (session hints are folder names), large-v3-turbo with beam search can decode a
+/// whole file in lower case without punctuation after a long silent lead-in; a cased,
+/// punctuated sentence restores casing and punctuation. It goes before the glossary: placed
+/// after it, it weakened the glossary's spelling ("Rawko" instead of "Rawkode" on the
+/// 2026-10-22 outro clip), while seed-then-glossary kept both, even for a lower-case term.
+pub const STYLE_SEED: &str = "Okay, let's begin.";
+/// Bytes the seed takes at the end of a prompt (with its separating space).
+const SEED_BYTES: usize = STYLE_SEED.len() + 1;
+
 fn render_text(hint: Option<&str>, terms: &[String]) -> String {
     let mut parts = Vec::new();
     if let Some(h) = hint {
         parts.push(format!("{h}."));
     }
+    parts.push(STYLE_SEED.to_string());
     if !terms.is_empty() {
         parts.push(format!("Glossary: {}.", terms.join(", ")));
     }
@@ -204,7 +215,7 @@ pub fn cap(hint: Option<&str>, terms: &[String]) -> Capped {
             glossary_len + 2 + t.len()
         };
         let sep = usize::from(base > 0);
-        if base + sep + next > PROMPT_MAX_BYTES {
+        if base + sep + next + SEED_BYTES > PROMPT_MAX_BYTES {
             return Capped {
                 hint,
                 terms: kept,
@@ -352,18 +363,18 @@ mod tests {
     fn prompt_format() {
         let terms: Vec<String> = ["Cilium", "eBPF"].iter().map(|s| s.to_string()).collect();
         let c = cap(Some("talos demo"), &terms);
-        assert_eq!(c.render(2).as_str(), "talos demo. Glossary: Cilium, eBPF.");
-        assert_eq!(c.render(0).as_str(), "talos demo.");
+        assert_eq!(
+            c.render(2).as_str(),
+            "talos demo. Okay, let's begin. Glossary: Cilium, eBPF."
+        );
+        assert_eq!(c.render(0).as_str(), "talos demo. Okay, let's begin.");
         assert_eq!(
             cap(None, &terms).render(2).as_str(),
-            "Glossary: Cilium, eBPF."
+            "Okay, let's begin. Glossary: Cilium, eBPF."
         );
-        assert_eq!(cap(None, &[]).render(0).as_str(), "");
-        let f = fit(&cap(None, &[]), |_| {
-            panic!("an empty prompt is never tokenized")
-        })
-        .unwrap();
-        assert_eq!((f.tokens, f.bytes, f.terms_used), (0, 0, 0));
+        assert_eq!(cap(None, &[]).render(0).as_str(), STYLE_SEED);
+        let f = fit(&cap(None, &[]), fake_tokens).unwrap();
+        assert_eq!((f.bytes, f.terms_used), (STYLE_SEED.len(), 0));
     }
 
     #[test]
