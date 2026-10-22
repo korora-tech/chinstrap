@@ -21,6 +21,23 @@ pub struct DeviceInfo {
     pub name: String,                  // gst Device display_name
     pub detail: String,                // "pipewire #61 · 48 kHz · 2 ch" / "pipewire #2148 · 3840×2160 @25 · NV12"
     pub unsupported: Option<String>,   // Some(reason) => listed, not selectable
+    /// Cameras: every usable advertised mode, best first; the one with `auto` is the default.
+    pub modes: Vec<CameraModeInfo>,
+}
+
+/// One camera mode a device advertises (P2-9).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CameraModeInfo {
+    /// Stable key, e.g. "3840×2160 @25 · NV12"; `SelectCameraMode` takes it.
+    pub label: String,
+    pub width: i32,
+    pub height: i32,
+    pub fps_n: i32,
+    pub fps_d: i32,
+    /// "NV12" / "MJPEG" / "DMA-BUF …".
+    pub format: String,
+    /// The mode chosen automatically.
+    pub auto: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,18 +54,52 @@ pub struct SourceInfo {
     pub label: String,                    // "Screen 1" / "Window 2" / "Test pattern 3" (number = SourceId)
     pub logical_size: Option<(i32, i32)>, // portal Stream::size(), informational
     pub state: SourceState,
+    pub frame_rate: FrameRateMode,
+    /// The source's own maximum output rate (portal: the output refresh, from negotiation).
+    pub refresh: Option<(i32, i32)>,
+    /// Physical size from negotiation, when known.
+    pub size: Option<(i32, i32)>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum H264Encoder { Va, X264, OpenH264 }
-impl H264Encoder {
-    pub const FALLBACK_ORDER: [H264Encoder; 3] = [Self::Va, Self::X264, Self::OpenH264];
+/// A video encoder. (Historically H.264 only, hence `Capabilities::h264_encoder`.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VideoEncoder { Va, VaHevc, X264, OpenH264 }
+impl VideoEncoder {
+    /// Probe order; the first verified one is the default (`Capabilities::h264_encoder`).
+    pub const FALLBACK_ORDER: [VideoEncoder; 4] = [Self::Va, Self::VaHevc, Self::X264, Self::OpenH264];
     pub fn element_name(self) -> &'static str {
-        match self { Self::Va => "vah264enc", Self::X264 => "x264enc", Self::OpenH264 => "openh264enc" }
+        match self { Self::Va => "vah264enc", Self::VaHevc => "vah265enc", Self::X264 => "x264enc", Self::OpenH264 => "openh264enc" }
     }
     pub fn from_element_name(s: &str) -> Option<Self> {
         Self::FALLBACK_ORDER.into_iter().find(|e| e.element_name() == s)
     }
+    pub fn codec(self) -> VideoCodec { match self { Self::VaHevc => VideoCodec::Hevc, _ => VideoCodec::H264 } }
+    /// Runs on the GPU's video engine (shares its capacity with every other VA encode).
+    pub fn is_gpu(self) -> bool { matches!(self, Self::Va | Self::VaHevc) }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum VideoCodec { H264, Hevc }
+impl VideoCodec {
+    /// Manifest name: "h264" | "hevc".
+    pub fn name(self) -> &'static str { match self { Self::H264 => "h264", Self::Hevc => "hevc" } }
+}
+
+/// Frame rate of a screen/window/test source (SPEC P1-5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FrameRateMode {
+    /// Variable frame rate, up to the source's own output refresh (frames only on damage); the
+    /// engine may lower the cap to fit the measured encoder capacity (see `CapacityPlan`).
+    Native,
+    Cfr60,
+    Cfr30,
+}
+#[allow(dead_code)] // `ALL` and `label` are for the UI's frame-rate picker.
+impl FrameRateMode {
+    pub const ALL: [FrameRateMode; 3] = [Self::Native, Self::Cfr60, Self::Cfr30];
+    /// The constant rate, or None for Native.
+    pub fn cfr_fps(self) -> Option<i32> { match self { Self::Native => None, Self::Cfr60 => Some(60), Self::Cfr30 => Some(30) } }
+    pub fn label(self) -> &'static str { match self { Self::Native => "Native (variable)", Self::Cfr60 => "60 fps", Self::Cfr30 => "30 fps" } }
 }
 
 /// How DMA-BUF video is brought into a form the encoder accepts.
@@ -77,7 +128,9 @@ pub const REQUIRED_ELEMENTS: &[(&str, InputClass, &str /* nixpkgs pkg */)] = &[
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Capabilities {
-    pub h264_encoder: Option<H264Encoder>, // None => video inputs cannot record
+    pub h264_encoder: Option<VideoEncoder>, // default video encoder; None => video inputs cannot record
+    /// Every verified encoder with its measured 4K throughput (frames/s).
+    pub encoders: Vec<(VideoEncoder, f64)>,
     pub gpu_convert: Option<GpuConvert>,   // None => DMA-BUF inputs (all portal sources) cannot record
     pub missing_elements: Vec<String>,
     pub portal: PortalAvailability,
@@ -109,6 +162,59 @@ pub struct InputFile {
     pub path: PathBuf,            // absolute
     pub status: InputStatus,
     pub bytes: u64,               // refreshed ~1 Hz while recording, final on finish
+    /// Recording, but no frame has arrived yet (UI: "Waiting for first frame").
+    pub waiting_for_frame: bool,
+    /// Video only: counters and derived quality, refreshed ~1 Hz, final on finish (P2-8).
+    pub quality: Option<InputQuality>,
+}
+
+/// Per-input frame accounting (P0-1, P2-8).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct InputQuality {
+    pub encoder: Option<VideoEncoder>,
+    /// Constant rate recorded, or None for variable frame rate (Native).
+    pub nominal_fps: Option<f64>,
+    /// Native mode: the maximum rate requested from the source.
+    pub max_fps: Option<f64>,
+    pub frames_in: u64,          // frames delivered by the source and kept
+    pub dropped_corrupt: u64,    // truncated/corrupted source frames dropped
+    pub dropped_queue: u64,      // dropped by the leaky queue before the encoder (encoder too slow)
+    pub duplicated: u64,         // repeated by the rate converter/repeater (gaps), padding excluded
+    pub padded: u64,             // repeats that pad a late start to segment time zero
+    pub encoded: u64,            // frames written
+    pub effective_fps: f64,      // fresh frames per second of recording
+    pub repeat_pct: f64,         // duplicated / encoded
+    pub bitrate_kbps: u32,
+    /// First real frame relative to the segment start (the file itself starts at zero).
+    pub start_offset: Option<Duration>,
+}
+
+/// The encoder plan for the frozen inputs (P1-5): encoder per input and the load it puts on
+/// the GPU's video engine, from the measured throughput.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct CapacityPlan {
+    pub inputs: Vec<PlannedInput>,
+    /// Worst case (every encode on one video engine), percent of the usable budget.
+    pub gpu_load_pct: u32,
+    pub cpu_load_pct: u32,
+    /// The selection exceeds the measured capacity: frames will be dropped or repeated.
+    pub over: bool,
+    /// Shown before recording when `over`.
+    pub warning: Option<String>,
+    /// Automatic choices worth telling the user (codec switches, lowered native caps).
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlannedInput {
+    pub input: InputKey,
+    pub encoder: VideoEncoder,
+    pub width: i32,
+    pub height: i32,
+    /// Planned frame rate (Native: the cap).
+    pub fps: f64,
+    pub native: bool,
+    pub load_pct: u32,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -146,7 +252,27 @@ pub struct Snapshot {
     /// is Ready/selectable with its elements present (and h264_encoder / gpu_convert where needed).
     pub can_record: bool,
     pub transcription: TranscriptionInfo,
+    /// Frame-rate mode new window/screen sources get.
+    pub frame_rate_default: FrameRateMode,
+    /// The selected camera's mode override (a `CameraModeInfo::label`); None = automatic.
+    pub selected_camera_mode: Option<String>,
+    pub capacity: CapacityPlan,
+    pub vocabulary: VocabularyInfo,
 }
+
+/// Custom vocabulary (P0-2): glossary terms (Whisper prompt) and replacement rules.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct VocabularyInfo {
+    pub terms: Vec<String>,
+    pub replacements: Vec<ReplacementRule>,
+    pub glossary_path: PathBuf,
+    pub replacements_path: PathBuf,
+    /// Problems reading the files (bad lines, unreadable file).
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplacementRule { pub from: String, pub to: String }
 
 // ---- Transcription (SPEC §12.2) ----------------------------------------------------------------
 
@@ -223,6 +349,24 @@ pub enum EngineCommand {
     Transcribe { segment: u32 },   // manual + retry; segment's mic Complete, segment not being recorded
     CancelTranscription { segment: u32 },
     CancelOtherSessionTranscriptions,
+    // Frame rate, camera mode, vocabulary (P0-2, P1-5, P2-9). Sent by the UI.
+    /// Idle only. `source: None` sets the default for window/screen sources and applies it to
+    /// every one of them; `Some(id)` sets one source.
+    #[allow(dead_code)]
+    SetFrameRateMode { source: Option<SourceId>, mode: FrameRateMode },
+    /// Idle only. A `CameraModeInfo::label` of the selected camera, or None for automatic.
+    #[allow(dead_code)]
+    SelectCameraMode(Option<String>),
+    #[allow(dead_code)]
+    AddVocabularyTerm(String),
+    #[allow(dead_code)]
+    RemoveVocabularyTerm(String),
+    /// Adds a rule, replacing one with the same `from` (case-insensitive).
+    #[allow(dead_code)]
+    AddReplacement { from: String, to: String },
+    #[allow(dead_code)]
+    RemoveReplacement { from: String },
+    // Transcribe { segment } on a Done segment re-transcribes it with the current vocabulary.
 }
 
 #[derive(Clone, Debug)]

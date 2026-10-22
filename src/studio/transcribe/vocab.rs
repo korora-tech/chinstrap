@@ -1,4 +1,5 @@
-//! Custom vocabulary (§12.6): replacement rules applied after transcription.
+//! Custom vocabulary (§12.6): editing the glossary, and replacement rules applied after
+//! transcription.
 //!
 //! - `glossary.txt`: one term per line (see `prompt.rs`); the terms become Whisper's initial
 //!   prompt, which biases spelling ("Rawkode", "Kubernetes").
@@ -17,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use super::output::{Segment, Word};
 use super::prompt::{self, TERM_MAX_BYTES};
+use crate::studio::session;
 
 pub const REPLACEMENTS_MAX_BYTES: u64 = 1 << 20;
 /// Separator between the two sides of a rule.
@@ -78,6 +80,15 @@ pub fn rule(from: &str, to: &str) -> Result<Rule, String> {
     Ok(Rule { from, to })
 }
 
+/// A glossary term as typed in the UI, validated.
+pub fn term(t: &str) -> Result<String, String> {
+    let t = check_text("term", t)?;
+    if t.starts_with('#') {
+        return Err("a term cannot start with '#'".into());
+    }
+    Ok(t)
+}
+
 /// Parses `from => to` lines: trimmed, `#` and empty lines skipped, invalid lines reported.
 /// A later rule for the same `from` (case-insensitive) replaces an earlier one.
 pub fn parse_replacements(text: &str) -> (Vec<Rule>, Vec<String>) {
@@ -123,6 +134,123 @@ pub fn load_replacements(path: &Path) -> (Vec<Rule>, Vec<String>) {
         Ok(None) => (Vec::new(), Vec::new()),
         Err(e) => (Vec::new(), vec![e]),
     }
+}
+
+/// The vocabulary as the UI shows it (both files, re-read).
+pub fn info() -> crate::studio::types::VocabularyInfo {
+    let glossary_path = prompt::glossary_path();
+    let replacements_path = replacements_path();
+    let g = prompt::load_glossary(&glossary_path);
+    let (rules, rule_warnings) = load_replacements(&replacements_path);
+    crate::studio::types::VocabularyInfo {
+        terms: g.terms,
+        replacements: rules
+            .into_iter()
+            .map(|r| crate::studio::types::ReplacementRule {
+                from: r.from,
+                to: r.to,
+            })
+            .collect(),
+        glossary_path,
+        replacements_path,
+        warnings: g.warnings.into_iter().chain(rule_warnings).collect(),
+    }
+}
+
+/// Applies one vocabulary command to the files. `Ok(false)`: not a vocabulary command.
+pub fn command(cmd: &crate::studio::types::EngineCommand) -> Result<bool, String> {
+    use crate::studio::types::EngineCommand as C;
+    match cmd {
+        C::AddVocabularyTerm(t) => add_term(&prompt::glossary_path(), t)?,
+        C::RemoveVocabularyTerm(t) => remove_term(&prompt::glossary_path(), t)?,
+        C::AddReplacement { from, to } => add_rule(&replacements_path(), from, to)?,
+        C::RemoveReplacement { from } => remove_rule(&replacements_path(), from)?,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+// ---- editing -------------------------------------------------------------------------------
+
+const GLOSSARY_HEADER: &str =
+    "# Chinstrap glossary: one term per line, given to Whisper as its prompt.\n";
+const REPLACEMENTS_HEADER: &str = "# Chinstrap replacements: one `from => to` rule per line, applied after transcription\n\
+     # (case-insensitive, whole words).\n";
+
+fn write_lines(path: &Path, header: &str, lines: &[String]) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    let mut body = String::new();
+    if lines.is_empty() || !lines[0].starts_with('#') {
+        body.push_str(header);
+    }
+    for l in lines {
+        body.push_str(l);
+        body.push('\n');
+    }
+    session::write_atomic(path, body.as_bytes())
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+fn existing_lines(path: &Path) -> Result<Vec<String>, String> {
+    Ok(read_capped(path)?
+        .map(|t| t.lines().map(String::from).collect())
+        .unwrap_or_default())
+}
+
+/// Adds a glossary term (comments and other lines are kept). Adding a term that is already
+/// there (case-insensitively) is an error.
+pub fn add_term(path: &Path, t: &str) -> Result<(), String> {
+    let t = term(t)?;
+    let mut lines = existing_lines(path)?;
+    if lines.iter().any(|l| l.trim().eq_ignore_ascii_case(&t)) {
+        return Err(format!("{t:?} is already in the glossary"));
+    }
+    lines.push(t);
+    write_lines(path, GLOSSARY_HEADER, &lines)
+}
+
+/// Removes a glossary term (every line equal to it, case-insensitively).
+pub fn remove_term(path: &Path, t: &str) -> Result<(), String> {
+    let t = t.trim();
+    let mut lines = existing_lines(path)?;
+    let before = lines.len();
+    lines.retain(|l| !l.trim().eq_ignore_ascii_case(t));
+    if lines.len() == before {
+        return Err(format!("{t:?} is not in the glossary"));
+    }
+    write_lines(path, GLOSSARY_HEADER, &lines)
+}
+
+fn rule_from(line: &str) -> Option<&str> {
+    let l = line.trim();
+    if l.starts_with('#') {
+        return None;
+    }
+    l.split_once(ARROW).map(|(f, _)| f.trim())
+}
+
+/// Adds a rule, replacing an existing rule for the same `from` (case-insensitive).
+pub fn add_rule(path: &Path, from: &str, to: &str) -> Result<(), String> {
+    let r = rule(from, to)?;
+    let mut lines = existing_lines(path)?;
+    lines.retain(|l| !rule_from(l).is_some_and(|f| f.eq_ignore_ascii_case(&r.from)));
+    lines.push(format!("{} {ARROW} {}", r.from, r.to));
+    write_lines(path, REPLACEMENTS_HEADER, &lines)
+}
+
+/// Removes the rule for `from` (case-insensitive).
+pub fn remove_rule(path: &Path, from: &str) -> Result<(), String> {
+    let from = from.trim();
+    let mut lines = existing_lines(path)?;
+    let before = lines.len();
+    lines.retain(|l| !rule_from(l).is_some_and(|f| f.eq_ignore_ascii_case(from)));
+    if lines.len() == before {
+        return Err(format!("no replacement for {from:?}"));
+    }
+    write_lines(path, REPLACEMENTS_HEADER, &lines)
 }
 
 // ---- applying ------------------------------------------------------------------------------
@@ -366,5 +494,40 @@ mod tests {
         let mut words = vec![w("\"Raw", 0.0, 1.0), w("code!\"", 1.0, 2.0)];
         assert_eq!(replace_words(&mut words, &r("raw code", "Rawkode")), 1);
         assert_eq!(words[0].word, "\"Rawkode!\"");
+    }
+
+    #[test]
+    fn editing_files_keeps_comments() {
+        let dir = std::env::temp_dir().join(format!("chinstrap-vocab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let g = dir.join("glossary.txt");
+        add_term(&g, " Rawkode ").unwrap();
+        add_term(&g, "Kubernetes").unwrap();
+        assert!(add_term(&g, "rawkode").is_err());
+        assert_eq!(
+            prompt::load_glossary(&g).terms,
+            vec!["Rawkode", "Kubernetes"]
+        );
+        remove_term(&g, "RAWKODE").unwrap();
+        assert!(remove_term(&g, "nope").is_err());
+        let text = std::fs::read_to_string(&g).unwrap();
+        assert!(text.starts_with('#'), "{text}");
+        assert_eq!(prompt::load_glossary(&g).terms, vec!["Kubernetes"]);
+
+        let p = dir.join("replacements.txt");
+        add_rule(&p, "raw code", "Rawkode").unwrap();
+        add_rule(&p, "Raw Code", "RawKode").unwrap(); // same from: replaced
+        add_rule(&p, "rockwood", "Rawkode").unwrap();
+        let (rules, warnings) = load_replacements(&p);
+        assert!(warnings.is_empty());
+        assert_eq!(
+            rules,
+            vec![r("Raw Code", "RawKode"), r("rockwood", "Rawkode")]
+        );
+        remove_rule(&p, "raw code").unwrap();
+        assert!(remove_rule(&p, "raw code").is_err());
+        assert_eq!(load_replacements(&p).0, vec![r("rockwood", "Rawkode")]);
+        assert_eq!(load_replacements(&dir.join("missing")).0, vec![]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

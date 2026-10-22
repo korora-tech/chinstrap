@@ -56,9 +56,15 @@ pub struct ManifestInput {
     pub capture: Option<u32>,
     pub width: Option<i32>,
     pub height: Option<i32>,
-    /// Recorded frame rate, e.g. "25/1" (video only).
+    /// Recorded frame rate, e.g. "25/1" (video only); "variable" for Native.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framerate: Option<String>,
+    /// Native (variable rate) only: the maximum rate requested from the source, e.g. "60/1";
+    /// absent when the source's own maximum applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_framerate: Option<String>,
+    /// Running time of the first real frame (video: its arrival; the file itself starts at
+    /// zero, showing that frame until the next one).
     pub first_pts_ns: Option<u64>,
     pub last_pts_ns: Option<u64>,
     /// "starting" | "recording" | "finalizing" | "complete" | "failed"
@@ -68,6 +74,24 @@ pub struct ManifestInput {
     /// Mic only (§12.7). Absent in manifests written before transcription existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<ManifestTranscript>,
+    /// Video only: frame accounting (P2-8). Absent in older manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality: Option<ManifestQuality>,
+}
+
+/// Frame accounting of one video input (P0-1, P2-8).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ManifestQuality {
+    pub frames_in: u64,
+    pub dropped_corrupt: u64,
+    pub dropped_queue: u64,
+    pub duplicated: u64,
+    pub padded: u64,
+    pub encoded: u64,
+    pub effective_fps: f64,
+    pub repeat_pct: f64,
+    pub bitrate_kbps: u32,
+    pub start_offset_ns: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -305,12 +329,14 @@ mod tests {
                 width: Some(1280),
                 height: Some(720),
                 framerate: Some("30/1".into()),
+                max_framerate: None,
                 first_pts_ns: Some(1),
                 last_pts_ns: Some(2),
                 status: "complete".into(),
                 error: None,
                 device: None,
                 transcript: None,
+                quality: None,
             }],
         });
         write_manifest(&dir, &m).unwrap();
@@ -353,12 +379,14 @@ mod tests {
             width: None,
             height: None,
             framerate: None,
+            max_framerate: None,
             first_pts_ns: Some(0),
             last_pts_ns: Some(1),
             status: "complete".into(),
             error: None,
             device: None,
             transcript: None,
+            quality: None,
         };
         input.transcript = Some(ManifestTranscript {
             status: "done".into(),

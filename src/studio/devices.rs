@@ -8,7 +8,7 @@ use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::*;
 
-use super::types::{DeviceId, DeviceInfo, DeviceKind};
+use super::types::{CameraModeInfo, DeviceId, DeviceInfo, DeviceKind};
 
 /// Largest camera mode recorded without downscaling (DCI 4K width, UHD height).
 pub const CAMERA_MAX_W: i32 = 4096;
@@ -92,6 +92,31 @@ impl CameraMode {
         super::stamp::lock_size_within(self.width, self.height, CAMERA_MAX_W, CAMERA_MAX_H)
     }
 
+    /// Contract view of this mode (`auto`: the automatic choice).
+    pub fn info(&self, auto: bool) -> CameraModeInfo {
+        let (w, h) = self.output_size();
+        let (n, d) = self.output_fps();
+        CameraModeInfo {
+            label: self.label(),
+            width: w,
+            height: h,
+            fps_n: n,
+            fps_d: d,
+            format: self.format_label(),
+            auto,
+        }
+    }
+
+    fn format_label(&self) -> String {
+        match (self.path, &self.format) {
+            (CameraPath::Raw, Some(f)) => f.clone(),
+            (CameraPath::Raw, None) => "raw".into(),
+            (CameraPath::Jpeg, _) => "MJPEG".into(),
+            (CameraPath::DmaBuf, Some(f)) => format!("DMA-BUF {f}"),
+            (CameraPath::DmaBuf, None) => "DMA-BUF".into(),
+        }
+    }
+
     /// UI label, e.g. "3840×2160 @25 · NV12" or "1920×1080 @30 · MJPEG".
     pub fn label(&self) -> String {
         let (w, h) = self.output_size();
@@ -101,14 +126,7 @@ impl CameraMode {
         } else {
             format!("{:.2}", n as f64 / d as f64)
         };
-        let what = match (self.path, &self.format) {
-            (CameraPath::Raw, Some(f)) => f.clone(),
-            (CameraPath::Raw, None) => "raw".into(),
-            (CameraPath::Jpeg, _) => "MJPEG".into(),
-            (CameraPath::DmaBuf, Some(f)) => format!("DMA-BUF {f}"),
-            (CameraPath::DmaBuf, None) => "DMA-BUF".into(),
-        };
-        format!("{w}×{h} @{fps} · {what}")
+        format!("{w}×{h} @{fps} · {}", self.format_label())
     }
 }
 
@@ -302,14 +320,8 @@ pub fn classify_camera(caps: &gst::CapsRef, gpu_convert: bool) -> CameraClass {
 /// are not chosen), `gpu_convert` false when no GPU path exists (DMA-BUF modes are not chosen).
 pub fn classify_camera_with(caps: &gst::CapsRef, gpu_convert: bool, jpeg_ok: bool) -> CameraClass {
     let modes = camera_modes(caps);
-    let best = modes
-        .iter()
-        .filter(|m| match m.path {
-            CameraPath::Raw => true,
-            CameraPath::Jpeg => jpeg_ok,
-            CameraPath::DmaBuf => gpu_convert,
-        })
-        .max_by_key(|m| mode_rank(m));
+    let best = usable_modes(caps, gpu_convert, jpeg_ok).into_iter().next();
+    let best = best.as_ref();
     match best {
         Some(m) => CameraClass::Usable(m.clone()),
         None if modes.iter().any(|m| m.path == CameraPath::Jpeg) && !jpeg_ok => {
@@ -317,6 +329,22 @@ pub fn classify_camera_with(caps: &gst::CapsRef, gpu_convert: bool, jpeg_ok: boo
         }
         None => CameraClass::Unsupported(format!("no usable format: {}", caps_summary(caps))),
     }
+}
+
+/// Every mode that can be recorded, best (the automatic choice) first, one per label.
+pub fn usable_modes(caps: &gst::CapsRef, gpu_convert: bool, jpeg_ok: bool) -> Vec<CameraMode> {
+    let mut modes: Vec<CameraMode> = camera_modes(caps)
+        .into_iter()
+        .filter(|m| match m.path {
+            CameraPath::Raw => true,
+            CameraPath::Jpeg => jpeg_ok,
+            CameraPath::DmaBuf => gpu_convert,
+        })
+        .collect();
+    modes.sort_by_key(|m| std::cmp::Reverse(mode_rank(m)));
+    let mut seen = std::collections::HashSet::new();
+    modes.retain(|m| seen.insert(m.label()));
+    modes
 }
 
 /// Reads a device property as a string, whatever its GType.
@@ -341,11 +369,20 @@ pub struct Entry {
     pub info: DeviceInfo,
     pub device: gst::Device,
     pub class: Option<CameraClass>,
+    /// Cameras: every usable mode, best first (same order as `info.modes`).
+    pub modes: Vec<CameraMode>,
     /// `object.serial` for pipewire devices.
     pub serial: Option<String>,
 }
 
 impl Entry {
+    /// The mode labelled `label`, or the automatic one.
+    pub fn mode(&self, label: Option<&str>) -> Option<&CameraMode> {
+        label
+            .and_then(|l| self.modes.iter().find(|m| m.label() == l))
+            .or_else(|| self.class.as_ref().and_then(CameraClass::mode))
+    }
+
     /// Creates the source element (`device.create_element`, else `pipewiresrc target-object`).
     /// The provider targets the node by `object.serial`, which is correct; the stream is also
     /// marked `node.dont-fallback` so a vanished device fails loudly instead of WirePlumber
@@ -454,6 +491,7 @@ impl Devices {
             let caps = device.caps().unwrap_or_else(gst::Caps::new_empty);
             if device.has_classes("Video/Source") {
                 let class = classify_camera_with(&caps, gpu_convert, self.jpeg_ok);
+                let modes = usable_modes(&caps, gpu_convert, self.jpeg_ok);
                 let detail = match &class {
                     CameraClass::Usable(m) => format!("{origin} · {}", m.label()),
                     CameraClass::Unsupported(_) => origin.clone(),
@@ -470,9 +508,15 @@ impl Devices {
                         name,
                         detail,
                         unsupported,
+                        modes: modes
+                            .iter()
+                            .enumerate()
+                            .map(|(i, m)| m.info(i == 0))
+                            .collect(),
                     },
                     device,
                     class: Some(class),
+                    modes,
                     serial,
                 });
             } else if device.has_classes("Audio/Source") {
@@ -496,9 +540,11 @@ impl Devices {
                         name,
                         detail,
                         unsupported: None,
+                        modes: Vec::new(),
                     },
                     device,
                     class: None,
+                    modes: Vec::new(),
                     serial,
                 });
             }
@@ -584,6 +630,12 @@ mod tests {
         assert!(filter.can_intersect(&c));
         // Same result without a GPU path; without MJPEG support too.
         assert_eq!(usable(classify_camera_with(&c, false, false)), m);
+        // The mode list: the automatic choice first, then the other advertised paths.
+        let modes = usable_modes(&c, true, true);
+        assert_eq!(modes[0], m);
+        let labels: Vec<String> = modes.iter().map(|m| m.label()).collect();
+        assert!(labels.iter().any(|l| l.contains("MJPEG")), "{labels:?}");
+        assert!(modes[0].info(true).auto && !modes[1].info(false).auto);
     }
 
     #[test]

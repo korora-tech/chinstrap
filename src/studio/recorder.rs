@@ -6,24 +6,23 @@
 use std::os::fd::RawFd;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
-use super::devices::{CameraClass, CameraPath, Entry};
+use super::devices::{CameraMode, CameraPath, Entry};
 use super::encoders::{self, Role, set_prop};
-use super::stamp::{self, SizeSlot, UNSET};
-use super::types::{GpuConvert, H264Encoder};
+use super::stamp::{self, Counters, SizeSlot, UNSET};
+use super::types::{GpuConvert, VideoEncoder};
 
 /// Caps accepted right after a pipewiresrc (D7): DMA-BUF with modifiers, or plain raw.
 pub const SOURCE_CAPS: &str = "video/x-raw(memory:DMABuf),format=DMA_DRM; video/x-raw";
 /// Default test pattern size; `CHINSTRAP_TEST_SIZE=WxH` overrides it.
 pub const TEST_SIZE: (i32, i32) = (1280, 720);
 pub const TEST_RESIZE_CAPS: &str = "video/x-raw,width=1000,height=700,framerate=30/1";
-pub const H264_CAPS: &str = "video/x-h264,profile=(string){high,main,constrained-baseline}";
 pub const MIC_CAPS: &str = "audio/x-raw,rate=48000,channels=[1,2]";
 
 /// Parses a `WxH` size (both sides 16..=8192).
@@ -41,29 +40,152 @@ pub fn test_size() -> (i32, i32) {
         .unwrap_or(TEST_SIZE)
 }
 
-pub fn test_caps() -> String {
-    let (w, h) = test_size();
-    format!("video/x-raw,width={w},height={h},framerate=30/1")
+/// Test pattern caps at `fps` (`size` overrides `CHINSTRAP_TEST_SIZE`).
+pub fn test_caps_at(fps: (i32, i32), size: Option<(i32, i32)>) -> String {
+    let (w, h) = size.unwrap_or_else(test_size);
+    format!(
+        "video/x-raw,width={w},height={h},framerate={}/{}",
+        fps.0,
+        fps.1.max(1)
+    )
 }
 
-/// What one video input records: frame rate and the largest size before downscaling.
+/// How a video input's frames are timed (P1-5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rate {
+    /// Constant rate: videorate (camera, test) or the repeater (portal) fills gaps.
+    Cfr((i32, i32)),
+    /// Variable rate: frames as the source sends them, stamped on arrival. `cap` is the
+    /// maximum rate requested from the source (None: the source's own maximum, e.g. the
+    /// output refresh); `gop_fps` sizes the encoder's frame-counted GOP limit.
+    Native { cap: Option<i32>, gop_fps: i32 },
+}
+
+impl Rate {
+    pub fn cfr(self) -> Option<(i32, i32)> {
+        match self {
+            Rate::Cfr(f) => Some(f),
+            Rate::Native { .. } => None,
+        }
+    }
+}
+
+/// What one video input records: frame timing and the largest size before downscaling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VideoTarget {
-    pub fps: (i32, i32),
+    pub rate: Rate,
     pub max: (i32, i32),
+}
+
+/// Native test pattern: rendered at this rate with about half the frames dropped in an
+/// irregular pattern, so the recording is bursty variable-rate like a compositor's
+/// damage-driven stream.
+pub const TEST_NATIVE_FPS: i32 = 60;
+/// Of every 8 rendered frames, those whose bit is set are dropped (irregular gaps of 1-3
+/// frames; identity's drop-probability would also send GAP events, which encoders turn into
+/// empty frames with their own timestamps).
+const TEST_NATIVE_DROP_MASK: u8 = 0b1011_0010;
+/// Keyframe interval for variable-rate recordings (GOP limits count frames, not time).
+pub const KEYFRAME_EVERY_NS: u64 = 2_000_000_000;
+
+/// Frame rates offered to a portal source as its maximum, highest first: an enum, never a
+/// range. PipeWire fixates a range to its default, which gstpipewireformat sets to the range
+/// minimum (1 fps); an enum intersected with the producer's range keeps the first value in it.
+/// 60000/1001, 5994/100 and 30000/1001 keep ~59.94 Hz outputs negotiable (niri reports the
+/// refresh in mHz, e.g. 59940/1000, just below 60000/1001).
+const MAX_RATE_STEPS: [(i32, i32); 17] = [
+    (240, 1),
+    (165, 1),
+    (144, 1),
+    (120, 1),
+    (100, 1),
+    (90, 1),
+    (75, 1),
+    (60, 1),
+    (60000, 1001),
+    (5994, 100),
+    (50, 1),
+    (48, 1),
+    (30, 1),
+    (30000, 1001),
+    (25, 1),
+    (24, 1),
+    (15, 1),
+];
+
+/// `max-framerate` field asking a portal source for at most `cap` fps.
+pub fn max_rate_field(cap: i32) -> String {
+    let mut steps: Vec<String> = vec![format!("{cap}/1")];
+    for (n, d) in MAX_RATE_STEPS {
+        if (n as f64 / d as f64) < cap as f64 - 0.01 {
+            steps.push(format!("{n}/{d}"));
+        }
+    }
+    format!("max-framerate=(fraction){{ {} }}", steps.join(", "))
+}
+
+/// Caps right after a portal pipewiresrc: [`SOURCE_CAPS`], with a maximum rate when capped.
+pub fn portal_source_caps(cap: Option<i32>) -> String {
+    match cap {
+        None => SOURCE_CAPS.to_string(),
+        Some(c) => {
+            let f = max_rate_field(c);
+            format!("video/x-raw(memory:DMABuf),format=DMA_DRM,{f}; video/x-raw,{f}")
+        }
+    }
+}
+
+/// Selftest hooks for a test pattern (never set by the app).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TestBehaviour {
+    /// Size instead of `CHINSTRAP_TEST_SIZE`.
+    pub size: Option<(i32, i32)>,
+    /// No frame before this much running time (a source that starts late).
+    pub late: Option<Duration>,
+    /// No frame at all (a window that is never redrawn).
+    pub silent: bool,
 }
 
 /// Where a video input's frames come from.
 pub enum VideoSource<'a> {
-    Test,
-    Portal {
-        fd: RawFd,
-        node: u32,
-    },
-    Camera {
-        entry: &'a Entry,
-        class: CameraClass,
-    },
+    Test(TestBehaviour),
+    Portal { fd: RawFd, node: u32 },
+    Camera { entry: &'a Entry, mode: CameraMode },
+}
+
+/// The last frame sent to the encoder of a variable-rate input, to repeat at the stop time so
+/// the file lasts the whole segment (a static window sends one frame, then nothing).
+#[derive(Clone)]
+pub struct Tail {
+    last: Arc<Mutex<Option<gst::Buffer>>>,
+    /// Sink pad of the leaky queue: where the repeat goes in (its chain takes the stream lock).
+    pad: gst::Pad,
+    counters: Arc<Counters>,
+}
+
+impl Tail {
+    /// Pushes the last frame again, stamped `running_ns` (if later than it). Blocking only as
+    /// long as the leaky queue's chain function (it never waits for space): call it on a
+    /// worker thread.
+    pub fn push_at(&self, running_ns: u64) {
+        let Some(buf) = self.last.lock().ok().and_then(|g| g.clone()) else {
+            return;
+        };
+        if buf.pts().is_some_and(|p| p.nseconds() >= running_ns) {
+            return;
+        }
+        let mut copy = buf.copy();
+        {
+            let b = copy.make_mut();
+            b.set_pts(gst::ClockTime::from_nseconds(running_ns));
+            b.set_dts(gst::ClockTime::NONE);
+            b.set_duration(gst::ClockTime::NONE);
+            b.unset_flags(gst::BufferFlags::DISCONT);
+        }
+        if self.pad.chain(copy).is_ok() {
+            self.counters.reinjected.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 }
 
 /// One input's pipeline for one segment, plus the shared state its probes write.
@@ -82,12 +204,19 @@ pub struct InputPipeline {
     pub resize_filter: Option<gst::Element>,
     /// The convert path actually used (manifest).
     pub convert: Option<GpuConvert>,
-    /// The H.264 encoder used (video only, manifest).
-    pub encoder: Option<H264Encoder>,
-    /// Recorded frame rate (video only, manifest).
-    pub fps: Option<(i32, i32)>,
+    /// The video encoder used (video only, manifest).
+    pub encoder: Option<VideoEncoder>,
+    /// Frame timing (video only, manifest).
+    pub rate: Option<Rate>,
     /// Warning to surface once (e.g. `add-borders` missing).
     pub warning: Option<String>,
+    pub counters: Arc<Counters>,
+    /// videorate, whose `duplicate`/`drop` counts are read for the quality summary.
+    pub videorate: Option<gst::Element>,
+    /// The leaky queue (its current level, for the live drop count).
+    pub leaky: Option<gst::Element>,
+    /// Variable-rate inputs: the last frame, repeated at the stop time.
+    pub tail: Option<Tail>,
 }
 
 fn make(factory: &str) -> Result<gst::Element, String> {
@@ -95,7 +224,6 @@ fn make(factory: &str) -> Result<gst::Element, String> {
         .build()
         .map_err(|e| format!("cannot create {factory}: {e}"))
 }
-
 fn capsfilter(caps: &str) -> Result<gst::Element, String> {
     let caps = gst::Caps::from_str(caps).map_err(|e| format!("bad caps {caps}: {e}"))?;
     gst::ElementFactory::make("capsfilter")
@@ -309,12 +437,46 @@ fn src_pad(el: &gst::Element) -> Result<gst::Pad, String> {
         .ok_or_else(|| format!("{} has no src pad", el.name()))
 }
 
-fn mux_probe(before_mux: &gst::Element) -> Result<(Arc<AtomicU64>, Arc<AtomicU64>), String> {
+fn mux_probe(
+    before_mux: &gst::Element,
+    counters: Arc<Counters>,
+) -> Result<(Arc<AtomicU64>, Arc<AtomicU64>), String> {
     let first = Arc::new(AtomicU64::new(UNSET));
     let last = Arc::new(AtomicU64::new(UNSET));
     let pad = src_pad(before_mux)?.peer().ok_or("muxer pad not linked")?;
-    stamp::install_mux_probe(&pad, first.clone(), last.clone());
+    stamp::install_mux_probe(&pad, first.clone(), last.clone(), counters);
     Ok((first, last))
+}
+
+/// Forces a keyframe at least every [`KEYFRAME_EVERY_NS`] of stream time on `pad` (upstream of
+/// the encoder): variable-rate input makes a frame-counted GOP arbitrary in time.
+fn install_timed_keyframes(pad: &gst::Pad) {
+    let next = Mutex::new(None::<u64>);
+    pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+        let Some(pts) = info.buffer().and_then(|b| b.pts()).map(|p| p.nseconds()) else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let Ok(mut next) = next.lock() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        match *next {
+            // The first frame is a keyframe anyway.
+            None => *next = Some(pts + KEYFRAME_EVERY_NS),
+            Some(due) if pts >= due => {
+                *next = Some(pts + KEYFRAME_EVERY_NS);
+                let s = gst::Structure::builder("GstForceKeyUnit")
+                    .field("timestamp", pts)
+                    .field("stream-time", pts)
+                    .field("running-time", pts)
+                    .field("all-headers", true)
+                    .field("count", 0u32)
+                    .build();
+                pad.push_event(gst::event::CustomDownstream::new(s));
+            }
+            Some(_) => {}
+        }
+        gst::PadProbeReturn::Ok
+    });
 }
 
 /// Builds a video input (§5.2 screen/window/test, §5.4 camera) in NULL.
@@ -323,7 +485,7 @@ pub fn build_video(
     name: &str,
     source: VideoSource<'_>,
     convert: Option<GpuConvert>,
-    enc: H264Encoder,
+    enc: VideoEncoder,
     role: Role,
     target: VideoTarget,
     clock: &gst::Clock,
@@ -331,20 +493,37 @@ pub fn build_video(
 ) -> Result<InputPipeline, String> {
     let pipeline = new_pipeline(name, clock);
     let base = Arc::new(AtomicU64::new(UNSET));
+    let counters = Arc::new(Counters::default());
+    let native = matches!(target.rate, Rate::Native { .. });
+    let portal = matches!(source, VideoSource::Portal { .. });
 
-    // Source section: `src_chain` ends at the element whose src pad carries the source caps.
+    // Source section: `src_chain` ends at the element whose src pad carries the source caps;
+    // `stamp_at` is the element whose src pad gets the stamp probe.
     let mut src_chain: Vec<gst::Element> = Vec::new();
+    let stamp_at = 0;
+    let mut bursty = false;
     let mut resize_filter = None;
     let mut camera_mode = None;
+    let mut gate = None;
     match &source {
-        VideoSource::Test => {
+        VideoSource::Test(behaviour) => {
             let src = make("videotestsrc")?;
             set_prop(&src, "is-live", "true");
             set_prop(&src, "pattern", "smpte");
-            let caps = capsfilter(&test_caps())?;
+            // Moving content, so repeated frames are visible in the file.
+            set_prop(&src, "horizontal-speed", "4");
+            let rate = match target.rate {
+                Rate::Cfr(f) => f,
+                Rate::Native { .. } => (TEST_NATIVE_FPS, 1),
+            };
+            let caps = capsfilter(&test_caps_at(rate, behaviour.size))?;
+            if behaviour.silent || behaviour.late.is_some() {
+                gate = Some(*behaviour);
+            }
             resize_filter = Some(caps.clone());
             src_chain.push(src);
             src_chain.push(caps);
+            bursty = native;
             // Deviation from §5.3: videotestsrc stamps its first frame with the running time at
             // which it started, which is negative while B is still 100 ms in the future (it
             // wraps to ~2^64 and videorate then duplicates without bound). Stamp it like every
@@ -356,13 +535,9 @@ pub fn build_video(
         VideoSource::Portal { fd, node } => {
             src_chain.push(portal_source("src", Some(*fd), *node)?);
         }
-        VideoSource::Camera { entry, class } => {
-            let mode = match class {
-                CameraClass::Usable(m) => m.clone(),
-                CameraClass::Unsupported(r) => return Err(r.clone()),
-            };
+        VideoSource::Camera { entry, mode } => {
             src_chain.push(entry.create_source("cam-src")?);
-            camera_mode = Some(mode);
+            camera_mode = Some(mode.clone());
         }
     }
 
@@ -371,6 +546,9 @@ pub fn build_video(
     // Portal sources: the converter scales to the locked size (no frame rate) ahead of the
     // repeater, which then outputs at the target rate.
     let mut repeat_caps = None;
+    let mut videorate = None;
+    let mut repeater_el = None;
+    let mut leaky = None;
     let format = encoders::encoder_format(enc);
     let (add_borders_missing, effective_convert) = match &camera_mode {
         Some(mode) if mode.path != CameraPath::DmaBuf => {
@@ -383,34 +561,49 @@ pub fn build_video(
             mid.push(queue()?);
             let (block, missing) = convert_block(None, format)?;
             mid.extend(block);
-            // skip-to-first: no frames are invented before the camera's first real frame, so
-            // the muxer's first_pts_ns reports the camera's real start latency.
+            // skip-to-first: no frames are invented before the camera's first real frame (the
+            // stamp probe puts that one at 0, so the file still starts at segment time zero).
             let rate = make("videorate")?;
             set_prop(&rate, "skip-to-first", "true");
+            videorate = Some(rate.clone());
             mid.push(rate);
             (missing, None)
         }
         _ => {
             // §5.2 chain (portal, test pattern, DMA-BUF camera).
-            let caps = match &camera_mode {
-                Some(mode) => mode.source_caps(),
-                None => SOURCE_CAPS.to_string(),
+            let caps = match (&camera_mode, portal, target.rate) {
+                (Some(mode), _, _) => mode.source_caps(),
+                // Ask the compositor for no more frames than are recorded.
+                (None, true, Rate::Cfr((n, d))) => {
+                    portal_source_caps(Some(((n as f64 / d.max(1) as f64).ceil()) as i32))
+                }
+                (None, true, Rate::Native { cap, .. }) => portal_source_caps(cap),
+                (None, false, _) => SOURCE_CAPS.to_string(),
             };
             mid.push(capsfilter(&caps)?);
             let (block, missing) = convert_block(convert, format)?;
             mid.extend(block);
-            mid.push(leaky_queue()?);
-            if matches!(source, VideoSource::Portal { .. }) {
-                let caps = make("capsfilter")?;
-                repeat_caps = Some(caps.clone());
-                mid.push(caps);
-                // VAMemory end to end exactly when outcaps carries it (encoders::outcaps_string).
-                let va = matches!((convert, enc), (Some(GpuConvert::Va), H264Encoder::Va));
-                mid.push(repeater(va, target.fps)?);
-            } else {
-                let rate = make("videorate")?;
-                set_prop(&rate, "skip-to-first", "true");
-                mid.push(rate);
+            let q = leaky_queue()?;
+            leaky = Some(q.clone());
+            mid.push(q);
+            match target.rate {
+                Rate::Native { .. } => {}
+                Rate::Cfr(fps) if portal => {
+                    let caps = make("capsfilter")?;
+                    repeat_caps = Some(caps.clone());
+                    mid.push(caps);
+                    // VAMemory end to end exactly when outcaps carries it (encoders::outcaps_string).
+                    let va = convert == Some(GpuConvert::Va) && enc.is_gpu();
+                    let agg = repeater(va, fps)?;
+                    repeater_el = Some(agg.clone());
+                    mid.push(agg);
+                }
+                Rate::Cfr(_) => {
+                    let rate = make("videorate")?;
+                    set_prop(&rate, "skip-to-first", "true");
+                    videorate = Some(rate.clone());
+                    mid.push(rate);
+                }
             }
             (missing, convert)
         }
@@ -420,14 +613,19 @@ pub fn build_video(
         .build()
         .map_err(|e| format!("cannot create capsfilter: {e}"))?;
     mid.push(outcaps.clone());
-    mid.push(queue()?);
-    let encoder = encoders::make_encoder(enc, role, target.fps)?;
+    let enc_queue = queue()?;
+    mid.push(enc_queue.clone());
+    let gop_rate = match target.rate {
+        Rate::Cfr(f) => f,
+        Rate::Native { gop_fps, .. } => (gop_fps.max(1), 1),
+    };
+    let encoder = encoders::make_encoder(enc, role, gop_rate)?;
     mid.push(encoder.clone());
-    let parse = make("h264parse")?;
+    let parse = make(encoders::parser_name(enc))?;
     set_prop(&parse, "config-interval", "-1");
     mid.push(parse);
-    let h264caps = capsfilter(H264_CAPS)?;
-    mid.push(h264caps.clone());
+    let coded = capsfilter(encoders::coded_caps(enc))?;
+    mid.push(coded.clone());
     let (mux, sink) = file_tail(path)?;
     mid.push(mux);
     mid.push(sink);
@@ -443,25 +641,102 @@ pub fn build_video(
     let deep_copy = camera_mode
         .as_ref()
         .is_some_and(|m| m.path != CameraPath::DmaBuf);
+    if bursty {
+        let n = std::sync::atomic::AtomicU32::new(0);
+        src_pad(&src_chain[0])?.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            let i = n.fetch_add(1, Ordering::Relaxed);
+            if TEST_NATIVE_DROP_MASK & (1 << (i % 8)) != 0 {
+                gst::PadProbeReturn::Drop
+            } else {
+                gst::PadProbeReturn::Ok
+            }
+        });
+    }
+    if let Some(b) = gate {
+        // Selftest: drop frames before the stamp probe sees them.
+        let (base, clock) = (base.clone(), clock.clone());
+        src_pad(&src_chain[0])?.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            let b0 = base.load(Ordering::Acquire);
+            let running = clock
+                .time()
+                .nseconds()
+                .checked_sub(b0)
+                .filter(|_| b0 != UNSET);
+            let open = !b.silent
+                && running.is_some_and(|r| b.late.is_none_or(|l| r >= l.as_nanos() as u64));
+            if open {
+                gst::PadProbeReturn::Ok
+            } else {
+                gst::PadProbeReturn::Drop
+            }
+        });
+    }
     stamp::install_video(
-        &src_pad(&src_chain[0])?,
+        &src_pad(&src_chain[stamp_at])?,
         clock.clone(),
         base.clone(),
         deep_copy,
-        matches!(source, VideoSource::Portal { .. }),
+        portal,
+        counters.clone(),
     );
+    // Counters around the leaky queue and the rate stage.
+    let mut tail = None;
+    if let Some(q) = &leaky {
+        stamp::count_buffers(&sink_pad(q)?, counters.clone(), |c| &c.queue_in);
+        stamp::count_buffers(&src_pad(q)?, counters.clone(), |c| &c.queue_out);
+        if native {
+            let last: Arc<Mutex<Option<gst::Buffer>>> = Arc::new(Mutex::new(None));
+            let store = last.clone();
+            src_pad(q)?.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let (Some(b), Ok(mut slot)) = (info.buffer(), store.lock()) {
+                    *slot = Some(b.clone());
+                }
+                gst::PadProbeReturn::Ok
+            });
+            tail = Some(Tail {
+                last,
+                pad: sink_pad(q)?,
+                counters: counters.clone(),
+            });
+        }
+    }
+    let rate_el = videorate.clone().or(repeater_el.clone());
+    if let Some(r) = &rate_el {
+        let input = match &repeater_el {
+            Some(agg) => agg
+                .sink_pads()
+                .into_iter()
+                .next()
+                .ok_or("repeater has no sink pad")?,
+            None => sink_pad(r)?,
+        };
+        stamp::count_buffers(&input, counters.clone(), |c| &c.rate_in);
+        stamp::count_rate_out(&src_pad(r)?, counters.clone());
+    }
+    if native {
+        install_timed_keyframes(&src_pad(&enc_queue)?);
+    }
     let size = Arc::new(Mutex::new(None));
-    let fps = target.fps;
+    let out_rate = target.rate.cfr();
     stamp::install_size_lock(
         &src_out,
         outcaps,
         target.max,
         move |w, h| {
             // The bitrate follows the locked size; the encoder has not seen caps yet.
-            encoders::set_bitrate(&encoder, enc, encoders::bitrate_kbps(role, w, h, fps));
-            let caps =
-                gst::Caps::from_str(&encoders::outcaps_string(enc, effective_convert, w, h, fps))
-                    .unwrap_or_else(|_| gst::Caps::new_any());
+            encoders::set_bitrate(
+                &encoder,
+                enc,
+                encoders::bitrate_kbps(role, enc.codec(), w, h, gop_rate),
+            );
+            let caps = gst::Caps::from_str(&encoders::outcaps_string(
+                enc,
+                effective_convert,
+                w,
+                h,
+                out_rate,
+            ))
+            .unwrap_or_else(|_| gst::Caps::new_any());
             if let Some(filter) = &repeat_caps {
                 let mut unrated = caps.clone();
                 if let Some(s) = unrated.make_mut().structure_mut(0) {
@@ -473,7 +748,7 @@ pub fn build_video(
         },
         size.clone(),
     );
-    let (first_pts, last_pts) = mux_probe(&h264caps)?;
+    let (first_pts, last_pts) = mux_probe(&coded, counters.clone())?;
     let bus = pipeline.bus().ok_or("pipeline has no bus")?;
     Ok(InputPipeline {
         pipeline,
@@ -486,9 +761,13 @@ pub fn build_video(
         resize_filter,
         convert: effective_convert,
         encoder: Some(enc),
-        fps: Some(fps),
+        rate: Some(target.rate),
         warning: add_borders_missing
             .then(|| "add-borders is unavailable: video will be stretched".to_string()),
+        counters,
+        videorate,
+        leaky,
+        tail,
     })
 }
 
@@ -523,7 +802,8 @@ pub fn build_mic(
     ];
     link_chain(&pipeline, &chain)?;
     stamp::install_audio(&src_pad(&src)?, clock.clone(), base.clone());
-    let (first_pts, last_pts) = mux_probe(&opus)?;
+    let counters = Arc::new(Counters::default());
+    let (first_pts, last_pts) = mux_probe(&opus, counters.clone())?;
     let bus = pipeline.bus().ok_or("pipeline has no bus")?;
     Ok(InputPipeline {
         pipeline,
@@ -536,29 +816,33 @@ pub fn build_mic(
         resize_filter: None,
         convert: None,
         encoder: None,
-        fps: None,
+        rate: None,
         warning: None,
+        counters,
+        videorate: None,
+        leaky: None,
+        tail: None,
     })
 }
 
 /// Source-negotiation probe (§5.2): `pipewiresrc ! capsfilter ! <CONVERT> ! outcaps-format !
 /// fakesink num-buffers=1`, on the capture's one fd number.
+/// The probe also records the negotiated source caps: the physical size and the source's own
+/// maximum rate (`max-framerate`, niri: the output refresh), see [`source_facts`].
 pub fn build_probe(
     name: &str,
     fd: RawFd,
     node: u32,
     convert: GpuConvert,
-    enc: Option<H264Encoder>,
-) -> Result<(gst::Pipeline, gst::Bus), String> {
+    enc: Option<VideoEncoder>,
+) -> Result<(gst::Pipeline, gst::Bus, CapsSlot), String> {
     let pipeline = gst::Pipeline::with_name(name);
-    let mut chain = vec![
-        portal_source("src", Some(fd), node)?,
-        capsfilter(SOURCE_CAPS)?,
-    ];
+    let filter = capsfilter(SOURCE_CAPS)?;
+    let mut chain = vec![portal_source("src", Some(fd), node)?, filter.clone()];
     let fmt = enc.map(encoders::encoder_format).unwrap_or("I420");
     chain.extend(convert_block(Some(convert), fmt)?.0);
     let out = match (convert, enc) {
-        (GpuConvert::Va, Some(H264Encoder::Va)) => {
+        (GpuConvert::Va, Some(e)) if e.is_gpu() => {
             format!("video/x-raw(memory:VAMemory),format={fmt}")
         }
         _ => format!("video/x-raw,format={fmt}"),
@@ -569,9 +853,49 @@ pub fn build_probe(
     set_prop(&sink, "sync", "false");
     chain.push(sink);
     link_chain(&pipeline, &chain)?;
+    let caps: CapsSlot = Arc::new(Mutex::new(None));
+    let slot = caps.clone();
+    src_pad(&filter)?.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        if let Some(gst::EventView::Caps(c)) = info.event().map(|e| e.view())
+            && let Ok(mut s) = slot.lock()
+        {
+            *s = Some(c.caps_owned());
+        }
+        gst::PadProbeReturn::Ok
+    });
     let bus = pipeline.bus().ok_or("pipeline has no bus")?;
-    Ok((pipeline, bus))
+    Ok((pipeline, bus, caps))
 }
+
+/// What negotiated portal source caps say about the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SourceFacts {
+    pub size: Option<(i32, i32)>,
+    /// `max-framerate` (niri: the output refresh).
+    pub max_rate: Option<(i32, i32)>,
+}
+
+pub fn source_facts(caps: &gst::CapsRef) -> SourceFacts {
+    let Some(s) = caps.structure(0) else {
+        return SourceFacts::default();
+    };
+    let size = match (s.get::<i32>("width"), s.get::<i32>("height")) {
+        (Ok(w), Ok(h)) if w > 0 && h > 0 => Some((w, h)),
+        _ => None,
+    };
+    let rate = s
+        .get::<gst::Fraction>("max-framerate")
+        .ok()
+        .filter(|f| f.numer() > 0 && f.denom() > 0)
+        .map(|f| (f.numer(), f.denom()));
+    SourceFacts {
+        size,
+        max_rate: rate,
+    }
+}
+
+/// Where a probe leaves the negotiated source caps.
+pub type CapsSlot = Arc<Mutex<Option<gst::Caps>>>;
 
 /// Changes the test pattern's caps to force a renegotiation (selftest resize, §5.3).
 pub fn renegotiate_test(filter: &gst::Element) {
@@ -797,6 +1121,33 @@ mod tests {
         // Without a portal fd the normal daemon is used (fd stays -1).
         let src = portal_source("src2", None, 7).unwrap();
         assert_eq!(src.property::<i32>("fd"), -1);
+    }
+
+    #[test]
+    fn max_rate_is_an_enum_that_never_exceeds_the_cap() {
+        gst::init().unwrap();
+        let f = max_rate_field(60);
+        assert!(
+            f.starts_with("max-framerate=(fraction){ 60/1, 60000/1001, 5994/100, 50/1"),
+            "{f}"
+        );
+        assert!(!f.contains("144/1"), "{f}");
+        let caps = gst::Caps::from_str(&portal_source_caps(Some(60))).expect("caps parse");
+        assert_eq!(caps.size(), 2);
+        // A producer offering up to 143.999 Hz intersects at 60.
+        let producer =
+            gst::Caps::from_str("video/x-raw,max-framerate=(fraction)[1/1, 143999/1000]").unwrap();
+        let mut fixed = caps.intersect(&producer);
+        fixed.fixate();
+        assert_eq!(source_facts(&fixed).max_rate, Some((60, 1)));
+        // A 59.94 Hz output still negotiates.
+        let ntsc =
+            gst::Caps::from_str("video/x-raw,max-framerate=(fraction)[1/1, 59940/1000]").unwrap();
+        let mut fixed = caps.intersect(&ntsc);
+        fixed.fixate();
+        let (n, d) = source_facts(&fixed).max_rate.unwrap();
+        assert!((n as f64 / d as f64 - 59.94).abs() < 1e-9, "{n}/{d}");
+        assert_eq!(portal_source_caps(None), SOURCE_CAPS);
     }
 
     #[test]

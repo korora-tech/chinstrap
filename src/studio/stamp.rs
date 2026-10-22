@@ -14,6 +14,80 @@ use gstreamer::prelude::*;
 /// The size locked from the first CAPS event, shared with the engine.
 pub type SizeSlot = Arc<Mutex<Option<(i32, i32)>>>;
 
+/// Frame accounting for one input (P0-1), written by pad probes, read by the engine.
+#[derive(Debug)]
+pub struct Counters {
+    /// Source frames kept (stamped).
+    pub frames_in: AtomicU64,
+    /// Source frames dropped as CORRUPTED (truncated).
+    pub dropped_corrupt: AtomicU64,
+    /// Buffers into / out of the leaky queue before the encoder.
+    pub queue_in: AtomicU64,
+    pub queue_out: AtomicU64,
+    /// Buffers into / out of the rate stage (videorate or the repeater).
+    pub rate_in: AtomicU64,
+    pub rate_out: AtomicU64,
+    /// Rate-stage output before the first real frame's arrival (start padding).
+    pub padded: AtomicU64,
+    /// Frames pushed again by the engine (Native: the last frame at the stop time).
+    pub reinjected: AtomicU64,
+    /// Buffers into the muxer.
+    pub encoded: AtomicU64,
+    /// Running time at which the first real frame arrived (UNSET until then).
+    pub first_arrival: AtomicU64,
+}
+
+impl Default for Counters {
+    fn default() -> Self {
+        Self {
+            frames_in: AtomicU64::new(0),
+            dropped_corrupt: AtomicU64::new(0),
+            queue_in: AtomicU64::new(0),
+            queue_out: AtomicU64::new(0),
+            rate_in: AtomicU64::new(0),
+            rate_out: AtomicU64::new(0),
+            padded: AtomicU64::new(0),
+            reinjected: AtomicU64::new(0),
+            encoded: AtomicU64::new(0),
+            first_arrival: AtomicU64::new(UNSET),
+        }
+    }
+}
+
+impl Counters {
+    pub fn get(a: &AtomicU64) -> u64 {
+        a.load(Ordering::Acquire)
+    }
+}
+
+fn bump(a: &AtomicU64) {
+    a.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Counts every buffer passing `pad` into `counter`.
+pub fn count_buffers(pad: &gst::Pad, counters: Arc<Counters>, pick: fn(&Counters) -> &AtomicU64) {
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+        bump(pick(&counters));
+        gst::PadProbeReturn::Ok
+    });
+}
+
+/// Counts buffers leaving the rate stage, and those that pad the start (before the first real
+/// frame's arrival).
+pub fn count_rate_out(pad: &gst::Pad, counters: Arc<Counters>) {
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        bump(&counters.rate_out);
+        let first = counters.first_arrival.load(Ordering::Acquire);
+        if let Some(pts) = info.buffer().and_then(|b| b.pts())
+            && first != UNSET
+            && pts.nseconds() + 1_000_000 < first
+        {
+            bump(&counters.padded);
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
 /// Sentinel for "not set yet" in the shared `AtomicU64`s.
 pub const UNSET: u64 = u64::MAX;
 
@@ -76,12 +150,23 @@ pub fn lock_size_within(width: i32, height: i32, max_w: i32, max_h: i32) -> (i32
 #[derive(Debug, Default)]
 pub struct VideoStamp {
     last: Option<u64>,
+    /// The first frame is stamped 0 (P1-7): every file starts at segment time zero, showing its
+    /// first frame until the second one arrives, however late the source started.
+    pad_start: bool,
 }
 
 impl VideoStamp {
+    pub fn padded() -> Self {
+        Self {
+            last: None,
+            pad_start: true,
+        }
+    }
+
     pub fn next(&mut self, running_ns: u64) -> u64 {
         let pts = match self.last {
             Some(last) => running_ns.max(last + 1),
+            None if self.pad_start => 0,
             None => running_ns,
         };
         self.last = Some(pts);
@@ -185,19 +270,24 @@ fn running_now(clock: &gst::Clock, base: &AtomicU64) -> Option<u64> {
 /// `hold_early` (portal sources): a frame arriving after the base time is set but before it is
 /// reached is stamped 0 instead of dropped. Compositors render a window once when the cast
 /// starts and then only on damage, so dropping that frame leaves a static window with none.
+///
+/// The first kept frame is stamped 0 ([`VideoStamp::padded`]); its real arrival goes to
+/// `counters.first_arrival`.
 pub fn install_video(
     pad: &gst::Pad,
     clock: gst::Clock,
     base: Arc<AtomicU64>,
     deep_copy: bool,
     hold_early: bool,
+    counters: Arc<Counters>,
 ) {
-    let state = Mutex::new(VideoStamp::default());
+    let state = Mutex::new(VideoStamp::padded());
     pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
         if info
             .buffer()
             .is_some_and(|b| b.flags().contains(gst::BufferFlags::CORRUPTED))
         {
+            bump(&counters.dropped_corrupt);
             return gst::PadProbeReturn::Drop;
         }
         if deep_copy && let Some(gst::PadProbeData::Buffer(buffer)) = info.data.as_mut() {
@@ -209,6 +299,13 @@ pub fn install_video(
             None => return gst::PadProbeReturn::Drop,
         };
         let pts = state.lock().map(|mut s| s.next(running)).unwrap_or(running);
+        let _ = counters.first_arrival.compare_exchange(
+            UNSET,
+            running,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        bump(&counters.frames_in);
         if let Some(buffer) = info.buffer_mut() {
             let b = buffer.make_mut();
             b.set_pts(gst::ClockTime::from_nseconds(pts));
@@ -336,7 +433,12 @@ pub fn install_size_lock(
 
 /// Records the first and last buffer PTS reaching a muxer sink pad (§5.1), as running time
 /// (encoders may offset PTS, e.g. a 1000 h min-pts, compensated by their segment).
-pub fn install_mux_probe(pad: &gst::Pad, first: Arc<AtomicU64>, last: Arc<AtomicU64>) {
+pub fn install_mux_probe(
+    pad: &gst::Pad,
+    first: Arc<AtomicU64>,
+    last: Arc<AtomicU64>,
+    counters: Arc<Counters>,
+) {
     let segment: Arc<Mutex<Option<gst::FormattedSegment<gst::ClockTime>>>> =
         Arc::new(Mutex::new(None));
     let seg_events = segment.clone();
@@ -359,6 +461,7 @@ pub fn install_mux_probe(pad: &gst::Pad, first: Arc<AtomicU64>, last: Arc<Atomic
             .and_then(|s| s.as_ref().and_then(|s| s.to_running_time(pts)))
             .unwrap_or(pts);
         let ns = running.nseconds();
+        bump(&counters.encoded);
         let _ = first.compare_exchange(UNSET, ns, Ordering::AcqRel, Ordering::Acquire);
         let mut cur = last.load(Ordering::Acquire);
         while cur == UNSET || ns > cur {
@@ -415,6 +518,15 @@ mod tests {
         assert_eq!(s.next(100), 101);
         assert_eq!(s.next(50), 102);
         assert_eq!(s.next(1_000), 1_000);
+    }
+
+    #[test]
+    fn late_first_frame_is_padded_to_zero() {
+        // A window whose first frame arrives 5.58 s into the segment.
+        let mut s = VideoStamp::padded();
+        assert_eq!(s.next(5_580_000_000), 0);
+        assert_eq!(s.next(5_620_000_000), 5_620_000_000);
+        assert_eq!(s.next(5_600_000_000), 5_620_000_001);
     }
 
     #[test]

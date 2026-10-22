@@ -1266,12 +1266,14 @@ mod tests {
                 width: None,
                 height: None,
                 framerate: None,
+                max_framerate: None,
                 first_pts_ns: None,
                 last_pts_ns: None,
                 status: "complete".into(),
                 error: None,
                 device: None,
                 transcript: Some(ManifestTranscript::status_only("running")),
+                quality: None,
             }],
         });
         session::write_manifest(&sess, &m).unwrap();
@@ -1393,12 +1395,14 @@ mod tests {
                     width: None,
                     height: None,
                     framerate: None,
+                    max_framerate: None,
                     first_pts_ns: None,
                     last_pts_ns: None,
                     status: "complete".into(),
                     error: None,
                     device: None,
                     transcript: None,
+                    quality: None,
                 }],
             });
         }

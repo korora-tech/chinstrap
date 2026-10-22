@@ -1,9 +1,10 @@
-//! Element checks (SPEC §5.7), the H.264 encoder probe (§5.6) and the GPU path probe (§5.2).
+//! Element checks (SPEC §5.7), the video encoder probe (§5.6) and the GPU path probe (§5.2).
 //!
 //! The probes run on the engine thread before the first Snapshot; that is the only accepted
 //! blocking period. Per encoder candidate: the small probe (≤2 s) plus the throughput
-//! measurement (4K, and 1080p when 4K fails, sharing one ≤2 s budget), so ≤4 s per candidate;
-//! probing stops at the first candidate that keeps up at 4K.
+//! measurement (4K, and 1080p when 4K fails, sharing one ≤2 s budget), so ≤4 s per candidate.
+//! Both VA encoders (H.264 and HEVC) and x264 are measured, so the capacity plan (`plan.rs`)
+//! can spread the inputs over them; openh264 is only probed when none of those works.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ use std::time::{Duration, Instant};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
-use super::types::{GpuConvert, H264Encoder, InputClass, REQUIRED_ELEMENTS};
+use super::types::{GpuConvert, InputClass, REQUIRED_ELEMENTS, VideoCodec, VideoEncoder};
 
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -26,6 +27,8 @@ pub const FHD: (i32, i32) = (1920, 1080);
 /// Bits per pixel per frame: screens carry sharp text, cameras are noisier but smoother.
 pub const SCREEN_BPP: f64 = 0.18;
 pub const CAMERA_BPP: f64 = 0.12;
+/// HEVC reaches the same quality with about 0.65 times the H.264 bits.
+pub const HEVC_FACTOR: f64 = 0.65;
 /// Floor for any computed bitrate's bits per pixel.
 pub const MIN_BPP: f64 = 0.1;
 pub const MIN_KBPS: u32 = 2_000;
@@ -45,22 +48,39 @@ pub fn screen_fps() -> i32 {
 /// Bitrate in kbit/s for `w`×`h` at `fps`: `override_kbps` when given, else
 /// `bpp × pixels × fps` (bpp ≥ 0.1), clamped to 2..400 Mbit/s.
 /// Screen 1080p30 ≈ 11 Mbit/s, 4K30 ≈ 45 Mbit/s; camera 4K25 ≈ 25 Mbit/s.
+#[cfg(test)]
 pub fn bitrate_for(role: Role, override_kbps: Option<u32>, w: i32, h: i32, fps: (i32, i32)) -> u32 {
+    bitrate_for_codec(role, VideoCodec::H264, override_kbps, w, h, fps)
+}
+
+/// [`bitrate_for`] for `codec` (HEVC: [`HEVC_FACTOR`] of the H.264 rate, same floor).
+pub fn bitrate_for_codec(
+    role: Role,
+    codec: VideoCodec,
+    override_kbps: Option<u32>,
+    w: i32,
+    h: i32,
+    fps: (i32, i32),
+) -> u32 {
     if let Some(k) = override_kbps.filter(|k| *k > 0) {
         return k.min(MAX_KBPS);
     }
-    let bpp = match role {
+    let factor = match codec {
+        VideoCodec::H264 => 1.0,
+        VideoCodec::Hevc => HEVC_FACTOR,
+    };
+    let bpp = (match role {
         Role::Screen => SCREEN_BPP,
         Role::Camera => CAMERA_BPP,
-    }
-    .max(MIN_BPP);
+    } * factor)
+        .max(MIN_BPP);
     let rate = fps.0.max(1) as f64 / fps.1.max(1) as f64;
     let kbps = (w.max(1) as f64 * h.max(1) as f64 * rate * bpp / 1000.0).round() as u32;
     kbps.clamp(MIN_KBPS, MAX_KBPS)
 }
 
-/// [`bitrate_for`] with `CHINSTRAP_SCREEN_BITRATE_KBPS` / `CHINSTRAP_CAMERA_BITRATE_KBPS`.
-pub fn bitrate_kbps(role: Role, w: i32, h: i32, fps: (i32, i32)) -> u32 {
+/// [`bitrate_for_codec`] with `CHINSTRAP_SCREEN_BITRATE_KBPS` / `CHINSTRAP_CAMERA_BITRATE_KBPS`.
+pub fn bitrate_kbps(role: Role, codec: VideoCodec, w: i32, h: i32, fps: (i32, i32)) -> u32 {
     let key = match role {
         Role::Screen => "CHINSTRAP_SCREEN_BITRATE_KBPS",
         Role::Camera => "CHINSTRAP_CAMERA_BITRATE_KBPS",
@@ -68,13 +88,13 @@ pub fn bitrate_kbps(role: Role, w: i32, h: i32, fps: (i32, i32)) -> u32 {
     let over = std::env::var(key)
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok());
-    bitrate_for(role, over, w, h, fps)
+    bitrate_for_codec(role, codec, over, w, h, fps)
 }
 
 /// Sets an encoder's bitrate (`kbps` kbit/s; openh264enc takes bit/s).
-pub fn set_bitrate(el: &gst::Element, enc: H264Encoder, kbps: u32) {
+pub fn set_bitrate(el: &gst::Element, enc: VideoEncoder, kbps: u32) {
     let value = match enc {
-        H264Encoder::OpenH264 => (kbps as u64 * 1000).to_string(),
+        VideoEncoder::OpenH264 => (kbps as u64 * 1000).to_string(),
         _ => kbps.to_string(),
     };
     set_prop(el, "bitrate", &value);
@@ -109,9 +129,9 @@ pub fn convert_elements(convert: GpuConvert) -> &'static [&'static str] {
 }
 
 /// Encoder candidates: preferred first, then `FALLBACK_ORDER`, deduplicated.
-pub fn candidates(preferred: Option<H264Encoder>) -> Vec<H264Encoder> {
+pub fn candidates(preferred: Option<VideoEncoder>) -> Vec<VideoEncoder> {
     let mut out = Vec::new();
-    for e in preferred.into_iter().chain(H264Encoder::FALLBACK_ORDER) {
+    for e in preferred.into_iter().chain(VideoEncoder::FALLBACK_ORDER) {
         if !out.contains(&e) {
             out.push(e);
         }
@@ -134,30 +154,49 @@ pub fn convert_candidates(preferred: Option<GpuConvert>) -> Vec<GpuConvert> {
 }
 
 /// The raw format fed to an encoder.
-pub fn encoder_format(enc: H264Encoder) -> &'static str {
+pub fn encoder_format(enc: VideoEncoder) -> &'static str {
     match enc {
-        H264Encoder::Va => "NV12",
+        VideoEncoder::Va | VideoEncoder::VaHevc => "NV12",
         _ => "I420",
     }
 }
 
+/// The parser after an encoder.
+pub fn parser_name(enc: VideoEncoder) -> &'static str {
+    match enc.codec() {
+        VideoCodec::H264 => "h264parse",
+        VideoCodec::Hevc => "h265parse",
+    }
+}
+
+/// Caps after the parser: 8-bit 4:2:0 profiles the muxer and editors take.
+pub fn coded_caps(enc: VideoEncoder) -> &'static str {
+    match enc.codec() {
+        VideoCodec::H264 => "video/x-h264,profile=(string){high,main,constrained-baseline}",
+        VideoCodec::Hevc => "video/x-h265,profile=(string)main",
+    }
+}
+
 /// `outcaps` for the video chain (§5.2 table). `convert == None` means plain system memory.
+/// `fps == None` (variable frame rate) leaves the rate to the source.
 pub fn outcaps_string(
-    enc: H264Encoder,
+    enc: VideoEncoder,
     convert: Option<GpuConvert>,
     width: i32,
     height: i32,
-    fps: (i32, i32),
+    fps: Option<(i32, i32)>,
 ) -> String {
-    let feature = match (convert, enc) {
-        (Some(GpuConvert::Va), H264Encoder::Va) => "(memory:VAMemory)",
-        _ => "",
+    let feature = if convert == Some(GpuConvert::Va) && enc.is_gpu() {
+        "(memory:VAMemory)"
+    } else {
+        ""
     };
+    let rate = fps
+        .map(|(n, d)| format!(",framerate={n}/{}", d.max(1)))
+        .unwrap_or_default();
     format!(
-        "video/x-raw{feature},format={},width={width},height={height},framerate={}/{},pixel-aspect-ratio=1/1",
-        encoder_format(enc),
-        fps.0,
-        fps.1.max(1)
+        "video/x-raw{feature},format={},width={width},height={height}{rate},pixel-aspect-ratio=1/1",
+        encoder_format(enc)
     )
 }
 
@@ -191,29 +230,42 @@ pub fn set_prop(el: &gst::Element, name: &str, value: &str) -> bool {
 
 /// Configures an encoder (§5.6 table): a keyframe every 2 s at `fps`, and a 1080p bitrate
 /// until the size lock sets the real one ([`set_bitrate`]).
-pub fn configure_encoder(el: &gst::Element, enc: H264Encoder, role: Role, fps: (i32, i32)) {
+///
+/// VA: one reference frame. On radeonsi (RX 7900 XT, Mesa 26.2) vah264enc's default of 3
+/// halves throughput: one 4K stream 46 fps vs 98 fps, and the encode engine then falls behind a
+/// 4K25 camera plus two 4K30 windows (the camera's repeated frames in the 2026-10-22 recording).
+pub fn configure_encoder(el: &gst::Element, enc: VideoEncoder, role: Role, fps: (i32, i32)) {
     let rate = fps.0.max(1) as f64 / fps.1.max(1) as f64;
     let gop = ((rate * 2.0).round() as i64).clamp(1, 1024).to_string();
     match enc {
-        H264Encoder::Va => {
+        VideoEncoder::Va | VideoEncoder::VaHevc => {
             set_prop(el, "key-int-max", &gop);
             set_prop(el, "rate-control", "cbr");
+            set_prop(el, "ref-frames", "1");
         }
-        H264Encoder::X264 => {
+        VideoEncoder::X264 => {
             set_prop(el, "tune", "zerolatency");
             set_prop(el, "speed-preset", "veryfast");
             set_prop(el, "key-int-max", &gop);
         }
-        H264Encoder::OpenH264 => {
+        VideoEncoder::OpenH264 => {
             set_prop(el, "gop-size", &gop);
             set_prop(el, "complexity", "low");
         }
     }
-    set_bitrate(el, enc, bitrate_for(role, None, FHD.0, FHD.1, fps));
+    set_bitrate(
+        el,
+        enc,
+        bitrate_for_codec(role, enc.codec(), None, FHD.0, FHD.1, fps),
+    );
 }
 
 /// Creates and configures an encoder (§5.6 table).
-pub fn make_encoder(enc: H264Encoder, role: Role, fps: (i32, i32)) -> Result<gst::Element, String> {
+pub fn make_encoder(
+    enc: VideoEncoder,
+    role: Role,
+    fps: (i32, i32),
+) -> Result<gst::Element, String> {
     let el = gst::ElementFactory::make(enc.element_name())
         .build()
         .map_err(|e| format!("{}: {e}", enc.element_name()))?;
@@ -267,63 +319,44 @@ fn run_pipeline(pipeline: &gst::Pipeline, timeout: Duration) -> Result<(), Strin
 }
 
 /// Probe description for one encoder (§5.6).
-pub fn encoder_probe_launch(enc: H264Encoder) -> String {
+pub fn encoder_probe_launch(enc: VideoEncoder) -> String {
     format!(
-        "videotestsrc num-buffers=5 ! video/x-raw,width=320,height=240,framerate=30/1 ! videoconvert ! {} ! h264parse ! fakesink",
-        enc.element_name()
+        "videotestsrc num-buffers=5 ! video/x-raw,width=320,height=240,framerate=30/1 ! videoconvert ! {} ! {} ! fakesink",
+        enc.element_name(),
+        parser_name(enc)
     )
 }
 
 /// What an encoder was verified to do (§5.6 as revised for 4K).
 #[derive(Clone, Debug, PartialEq)]
 pub struct EncoderCap {
-    pub enc: H264Encoder,
+    pub enc: VideoEncoder,
     /// Largest verified size (UHD/DCI 4K, or 1080p when 4K failed).
     pub max: (i32, i32),
-    /// Measured encode throughput at `max` (frames per second).
+    /// Measured encode throughput (frames per second) at 3840×2160, or at 1920×1080 when
+    /// `max` is 1080p.
     pub fps_at_max: f64,
 }
 
 impl EncoderCap {
-    fn fits(&self, w: i32, h: i32) -> bool {
+    pub fn fits(&self, w: i32, h: i32) -> bool {
         w <= self.max.0 && h <= self.max.1
     }
 
     /// Estimated throughput at `w`×`h` (scales with pixel count, never above 4× the measure).
-    fn fps_at(&self, w: i32, h: i32) -> f64 {
+    pub fn fps_at(&self, w: i32, h: i32) -> f64 {
+        // `fps_at_max` is measured at 3840×2160 (1920×1080 when 4K failed), even when `max`
+        // is DCI 4096×2160.
+        let measured = if self.max == FHD { FHD } else { UHD };
+        let ref_area = measured.0 as f64 * measured.1 as f64;
         let max_area = self.max.0 as f64 * self.max.1 as f64;
         let area = (w.max(1) as f64 * h.max(1) as f64).min(max_area);
-        self.fps_at_max * (max_area / area).min(4.0)
+        self.fps_at_max * (ref_area / area).min(4.0)
     }
 }
 
-/// Picks the encoder for one input that needs `w`×`h` at `fps` frames per second: the first
-/// verified encoder (preference order) that fits and keeps up (5% probe slack); else the
-/// fastest one that fits; else the one with the largest size (the input is downscaled).
-/// Returns the encoder and the size the input may record at most.
-///
-/// Each input is judged on its own against a *single-stream* measurement; the load of other
-/// inputs on the same encoder is deliberately not summed. On the VA host this was checked on,
-/// two concurrent 4K vah264enc encodes (30 + 25 fps) each still ran at ~46-47 fps, the same as
-/// one alone (the measure is latency-bound), so summing would wrongly push a 4K camera onto
-/// x264enc (~9 cores). On hardware whose engine does saturate, a shortfall shows up as frames
-/// repeated by videorate after the leaky queue drops.
-pub fn pick_encoder(
-    table: &[EncoderCap],
-    w: i32,
-    h: i32,
-    fps: f64,
-) -> Option<(H264Encoder, (i32, i32))> {
-    let fitting = || table.iter().filter(|c| c.fits(w, h));
-    let choice = fitting()
-        .find(|c| c.fps_at(w, h) >= fps * 0.95)
-        .or_else(|| fitting().max_by(|a, b| a.fps_at(w, h).total_cmp(&b.fps_at(w, h))))
-        .or_else(|| table.iter().max_by_key(|c| c.max.0 as i64 * c.max.1 as i64))?;
-    Some((choice.enc, choice.max))
-}
-
 /// True when the encoder's sink template admits raw video of `w`×`h`.
-pub fn template_accepts(enc: H264Encoder, w: i32, h: i32) -> bool {
+pub fn template_accepts(enc: VideoEncoder, w: i32, h: i32) -> bool {
     let Some(factory) = gst::ElementFactory::find(enc.element_name()) else {
         return false;
     };
@@ -343,7 +376,12 @@ pub fn template_accepts(enc: H264Encoder, w: i32, h: i32) -> bool {
 /// `timeout`; a timeout after at least 5 frames still yields a (low) measurement.
 /// videotestsrc renders 4K SMPTE at ~150 fps on its own thread (behind the queue), well above
 /// the encoders measured, so the source does not cap the result.
-pub fn measure_encoder(enc: H264Encoder, w: i32, h: i32, timeout: Duration) -> Result<f64, String> {
+pub fn measure_encoder(
+    enc: VideoEncoder,
+    w: i32,
+    h: i32,
+    timeout: Duration,
+) -> Result<f64, String> {
     if timeout < Duration::from_millis(200) {
         return Err("no time left to measure".into());
     }
@@ -352,9 +390,10 @@ pub fn measure_encoder(enc: H264Encoder, w: i32, h: i32, timeout: Duration) -> R
         "videotestsrc num-buffers={FRAMES} pattern=smpte horizontal-speed=8 ! \
          video/x-raw,format={},width={w},height={h},framerate=60/1 ! \
          queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 ! {} name=enc ! \
-         h264parse ! fakesink name=sink sync=false",
+         {} ! fakesink name=sink sync=false",
         encoder_format(enc),
-        enc.element_name()
+        enc.element_name(),
+        parser_name(enc)
     );
     let pipeline = gst::parse::launch(&desc)
         .map_err(|e| e.to_string())?
@@ -362,7 +401,11 @@ pub fn measure_encoder(enc: H264Encoder, w: i32, h: i32, timeout: Duration) -> R
         .map_err(|_| "not a pipeline".to_string())?;
     let el = pipeline.by_name("enc").ok_or("no encoder")?;
     configure_encoder(&el, enc, Role::Screen, (60, 1));
-    set_bitrate(&el, enc, bitrate_for(Role::Screen, None, w, h, (30, 1)));
+    set_bitrate(
+        &el,
+        enc,
+        bitrate_for_codec(Role::Screen, enc.codec(), None, w, h, (30, 1)),
+    );
     // (frames, first, last) at the sink.
     type Stats = (u32, Option<Instant>, Option<Instant>);
     let stats: Arc<Mutex<Stats>> = Arc::new(Mutex::new((0, None, None)));
@@ -399,20 +442,24 @@ pub fn measure_encoder(enc: H264Encoder, w: i32, h: i32, timeout: Duration) -> R
 /// `PROBE_TIMEOUT` budget. Probing stops at the first encoder that encodes 4K at `need_fps`.
 /// The first entry is the default encoder. Returns the verified table and one Info line per
 /// candidate.
-pub fn select_encoders(
-    preferred: Option<H264Encoder>,
-    need_fps: i32,
-) -> (Vec<EncoderCap>, Vec<String>) {
+pub fn select_encoders(preferred: Option<VideoEncoder>) -> (Vec<EncoderCap>, Vec<String>) {
     let mut notes = Vec::new();
-    let mut table = Vec::new();
+    let mut table: Vec<EncoderCap> = Vec::new();
     for enc in candidates(preferred) {
         let name = enc.element_name();
-        if !has_element(name) {
-            notes.push(format!("H.264 encoder {name} is not installed"));
+        // openh264 (software, slow) only when nothing better works.
+        if enc == VideoEncoder::OpenH264 && !table.is_empty() {
+            continue;
+        }
+        if !has_element(name) || !has_element(parser_name(enc)) {
+            notes.push(format!(
+                "Video encoder {name} (or {}) is not installed",
+                parser_name(enc)
+            ));
             continue;
         }
         if let Err(e) = run_probe(&encoder_probe_launch(enc), PROBE_TIMEOUT) {
-            notes.push(format!("H.264 encoder {name} failed its probe: {e}"));
+            notes.push(format!("Video encoder {name} failed its probe: {e}"));
             continue;
         }
         let budget = Instant::now() + PROBE_TIMEOUT;
@@ -432,7 +479,7 @@ pub fn select_encoders(
                 }
             }
             Err(e) => {
-                notes.push(format!("H.264 encoder {name} cannot encode 3840×2160: {e}"));
+                notes.push(format!("Video encoder {name} cannot encode 3840×2160: {e}"));
                 let fps = measure_encoder(enc, FHD.0, FHD.1, left()).unwrap_or(0.0);
                 EncoderCap {
                     enc,
@@ -442,7 +489,7 @@ pub fn select_encoders(
             }
         };
         notes.push(format!(
-            "H.264 encoder {name}: up to {}×{}, ~{:.0} fps measured at {}",
+            "Video encoder {name}: up to {}×{}, ~{:.0} fps measured at {}",
             cap.max.0,
             cap.max.1,
             cap.fps_at_max,
@@ -452,17 +499,13 @@ pub fn select_encoders(
                 "3840×2160"
             }
         ));
-        let enough = cap.max != FHD && cap.fps_at_max >= need_fps as f64 * 0.95;
         table.push(cap);
-        if enough {
-            break;
-        }
     }
     (table, notes)
 }
 
 /// Probe description for a GPU path (§5.2): upload to GPU memory, then the CONVERT block.
-pub fn gpu_probe_launch(convert: GpuConvert, enc: H264Encoder) -> String {
+pub fn gpu_probe_launch(convert: GpuConvert, enc: VideoEncoder) -> String {
     let upload = match convert {
         GpuConvert::Va => "vapostproc ! video/x-raw(memory:DMABuf)",
         GpuConvert::Gl => "glupload",
@@ -470,7 +513,7 @@ pub fn gpu_probe_launch(convert: GpuConvert, enc: H264Encoder) -> String {
     format!(
         "videotestsrc num-buffers=5 ! video/x-raw,width=320,height=240,framerate=30/1 ! {upload} ! {} ! {} ! {} ! fakesink",
         convert_launch(Some(convert), encoder_format(enc)),
-        outcaps_string(enc, Some(convert), 640, 360, (30, 1)),
+        outcaps_string(enc, Some(convert), 640, 360, Some((30, 1))),
         enc.element_name()
     )
 }
@@ -479,7 +522,7 @@ pub fn gpu_probe_launch(convert: GpuConvert, enc: H264Encoder) -> String {
 /// reaches EOS with `enc`.
 pub fn select_convert(
     preferred: Option<GpuConvert>,
-    enc: Option<H264Encoder>,
+    enc: Option<VideoEncoder>,
 ) -> (Option<GpuConvert>, Vec<String>) {
     let mut notes = Vec::new();
     let Some(enc) = enc else {
@@ -511,18 +554,23 @@ mod tests {
 
     #[test]
     fn from_element_name_round_trip() {
-        for e in H264Encoder::FALLBACK_ORDER {
-            assert_eq!(H264Encoder::from_element_name(e.element_name()), Some(e));
+        for e in VideoEncoder::FALLBACK_ORDER {
+            assert_eq!(VideoEncoder::from_element_name(e.element_name()), Some(e));
         }
-        assert_eq!(H264Encoder::from_element_name("nvh264enc"), None);
+        assert_eq!(VideoEncoder::from_element_name("nvh264enc"), None);
     }
 
     #[test]
     fn candidate_order() {
-        assert_eq!(candidates(None), H264Encoder::FALLBACK_ORDER.to_vec());
+        assert_eq!(candidates(None), VideoEncoder::FALLBACK_ORDER.to_vec());
         assert_eq!(
-            candidates(Some(H264Encoder::OpenH264)),
-            vec![H264Encoder::OpenH264, H264Encoder::Va, H264Encoder::X264]
+            candidates(Some(VideoEncoder::OpenH264)),
+            vec![
+                VideoEncoder::OpenH264,
+                VideoEncoder::Va,
+                VideoEncoder::VaHevc,
+                VideoEncoder::X264
+            ]
         );
         assert_eq!(
             convert_candidates(Some(GpuConvert::Gl)),
@@ -533,25 +581,44 @@ mod tests {
     #[test]
     fn outcaps_table() {
         assert!(
-            outcaps_string(H264Encoder::Va, Some(GpuConvert::Va), 1280, 720, (30, 1))
-                .starts_with("video/x-raw(memory:VAMemory),format=NV12,width=1280,height=720")
+            outcaps_string(
+                VideoEncoder::Va,
+                Some(GpuConvert::Va),
+                1280,
+                720,
+                Some((30, 1))
+            )
+            .starts_with("video/x-raw(memory:VAMemory),format=NV12,width=1280,height=720")
         );
         assert!(
-            outcaps_string(H264Encoder::X264, Some(GpuConvert::Va), 2, 2, (30, 1))
-                .starts_with("video/x-raw,format=I420")
+            outcaps_string(
+                VideoEncoder::X264,
+                Some(GpuConvert::Va),
+                2,
+                2,
+                Some((30, 1))
+            )
+            .starts_with("video/x-raw,format=I420")
         );
         assert!(
-            outcaps_string(H264Encoder::Va, Some(GpuConvert::Gl), 2, 2, (30, 1))
+            outcaps_string(VideoEncoder::Va, Some(GpuConvert::Gl), 2, 2, Some((30, 1)))
                 .starts_with("video/x-raw,format=NV12")
         );
     }
 
     #[test]
     fn outcaps_carry_native_rate() {
-        let c = outcaps_string(H264Encoder::X264, None, 3840, 2160, (25, 1));
+        let c = outcaps_string(VideoEncoder::X264, None, 3840, 2160, Some((25, 1)));
         assert!(c.contains("width=3840,height=2160,framerate=25/1"), "{c}");
-        let c = outcaps_string(H264Encoder::X264, None, 1920, 1080, (30000, 1001));
+        let c = outcaps_string(VideoEncoder::X264, None, 1920, 1080, Some((30000, 1001)));
         assert!(c.contains("framerate=30000/1001"), "{c}");
+        // Variable frame rate: no rate, HEVC on VA memory.
+        let c = outcaps_string(VideoEncoder::VaHevc, Some(GpuConvert::Va), 3840, 2160, None);
+        assert!(!c.contains("framerate"), "{c}");
+        assert!(
+            c.starts_with("video/x-raw(memory:VAMemory),format=NV12"),
+            "{c}"
+        );
     }
 
     #[test]
@@ -587,65 +654,11 @@ mod tests {
             bitrate_for(Role::Screen, Some(0), 1920, 1080, (30, 1)),
             s1080
         );
-    }
-
-    #[test]
-    fn per_input_encoder_pick() {
-        let va = EncoderCap {
-            enc: H264Encoder::Va,
-            max: (4096, 2160),
-            fps_at_max: 70.0,
-        };
-        let x264 = EncoderCap {
-            enc: H264Encoder::X264,
-            max: (4096, 2160),
-            fps_at_max: 40.0,
-        };
-        let slow_va = EncoderCap {
-            enc: H264Encoder::Va,
-            max: (4096, 2160),
-            fps_at_max: 20.0,
-        };
-        let va_1080 = EncoderCap {
-            enc: H264Encoder::Va,
-            max: FHD,
-            fps_at_max: 200.0,
-        };
-        // First encoder fits and keeps up.
-        assert_eq!(
-            pick_encoder(&[va.clone(), x264.clone()], 3840, 2160, 30.0),
-            Some((H264Encoder::Va, (4096, 2160)))
+        let h4k = bitrate_for_codec(Role::Screen, VideoCodec::Hevc, None, 3840, 2160, (30, 1));
+        assert!(
+            h4k < s4k && h4k as f64 >= s4k as f64 * 0.6,
+            "{h4k} vs {s4k}"
         );
-        // VA too slow for 4K30: fall back to x264 for that input only...
-        assert_eq!(
-            pick_encoder(&[slow_va.clone(), x264.clone()], 3840, 2160, 30.0),
-            Some((H264Encoder::X264, (4096, 2160)))
-        );
-        // ...while 1080p30 (4× fewer pixels) stays on VA.
-        assert_eq!(
-            pick_encoder(&[slow_va.clone(), x264.clone()], 1920, 1080, 30.0),
-            Some((H264Encoder::Va, (4096, 2160)))
-        );
-        // VA cannot do 4K at all: 4K inputs go to x264.
-        assert_eq!(
-            pick_encoder(&[va_1080.clone(), x264.clone()], 3840, 2160, 25.0),
-            Some((H264Encoder::X264, (4096, 2160)))
-        );
-        // Nothing does 4K: the input is downscaled to 1080p.
-        assert_eq!(
-            pick_encoder(std::slice::from_ref(&va_1080), 3840, 2160, 30.0),
-            Some((H264Encoder::Va, FHD))
-        );
-        // Nobody keeps up: the fastest one that fits.
-        let slow_x264 = EncoderCap {
-            fps_at_max: 25.0,
-            ..x264
-        };
-        assert_eq!(
-            pick_encoder(&[slow_va, slow_x264], 3840, 2160, 60.0),
-            Some((H264Encoder::X264, (4096, 2160)))
-        );
-        assert_eq!(pick_encoder(&[], 1920, 1080, 30.0), None);
     }
 
     #[test]

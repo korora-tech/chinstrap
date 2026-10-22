@@ -21,21 +21,36 @@ use gstreamer::prelude::*;
 use super::devices::{self, CameraClass, CameraPath, Devices};
 use super::encoders::{self, Role};
 use super::fake;
+use super::plan::{self, Demand, Plan};
 use super::portal::{self, PortalCmd, PortalOutcome};
-use super::recorder::{self, InputPipeline, VideoSource};
-use super::session::{self, Manifest, ManifestInput, ManifestSegment};
-use super::stamp::{self, SizeSlot, UNSET};
+use super::recorder::{self, InputPipeline, Rate, VideoSource};
+use super::session::{self, Manifest, ManifestInput, ManifestQuality, ManifestSegment};
+use super::stamp::{self, Counters, SizeSlot, UNSET};
 use super::transcribe::control::{JobKey, ModelEvent, SegView, Transcription, TxConfig};
+use super::transcribe::vocab;
 use super::transcribe::worker::WorkerEvent;
 use super::types::*;
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub output_root: PathBuf, // always absolute (std::path::absolute)
-    pub preferred_encoder: Option<H264Encoder>, // CHINSTRAP_H264_ENCODER
+    pub preferred_encoder: Option<VideoEncoder>, // CHINSTRAP_H264_ENCODER
     pub preferred_convert: Option<GpuConvert>, // CHINSTRAP_GPU_CONVERT=va|gl
     pub enable_portal: bool,  // false in --selftest
     pub fake: bool,           // CHINSTRAP_FAKE_ENGINE=1
+    /// Frame-rate mode new window/screen sources get (CHINSTRAP_FRAME_RATE=native|60|30).
+    pub frame_rate: FrameRateMode,
+    /// Selftest only: behaviour of the test pattern with this source id.
+    pub test_sources: Vec<(u32, recorder::TestBehaviour)>,
+}
+
+/// `CHINSTRAP_FRAME_RATE`: native (default), 60, 30.
+pub fn parse_frame_rate(v: Option<&str>) -> FrameRateMode {
+    match v.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("60") => FrameRateMode::Cfr60,
+        Some("30") => FrameRateMode::Cfr30,
+        _ => FrameRateMode::Native,
+    }
 }
 
 impl EngineConfig {
@@ -57,7 +72,7 @@ impl EngineConfig {
 
         let preferred_encoder = std::env::var("CHINSTRAP_H264_ENCODER")
             .ok()
-            .and_then(|name| H264Encoder::from_element_name(name.trim()));
+            .and_then(|name| VideoEncoder::from_element_name(name.trim()));
         let preferred_convert = std::env::var("CHINSTRAP_GPU_CONVERT").ok().and_then(|v| {
             match v.trim().to_ascii_lowercase().as_str() {
                 "va" => Some(GpuConvert::Va),
@@ -66,6 +81,7 @@ impl EngineConfig {
             }
         });
         let fake = std::env::var("CHINSTRAP_FAKE_ENGINE").is_ok_and(|v| v.trim() == "1");
+        let frame_rate = parse_frame_rate(std::env::var("CHINSTRAP_FRAME_RATE").ok().as_deref());
 
         Self {
             output_root,
@@ -73,6 +89,8 @@ impl EngineConfig {
             preferred_convert,
             enable_portal: true,
             fake,
+            frame_rate,
+            test_sources: Vec::new(),
         }
     }
 }
@@ -222,6 +240,11 @@ const LEVEL_EVERY: Duration = Duration::from_millis(100);
 /// A recording mic whose newest muxed buffer is this far behind the clock has stopped (§5.0).
 const MIC_STALL: Duration = Duration::from_secs(3);
 const NOT_FINALIZED: &str = "not finalized: file may lack index";
+/// Native rate assumed for a source whose maximum is unknown.
+const DEFAULT_NATIVE_FPS: f64 = 60.0;
+/// Re-read the vocabulary files this often (edits made outside the app).
+const VOCAB_EVERY: Duration = Duration::from_secs(5);
+const NO_FRAMES: &str = "no frames received";
 
 #[derive(Clone, Debug, PartialEq)]
 enum Stage {
@@ -262,6 +285,8 @@ enum PipeKind {
         source: SourceId,
         convert: GpuConvert,
         result: Option<Result<(), String>>,
+        /// Negotiated source caps (size, maximum rate).
+        caps: recorder::CapsSlot,
     },
 }
 
@@ -310,6 +335,7 @@ struct FileRec {
     first: Option<Arc<std::sync::atomic::AtomicU64>>,
     last: Option<Arc<std::sync::atomic::AtomicU64>>,
     size: Option<SizeSlot>,
+    counters: Option<Arc<Counters>>,
 }
 
 struct Seg {
@@ -340,9 +366,16 @@ struct Engine {
     encoders: Vec<encoders::EncoderCap>,
     /// Encoders whose GPU convert path (`caps.gpu_convert`) passed its probe; DMA-BUF inputs
     /// (portal sources, DMA-BUF cameras) are only given one of these.
-    gpu_encoders: Vec<H264Encoder>,
-    /// Screen/window/test frame rate (`CHINSTRAP_SCREEN_FPS`, default 30, max 60).
+    gpu_encoders: Vec<VideoEncoder>,
+    /// Test pattern CFR rate (`CHINSTRAP_SCREEN_FPS`, default 30, max 60).
     screen_fps: i32,
+    /// Frame-rate mode new window/screen sources get.
+    frame_rate_default: FrameRateMode,
+    /// Selected camera mode override (a mode label); None = automatic.
+    camera_mode: Option<String>,
+    vocabulary: VocabularyInfo,
+    last_vocab_check: Instant,
+    test_sources: Vec<(u32, recorder::TestBehaviour)>,
     devices: Devices,
     selected_camera: Option<DeviceId>,
     selected_microphone: Option<DeviceId>,
@@ -416,6 +449,67 @@ fn load(a: &Option<Arc<std::sync::atomic::AtomicU64>>) -> Option<u64> {
     a.as_ref()
         .map(|a| a.load(Ordering::Acquire))
         .filter(|v| *v != UNSET)
+}
+
+/// Frame accounting of a video input (None for audio), from its counters and file size.
+fn quality_of(rec: &InputPipeline, bytes: u64) -> Option<InputQuality> {
+    let enc = rec.encoder?;
+    let c = &rec.counters;
+    let g = Counters::get;
+    let level = rec
+        .leaky
+        .as_ref()
+        .map_or(0, |q| q.property::<u32>("current-level-buffers") as u64);
+    let dropped_queue = g(&c.queue_in).saturating_sub(g(&c.queue_out) + level);
+    // Repeats: videorate's own count; the repeater's output beyond its input; re-injected
+    // frames (Native: the last frame at the stop time).
+    // videorate resets its own counts when it stops, so its output beyond its input counts too.
+    let by_pads = g(&c.rate_out).saturating_sub(g(&c.rate_in));
+    let repeated = match (&rec.videorate, rec.rate) {
+        (Some(vr), _) => vr.property::<u64>("duplicate").max(by_pads),
+        (None, Some(Rate::Cfr(_))) => by_pads,
+        _ => 0,
+    } + g(&c.reinjected);
+    // The first output frame is the first real frame itself (stamped 0), not padding.
+    let padded = g(&c.padded).saturating_sub(1).min(repeated);
+    let encoded = g(&c.encoded);
+    let last = rec.last_pts.load(Ordering::Acquire);
+    let secs = if last == UNSET {
+        0.0
+    } else {
+        last as f64 / 1e9
+    };
+    let fresh = encoded.saturating_sub(repeated);
+    let first = g(&c.first_arrival);
+    Some(InputQuality {
+        encoder: Some(enc),
+        nominal_fps: rec
+            .rate
+            .and_then(Rate::cfr)
+            .map(|(n, d)| n as f64 / d.max(1) as f64),
+        max_fps: match rec.rate {
+            Some(Rate::Native { gop_fps, .. }) => Some(gop_fps as f64),
+            _ => None,
+        },
+        frames_in: g(&c.frames_in),
+        dropped_corrupt: g(&c.dropped_corrupt),
+        dropped_queue,
+        duplicated: repeated - padded,
+        padded,
+        encoded,
+        effective_fps: if secs > 0.0 { fresh as f64 / secs } else { 0.0 },
+        repeat_pct: if encoded > 0 {
+            (repeated - padded) as f64 * 100.0 / encoded as f64
+        } else {
+            0.0
+        },
+        bitrate_kbps: if secs > 0.0 {
+            (bytes as f64 * 8.0 / secs / 1000.0).round() as u32
+        } else {
+            0
+        },
+        start_offset: (first != UNSET).then(|| Duration::from_nanos(first)),
+    })
 }
 
 fn spawn_named(name: String, f: impl FnOnce() + Send + 'static) {
@@ -493,7 +587,7 @@ impl Engine {
         // §5.6 encoder selection, §5.2 GPU path probe. The only accepted blocking period.
         let screen_fps = encoders::screen_fps();
         let (encoder_table, enc_notes) = if encoders::class_ok(&missing, InputClass::Video) {
-            encoders::select_encoders(cfg.preferred_encoder, screen_fps.max(30))
+            encoders::select_encoders(cfg.preferred_encoder)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -504,7 +598,7 @@ impl Engine {
         if h264.is_none() {
             note(
                 Severity::Error,
-                "No working H.264 encoder: video inputs cannot record".into(),
+                "No working video encoder: video inputs cannot record".into(),
             );
         }
         let (gpu, gpu_notes) = encoders::select_convert(cfg.preferred_convert, h264);
@@ -514,7 +608,7 @@ impl Engine {
         // The GPU path was probed with the default encoder; probe it with every other encoder an
         // input may be given, so a DMA-BUF input never gets an encoder its path was not checked
         // with.
-        let gpu_encoders: Vec<H264Encoder> = match gpu {
+        let gpu_encoders: Vec<VideoEncoder> = match gpu {
             Some(convert) => encoder_table
                 .iter()
                 .map(|c| c.enc)
@@ -580,6 +674,10 @@ impl Engine {
             events,
             caps: Capabilities {
                 h264_encoder: h264,
+                encoders: encoder_table
+                    .iter()
+                    .map(|c| (c.enc, c.fps_at(encoders::UHD.0, encoders::UHD.1)))
+                    .collect(),
                 gpu_convert: gpu,
                 missing_elements: missing,
                 portal: portal_state,
@@ -587,6 +685,11 @@ impl Engine {
             encoders: encoder_table,
             gpu_encoders,
             screen_fps,
+            frame_rate_default: cfg.frame_rate,
+            camera_mode: None,
+            vocabulary: vocab::info(),
+            last_vocab_check: now,
+            test_sources: cfg.test_sources.clone(),
             devices,
             selected_camera: None,
             selected_microphone,
@@ -731,6 +834,10 @@ impl Engine {
             }),
             can_record: self.can_record(),
             transcription: self.transcription.info(),
+            frame_rate_default: self.frame_rate_default,
+            selected_camera_mode: self.camera_mode.clone(),
+            capacity: self.capacity(),
+            vocabulary: self.vocabulary.clone(),
         };
         let _ = self
             .events
@@ -790,7 +897,26 @@ impl Engine {
                             InputStatus::Failed { reason } => Some(reason.clone()),
                             _ => None,
                         };
-                        mi.first_pts_ns = load(&f.first).or(mi.first_pts_ns);
+                        // Video: the first real frame's arrival (the file is padded to zero).
+                        let arrival = f
+                            .counters
+                            .as_ref()
+                            .filter(|_| f.file.quality.is_some())
+                            .map(|c| Counters::get(&c.first_arrival))
+                            .filter(|v| *v != UNSET);
+                        mi.first_pts_ns = arrival.or(load(&f.first)).or(mi.first_pts_ns);
+                        mi.quality = f.file.quality.as_ref().map(|q| ManifestQuality {
+                            frames_in: q.frames_in,
+                            dropped_corrupt: q.dropped_corrupt,
+                            dropped_queue: q.dropped_queue,
+                            duplicated: q.duplicated,
+                            padded: q.padded,
+                            encoded: q.encoded,
+                            effective_fps: (q.effective_fps * 100.0).round() / 100.0,
+                            repeat_pct: (q.repeat_pct * 100.0).round() / 100.0,
+                            bitrate_kbps: q.bitrate_kbps,
+                            start_offset_ns: q.start_offset.map(|d| d.as_nanos() as u64),
+                        });
                         mi.last_pts_ns = load(&f.last).or(mi.last_pts_ns);
                         if let Some(Some((w, h))) =
                             f.size.as_ref().and_then(|s| s.lock().ok().map(|g| *g))
@@ -834,7 +960,7 @@ impl Engine {
                 };
                 e.info.unsupported.is_none()
                     && self.video_ok()
-                    && match e.class.as_ref().and_then(CameraClass::mode).map(|m| m.path) {
+                    && match e.mode(self.camera_mode.as_deref()).map(|m| m.path) {
                         Some(CameraPath::Raw) => true,
                         Some(CameraPath::Jpeg) => {
                             encoders::class_ok(missing, InputClass::MjpegCamera)
@@ -960,17 +1086,67 @@ impl Engine {
             | EngineCommand::RemoveSource(_)
             | EngineCommand::SetOutputRoot(_)
             | EngineCommand::EndSession
+            | EngineCommand::SetFrameRateMode { .. }
+            | EngineCommand::SelectCameraMode(_)
                 if busy =>
             {
                 self.reject(&cmd, "not allowed while recording");
             }
+            EngineCommand::SetFrameRateMode { source, mode } => match source {
+                None => {
+                    self.frame_rate_default = *mode;
+                    for s in &mut self.sources {
+                        if s.info.kind != SourceKind::TestPattern {
+                            s.info.frame_rate = *mode;
+                        }
+                    }
+                    self.dirty = true;
+                }
+                Some(id) => match self.sources.iter_mut().find(|s| s.info.id == *id) {
+                    Some(s) => {
+                        s.info.frame_rate = *mode;
+                        self.dirty = true;
+                    }
+                    None => self.reject(&cmd, "unknown source"),
+                },
+            },
+            EngineCommand::SelectCameraMode(label) => {
+                let known = match (
+                    label,
+                    self.selected_camera.and_then(|id| self.devices.camera(id)),
+                ) {
+                    (None, _) => true,
+                    (Some(l), Some(cam)) => cam.modes.iter().any(|m| &m.label() == l),
+                    (Some(_), None) => false,
+                };
+                if known {
+                    self.camera_mode = label.clone();
+                    self.dirty = true;
+                } else {
+                    self.reject(&cmd, "the selected camera has no such mode");
+                }
+            }
+            EngineCommand::AddVocabularyTerm(_)
+            | EngineCommand::RemoveVocabularyTerm(_)
+            | EngineCommand::AddReplacement { .. }
+            | EngineCommand::RemoveReplacement { .. } => {
+                if let Err(e) = vocab::command(&cmd) {
+                    self.reject(&cmd, &e);
+                }
+                self.vocabulary = vocab::info();
+                self.dirty = true;
+            }
             EngineCommand::SelectCamera(id) => match id {
                 None => {
                     self.selected_camera = None;
+                    self.camera_mode = None;
                     self.dirty = true;
                 }
                 Some(id) => match self.devices.camera(*id) {
                     Some(c) if c.info.unsupported.is_none() => {
+                        if self.selected_camera != Some(*id) {
+                            self.camera_mode = None;
+                        }
                         self.selected_camera = Some(*id);
                         self.dirty = true;
                     }
@@ -1013,7 +1189,7 @@ impl Engine {
                     SourceState::Ready
                 } else {
                     SourceState::Unsupported {
-                        reason: "no working H.264 encoder".into(),
+                        reason: "no working video encoder".into(),
                     }
                 };
                 self.sources.push(Source {
@@ -1024,6 +1200,18 @@ impl Engine {
                         label: format!("Test pattern {}", id.0),
                         logical_size: Some((1280, 720)),
                         state,
+                        // The test pattern is CFR at CHINSTRAP_SCREEN_FPS until set otherwise.
+                        frame_rate: if self.screen_fps == 60 {
+                            FrameRateMode::Cfr60
+                        } else {
+                            FrameRateMode::Cfr30
+                        },
+                        refresh: Some((recorder::TEST_NATIVE_FPS, 1)),
+                        size: Some(
+                            self.test_behaviour(id)
+                                .size
+                                .unwrap_or_else(recorder::test_size),
+                        ),
                     },
                     node: None,
                     convert: self.caps.gpu_convert,
@@ -1261,6 +1449,16 @@ impl Engine {
             }
         };
         let enc = self.caps.h264_encoder;
+        // One plan for the whole segment: encoders and rates fit the measured capacity together.
+        let plan = self.plan_for(&inputs);
+        for n in &plan.notes {
+            if self.warned.insert(n.clone()) {
+                self.notice(Severity::Info, None, n.clone());
+            }
+        }
+        if let Some(w) = plan.warning() {
+            self.notice(Severity::Warning, None, w);
+        }
         let mut files = Vec::new();
         let mut started = Vec::new();
         for key in inputs {
@@ -1307,7 +1505,7 @@ impl Engine {
             let codec = if key == InputKey::Microphone {
                 "opus"
             } else {
-                "h264"
+                plan.get(key).map_or("h264", |a| a.enc.codec().name())
             };
             let mut rec = FileRec {
                 file: InputFile {
@@ -1316,6 +1514,8 @@ impl Engine {
                     path: path.clone(),
                     status: InputStatus::Starting,
                     bytes: 0,
+                    waiting_for_frame: false,
+                    quality: None,
                 },
                 meta: ManifestInput {
                     key: key_string(key),
@@ -1323,7 +1523,7 @@ impl Engine {
                     label,
                     file: file_name,
                     codec: codec.into(),
-                    encoder: (codec == "h264")
+                    encoder: (codec != "opus")
                         .then(|| enc.map(|e| e.element_name().to_string()))
                         .flatten(),
                     convert: None,
@@ -1331,31 +1531,43 @@ impl Engine {
                     width: None,
                     height: None,
                     framerate: None,
+                    max_framerate: None,
                     first_pts_ns: None,
                     last_pts_ns: None,
                     status: "starting".into(),
                     error: None,
                     device,
                     transcript: None,
+                    quality: None,
                 },
                 first: None,
                 last: None,
                 size: None,
+                counters: None,
             };
             // Break-before-make (D4): no pipeline of this capture may still be out of Null.
             let blocked = capture.is_some_and(|c| self.pipes.iter().any(|p| p.capture == Some(c)));
             let built = if blocked {
                 Err("a previous pipeline for this capture did not stop".to_string())
             } else {
-                self.build_input(key, index, &path)
+                self.build_input(key, index, &path, &plan)
             };
             match built {
                 Ok(ip) => {
                     rec.meta.convert = encoders::convert_name(ip.convert);
                     if let Some(e) = ip.encoder {
                         rec.meta.encoder = Some(e.element_name().to_string());
+                        rec.meta.codec = e.codec().name().into();
                     }
-                    rec.meta.framerate = ip.fps.map(|(n, d)| format!("{n}/{d}"));
+                    match ip.rate {
+                        Some(Rate::Cfr((n, d))) => rec.meta.framerate = Some(format!("{n}/{d}")),
+                        Some(Rate::Native { cap, .. }) => {
+                            rec.meta.framerate = Some("variable".into());
+                            rec.meta.max_framerate = cap.map(|c| format!("{c}/1"));
+                        }
+                        None => {}
+                    }
+                    rec.counters = Some(ip.counters.clone());
                     rec.first = Some(ip.first_pts.clone());
                     rec.last = Some(ip.last_pts.clone());
                     rec.size = Some(ip.size.clone());
@@ -1421,38 +1633,152 @@ impl Engine {
         self.gap_from = pending_gap;
     }
 
-    /// Picks the encoder for a video input needing `w`×`h` at `fps` and the size it may record
-    /// at most (`limit` capped by what that encoder was verified to do). `gpu`: the input takes
-    /// the GPU convert path, so only encoders that path was probed with qualify.
+    /// What each video input among `inputs` needs (the capacity plan's input).
+    fn demands(&self, inputs: &[InputKey]) -> Vec<Demand> {
+        let mut out = Vec::new();
+        for &key in inputs {
+            match key {
+                InputKey::Microphone => {}
+                InputKey::Camera => {
+                    let Some(e) = self.selected_camera.and_then(|id| self.devices.camera(id))
+                    else {
+                        continue;
+                    };
+                    let Some(mode) = e.mode(self.camera_mode.as_deref()) else {
+                        continue;
+                    };
+                    let (n, d) = mode.output_fps();
+                    out.push(Demand {
+                        key,
+                        label: "Camera".into(),
+                        size: mode.output_size(),
+                        fps: n as f64 / d.max(1) as f64,
+                        native: false,
+                        gpu_path: mode.path == CameraPath::DmaBuf,
+                        camera: true,
+                    });
+                }
+                InputKey::Source(id) => {
+                    let Some(s) = self.sources.iter().find(|s| s.info.id == id) else {
+                        continue;
+                    };
+                    let size = match (s.info.kind, s.info.size) {
+                        (SourceKind::TestPattern, _) => {
+                            let (w, h) = self
+                                .test_behaviour(id)
+                                .size
+                                .unwrap_or_else(recorder::test_size);
+                            stamp::lock_size(w, h)
+                        }
+                        (_, Some((w, h))) => stamp::lock_size(w, h),
+                        // The physical size is only known from negotiation: plan for UHD.
+                        _ => encoders::UHD,
+                    };
+                    let (fps, native) = match s.info.frame_rate.cfr_fps() {
+                        Some(f) => (f as f64, false),
+                        None => (
+                            s.info
+                                .refresh
+                                .map(|(n, d)| n as f64 / d.max(1) as f64)
+                                .unwrap_or(DEFAULT_NATIVE_FPS),
+                            true,
+                        ),
+                    };
+                    out.push(Demand {
+                        key,
+                        label: s.info.label.clone(),
+                        size,
+                        fps,
+                        native,
+                        gpu_path: s.convert.or(self.caps.gpu_convert).is_some(),
+                        camera: false,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    fn test_behaviour(&self, id: SourceId) -> recorder::TestBehaviour {
+        self.test_sources
+            .iter()
+            .find(|(i, _)| *i == id.0)
+            .map(|(_, b)| *b)
+            .unwrap_or_default()
+    }
+
+    fn plan_for(&self, inputs: &[InputKey]) -> Plan {
+        plan::plan(&self.demands(inputs), &self.encoders, &self.gpu_encoders)
+    }
+
+    /// The plan for what Record would start now (Snapshot::capacity).
+    fn capacity(&self) -> CapacityPlan {
+        let p = self.plan_for(&self.frozen_inputs());
+        CapacityPlan {
+            inputs: p
+                .inputs
+                .iter()
+                .map(|a| {
+                    let size = self
+                        .demands(&[a.key])
+                        .first()
+                        .map_or(encoders::UHD, |d| d.size);
+                    PlannedInput {
+                        input: a.key,
+                        encoder: a.enc,
+                        width: size.0.min(a.max.0),
+                        height: size.1.min(a.max.1),
+                        fps: a.fps,
+                        native: a.native,
+                        load_pct: (a.load * 100.0).round() as u32,
+                    }
+                })
+                .collect(),
+            gpu_load_pct: (p.gpu_load / plan::GPU_BUDGET * 100.0).round() as u32,
+            cpu_load_pct: (p.cpu_load / plan::CPU_BUDGET * 100.0).round() as u32,
+            over: p.over,
+            warning: p.warning(),
+            notes: p.notes.clone(),
+        }
+    }
+
+    /// Encoder and timing for a planned video input; `limit` caps the size.
     fn video_target(
         &self,
-        need: (i32, i32),
-        fps: (i32, i32),
+        plan: &Plan,
+        key: InputKey,
+        cfr: (i32, i32),
         limit: (i32, i32),
-        gpu: bool,
-    ) -> Result<(H264Encoder, recorder::VideoTarget), String> {
-        let rate = fps.0 as f64 / fps.1.max(1) as f64;
-        let table: Vec<encoders::EncoderCap> = self
-            .encoders
-            .iter()
-            .filter(|c| !gpu || self.gpu_encoders.contains(&c.enc))
-            .cloned()
-            .collect();
-        let (enc, max) = encoders::pick_encoder(&table, need.0, need.1, rate).ok_or(if gpu {
-            "no H.264 encoder works with the GPU convert path"
+    ) -> Result<(VideoEncoder, recorder::VideoTarget), String> {
+        let a = plan
+            .get(key)
+            .ok_or("no video encoder can record this input")?;
+        let demand = self.demands(&[key]).into_iter().next();
+        let rate = if a.native {
+            let lowered = demand.is_some_and(|d| a.fps < d.fps - 0.5);
+            Rate::Native {
+                cap: lowered.then(|| a.fps.round() as i32),
+                gop_fps: a.fps.ceil() as i32,
+            }
         } else {
-            "no H.264 encoder"
-        })?;
+            Rate::Cfr(cfr)
+        };
         Ok((
-            enc,
+            a.enc,
             recorder::VideoTarget {
-                fps,
-                max: (limit.0.min(max.0), limit.1.min(max.1)),
+                rate,
+                max: (limit.0.min(a.max.0), limit.1.min(a.max.1)),
             },
         ))
     }
 
-    fn build_input(&self, key: InputKey, seg: u32, path: &Path) -> Result<InputPipeline, String> {
+    fn build_input(
+        &self,
+        key: InputKey,
+        seg: u32,
+        path: &Path,
+        plan: &Plan,
+    ) -> Result<InputPipeline, String> {
         let name = format!("seg{seg:03}-{}", key_string(key).replace(':', "-"));
         match key {
             InputKey::Microphone => {
@@ -1467,21 +1793,23 @@ impl Engine {
                     .selected_camera
                     .and_then(|id| self.devices.camera(id))
                     .ok_or("the camera is gone")?;
-                let class = e.class.clone().ok_or("camera not classified")?;
-                let mode = class.mode().ok_or("camera is not usable")?;
+                if let Some(CameraClass::Unsupported(r)) = &e.class {
+                    return Err(r.clone());
+                }
+                let mode = e
+                    .mode(self.camera_mode.as_deref())
+                    .ok_or("camera is not usable")?
+                    .clone();
                 // Native size and rate (≤60 fps); downscaled only above 4096×2160.
                 let (enc, target) = self.video_target(
-                    mode.output_size(),
+                    plan,
+                    key,
                     mode.output_fps(),
                     (devices::CAMERA_MAX_W, devices::CAMERA_MAX_H),
-                    mode.path == CameraPath::DmaBuf,
                 )?;
                 recorder::build_video(
                     &name,
-                    VideoSource::Camera {
-                        entry: e,
-                        class: class.clone(),
-                    },
+                    VideoSource::Camera { entry: e, mode },
                     self.caps.gpu_convert,
                     enc,
                     Role::Camera,
@@ -1497,11 +1825,8 @@ impl Engine {
                     .find(|s| s.info.id == id)
                     .ok_or("the source is gone")?;
                 let convert = s.convert.or(self.caps.gpu_convert);
-                let (source, need) = match s.info.kind {
-                    SourceKind::TestPattern => (
-                        VideoSource::Test,
-                        stamp::lock_size(recorder::test_size().0, recorder::test_size().1),
-                    ),
+                let source = match s.info.kind {
+                    SourceKind::TestPattern => VideoSource::Test(self.test_behaviour(id)),
                     _ => {
                         let fd = s
                             .info
@@ -1510,25 +1835,15 @@ impl Engine {
                             .and_then(|c| c.fd.as_ref())
                             .ok_or("the screen share is gone")?
                             .as_raw_fd();
-                        // The physical size is only known from the first caps (HiDPI outputs
-                        // are larger than the portal's logical size): plan for UHD.
-                        (
-                            VideoSource::Portal {
-                                fd,
-                                node: s.node.ok_or("no PipeWire node")?,
-                            },
-                            encoders::UHD,
-                        )
+                        VideoSource::Portal {
+                            fd,
+                            node: s.node.ok_or("no PipeWire node")?,
+                        }
                     }
                 };
-                // Portal sources and the test pattern both take the §5.2 GPU convert chain.
-                let gpu = convert.is_some();
-                let (enc, target) = self.video_target(
-                    need,
-                    (self.screen_fps, 1),
-                    (stamp::MAX_W, stamp::MAX_H),
-                    gpu,
-                )?;
+                let cfr = (s.info.frame_rate.cfr_fps().unwrap_or(self.screen_fps), 1);
+                let (enc, target) =
+                    self.video_target(plan, key, cfr, (stamp::MAX_W, stamp::MAX_H))?;
                 recorder::build_video(
                     &name,
                     source,
@@ -1580,6 +1895,19 @@ impl Engine {
             self.finalize_deadline
                 .unwrap_or_else(|| Instant::now() + FINALIZE_TIMEOUT),
         );
+        let stop_ns = self
+            .pipes
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(Pipe::input)
+            .and_then(|(seg, _)| {
+                self.session
+                    .as_ref()?
+                    .segs
+                    .iter()
+                    .find(|g| g.index == seg)?
+                    .stop_ns
+            });
         let Some(p) = self.pipes.iter_mut().find(|p| p.id == id) else {
             return;
         };
@@ -1605,7 +1933,14 @@ impl Engine {
         }
         if healthy {
             let pipeline = p.pipeline.clone();
+            // Variable rate: the last frame again at the stop time, so the file lasts the whole
+            // segment even when the source sent nothing since (a static window).
+            let base = rec.base.load(Ordering::Acquire);
+            let tail = rec.tail.clone().zip(stop_ns.filter(|_| base != UNSET));
             spawn_named(format!("chinstrap-gst-eos-{id}"), move || {
+                if let Some((t, stop)) = tail {
+                    t.push_at(stop.saturating_sub(base));
+                }
                 pipeline.send_event(gst::event::Eos::new());
             });
             p.stage = Stage::Draining {
@@ -1815,17 +2150,35 @@ impl Engine {
         let outcome = p.outcome.clone();
         match p.kind {
             PipeKind::Input { seg, key, rec, .. } => {
-                drop(rec);
-                drop(p.pipeline);
-                if abandoned {
-                    return;
-                }
                 let path = self
                     .session
                     .as_ref()
                     .and_then(|s| s.segs.iter().find(|g| g.index == seg))
                     .and_then(|g| g.files.iter().find(|f| f.file.input == key))
                     .map(|f| f.file.path.clone());
+                let bytes = path
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map_or(0, |m| m.len());
+                let quality = quality_of(&rec, bytes);
+                let encoded = Counters::get(&rec.counters.encoded);
+                drop(rec);
+                drop(p.pipeline);
+                if abandoned {
+                    return;
+                }
+                if let Some(f) = self.file_mut(seg, key) {
+                    f.file.quality = quality;
+                    f.file.waiting_for_frame = false;
+                }
+                // An input that never produced a frame is a failure, never a complete file.
+                let outcome = match outcome {
+                    Some(Outcome::Complete) if encoded == 0 => {
+                        self.notice(Severity::Error, Some(key), format!("{key:?}: {NO_FRAMES}"));
+                        Some(Outcome::Discard(NO_FRAMES.into()))
+                    }
+                    o => o,
+                };
                 match outcome {
                     Some(Outcome::Complete) => {
                         self.set_file_status(seg, key, InputStatus::Complete)
@@ -1859,12 +2212,14 @@ impl Engine {
                 source,
                 convert,
                 result,
+                caps,
             } => {
                 drop(p.pipeline);
                 if abandoned {
                     return;
                 }
-                self.apply_probe(source, convert, result);
+                let caps = caps.lock().ok().and_then(|c| c.clone());
+                self.apply_probe(source, convert, result, caps);
             }
         }
     }
@@ -2006,7 +2361,7 @@ impl Engine {
                     };
                     let state = if !self.video_ok() {
                         SourceState::Unsupported {
-                            reason: "no working H.264 encoder".into(),
+                            reason: "no working video encoder".into(),
                         }
                     } else if self.caps.gpu_convert.is_none() {
                         SourceState::Unsupported {
@@ -2024,6 +2379,9 @@ impl Engine {
                             label,
                             logical_size: size,
                             state,
+                            frame_rate: self.frame_rate_default,
+                            refresh: None,
+                            size: None,
                         },
                         node: Some(node),
                         convert: None,
@@ -2138,7 +2496,7 @@ impl Engine {
         };
         let name = format!("probe-{}-{convert:?}", source.0);
         match recorder::build_probe(&name, fd, node, convert, self.caps.h264_encoder) {
-            Ok((pipeline, bus)) => {
+            Ok((pipeline, bus, caps)) => {
                 let id = self.next_pipe;
                 self.next_pipe += 1;
                 self.pipes.push(Pipe {
@@ -2150,6 +2508,7 @@ impl Engine {
                         source,
                         convert,
                         result: None,
+                        caps,
                     },
                     stage: Stage::Starting,
                     deadline: Some(Instant::now() + PROBE_TIMEOUT),
@@ -2161,7 +2520,7 @@ impl Engine {
                 });
                 self.spawn_state(id, pipeline, gst::State::Playing);
             }
-            Err(e) => self.apply_probe(source, convert, Some(Err(e))),
+            Err(e) => self.apply_probe(source, convert, Some(Err(e)), None),
         }
     }
 
@@ -2183,6 +2542,7 @@ impl Engine {
         source: SourceId,
         convert: GpuConvert,
         result: Option<Result<(), String>>,
+        caps: Option<gst::Caps>,
     ) {
         let gl_ok = encoders::convert_elements(GpuConvert::Gl)
             .iter()
@@ -2197,6 +2557,15 @@ impl Engine {
             Ok(()) => {
                 s.info.state = SourceState::Ready;
                 s.convert = Some(convert);
+                if let Some(caps) = &caps {
+                    let facts = recorder::source_facts(caps);
+                    s.info.size = facts.size.or(s.info.size);
+                    s.info.refresh = facts.max_rate.or(s.info.refresh);
+                    eprintln!(
+                        "chinstrap: {}: source {:?} at up to {:?} fps",
+                        s.info.label, s.info.size, s.info.refresh
+                    );
+                }
             }
             Err(e) => {
                 // Any VA failure is retried with GL: a DMA-BUF modifier mismatch surfaces first
@@ -2317,10 +2686,12 @@ impl Engine {
                             source,
                             convert,
                             result,
+                            caps,
                         } = &mut p.kind
                     {
                         let (s, c, r) = (*source, *convert, result.take());
-                        self.apply_probe(s, c, r);
+                        let caps = caps.lock().ok().and_then(|c| c.clone());
+                        self.apply_probe(s, c, r, caps);
                     }
                 }
                 Stage::Draining { deadline, .. } if now >= deadline => {
@@ -2550,11 +2921,20 @@ impl Engine {
                 }
             }
         }
+        if now.duration_since(self.last_vocab_check) >= VOCAB_EVERY {
+            self.last_vocab_check = now;
+            let v = vocab::info();
+            if v != self.vocabulary {
+                self.vocabulary = v;
+                self.dirty = true;
+            }
+        }
         if now.duration_since(self.last_sizes) < SIZE_EVERY {
             return;
         }
         self.last_sizes = now;
         self.check_mic_stall();
+        self.refresh_quality();
         let Some(seg) = self.current_seg() else {
             return;
         };
@@ -2577,6 +2957,45 @@ impl Engine {
         }
         if changed {
             self.dirty = true;
+        }
+    }
+
+    /// Live quality and "waiting for first frame" of the current segment's inputs (~1 Hz).
+    fn refresh_quality(&mut self) {
+        let Some(seg) = self.current_seg() else {
+            return;
+        };
+        let bytes_of = |key: InputKey| {
+            self.session
+                .as_ref()
+                .and_then(|s| s.segs.iter().find(|g| g.index == seg))
+                .and_then(|g| g.files.iter().find(|f| f.file.input == key))
+                .map_or(0, |f| f.file.bytes)
+        };
+        let mut updates = Vec::new();
+        for p in &self.pipes {
+            if let PipeKind::Input {
+                seg: s, key, rec, ..
+            } = &p.kind
+                && *s == seg
+                && !p.abandoned
+                && matches!(p.stage, Stage::Running { .. } | Stage::Draining { .. })
+            {
+                let waiting = match rec.encoder {
+                    Some(_) => Counters::get(&rec.counters.frames_in) == 0,
+                    None => rec.first_pts.load(Ordering::Acquire) == UNSET,
+                };
+                updates.push((*key, waiting, quality_of(rec, bytes_of(*key))));
+            }
+        }
+        for (key, waiting, q) in updates {
+            if let Some(f) = self.file_mut(seg, key)
+                && (f.file.quality != q || f.file.waiting_for_frame != waiting)
+            {
+                f.file.quality = q;
+                f.file.waiting_for_frame = waiting;
+                self.dirty = true;
+            }
         }
     }
 

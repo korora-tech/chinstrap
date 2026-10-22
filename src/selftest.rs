@@ -3,6 +3,13 @@
 //! Drives the real engine (`enable_portal: false`) through Record → Cut → Stop, validates every
 //! file with Discoverer and the manifest, then checks finalize-on-shutdown. Prints a JSON
 //! summary and returns the process exit code.
+//!
+//! Test sources: 1 is the plain CFR pattern; 2 records Native (bursty variable rate, timed
+//! keyframes, last frame held to the stop); 3 starts 1.5 s late (its file must still start at
+//! zero); 4 never sends a frame (it must end Failed "no frames received", never complete).
+//! With `CHINSTRAP_SELFTEST_CAMERA`, a second engine then records that camera with two 4K test
+//! sources for `CHINSTRAP_SELFTEST_LOAD_SECS` (default 60) and asserts < 1% repeated camera
+//! frames, by the counters and by consecutive-frame differences.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -13,12 +20,24 @@ use gstreamer_pbutils as pbutils;
 use gstreamer_pbutils::prelude::*;
 
 use crate::studio::{
-    self, EngineCommand, EngineEvent, InputKey, InputStatus, ModelState, Phase, SegmentStatus,
-    Severity, Snapshot, SourceKind, SourceState, TranscriptStatus,
+    self, EngineCommand, EngineEvent, FrameRateMode, InputKey, InputStatus, ModelState, Phase,
+    SegmentStatus, Severity, Snapshot, SourceId, SourceKind, SourceState, TestBehaviour,
+    TranscriptStatus,
 };
 
 const DURATION_TOLERANCE: Duration = Duration::from_millis(600);
 const RESIZE_AFTER_MS: &str = "1500";
+/// Source ids of the extra test patterns (portal is off, so ids are 1, 2, 3, 4 in order).
+const NATIVE_ID: u32 = 2;
+const LATE_ID: u32 = 3;
+const SILENT_ID: u32 = 4;
+const LATE: Duration = Duration::from_millis(1500);
+/// A file "starts at zero" when its first frame is this close to it.
+const START_SLACK_NS: u64 = 50_000_000;
+/// Consecutive decoded frames (480×270 gray) closer than this are a repeat: a re-encoded
+/// identical frame measures 0.10-0.15 on this camera, a fresh one 0.3 and up.
+const REPEAT_DIFF: f64 = 0.2;
+const MAX_REPEAT_PCT: f64 = 1.0;
 
 struct Harness {
     rx: async_channel::Receiver<EngineEvent>,
@@ -155,8 +174,8 @@ fn check_video(disc: &pbutils::Discoverer, path: &Path) -> Result<FileCheck, Str
         .structure(0)
         .map(|s| s.name().to_string())
         .unwrap_or_default();
-    if name != "video/x-h264" {
-        return Err(format!("video stream is {name}, not H.264"));
+    if name != "video/x-h264" && name != "video/x-h265" {
+        return Err(format!("video stream is {name}, not H.264/H.265"));
     }
     let (w, h) = (v.width(), v.height());
     if w % 2 != 0 || h % 2 != 0 || w < 128 || h < 128 {
@@ -203,6 +222,142 @@ fn check_audio(disc: &pbutils::Discoverer, path: &Path) -> Result<FileCheck, Str
     })
 }
 
+/// (PTS ns, keyframe) of every video frame of a Matroska file, demuxed (not decoded).
+fn frame_times(path: &Path) -> Result<Vec<(u64, bool)>, String> {
+    let desc = format!(
+        "filesrc location=\"{}\" ! matroskademux ! fakesink name=s sync=false",
+        path.display()
+    );
+    let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let pipeline = gst::parse::launch(&desc)
+        .map_err(|e| e.to_string())?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| "not a pipeline")?;
+    let sink = pipeline.by_name("s").ok_or("no sink")?;
+    let f = frames.clone();
+    sink.static_pad("sink").ok_or("no sink pad")?.add_probe(
+        gst::PadProbeType::BUFFER,
+        move |_, info| {
+            if let Some(b) = info.buffer()
+                && let Some(pts) = b.pts()
+                && let Ok(mut v) = f.lock()
+            {
+                v.push((
+                    pts.nseconds(),
+                    !b.flags().contains(gst::BufferFlags::DELTA_UNIT),
+                ));
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
+    run_to_eos(&pipeline, Duration::from_secs(60))?;
+    let mut v = frames.lock().map_err(|_| "poisoned")?.clone();
+    v.sort_by_key(|x| x.0);
+    Ok(v)
+}
+
+/// Mean absolute difference (0-255 scale) between consecutive decoded frames, scaled to
+/// 480×270 gray, with each pair's later PTS.
+fn frame_diffs(path: &Path) -> Result<Vec<(u64, f64)>, String> {
+    let desc = format!(
+        "filesrc location=\"{}\" ! decodebin ! videoconvert ! videoscale ! \
+         video/x-raw,format=GRAY8,width=480,height=270 ! fakesink name=s sync=false",
+        path.display()
+    );
+    let out = std::sync::Arc::new(std::sync::Mutex::new((None::<Vec<u8>>, Vec::new())));
+    let pipeline = gst::parse::launch(&desc)
+        .map_err(|e| e.to_string())?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| "not a pipeline")?;
+    let sink = pipeline.by_name("s").ok_or("no sink")?;
+    let o = out.clone();
+    sink.static_pad("sink").ok_or("no sink pad")?.add_probe(
+        gst::PadProbeType::BUFFER,
+        move |_, info| {
+            if let Some(b) = info.buffer()
+                && let Ok(map) = b.map_readable()
+                && let Ok(mut st) = o.lock()
+            {
+                let cur = map.as_slice().to_vec();
+                if let Some(prev) = &st.0
+                    && prev.len() == cur.len()
+                    && !cur.is_empty()
+                {
+                    let sum: u64 = prev
+                        .iter()
+                        .zip(&cur)
+                        .map(|(a, b)| a.abs_diff(*b) as u64)
+                        .sum();
+                    let pts = b.pts().map_or(0, |p| p.nseconds());
+                    st.1.push((pts, sum as f64 / cur.len() as f64));
+                }
+                st.0 = Some(cur);
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
+    run_to_eos(&pipeline, Duration::from_secs(300))?;
+    let v = out.lock().map_err(|_| "poisoned")?.1.clone();
+    Ok(v)
+}
+
+fn run_to_eos(pipeline: &gst::Pipeline, timeout: Duration) -> Result<(), String> {
+    let bus = pipeline.bus().ok_or("no bus")?;
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|e| e.to_string())?;
+    let res = match bus.timed_pop_filtered(
+        gst::ClockTime::from_nseconds(timeout.as_nanos() as u64),
+        &[gst::MessageType::Eos, gst::MessageType::Error],
+    ) {
+        Some(m) => match m.view() {
+            gst::MessageView::Error(e) => Err(e.error().to_string()),
+            _ => Ok(()),
+        },
+        None => Err("timed out".into()),
+    };
+    let _ = pipeline.set_state(gst::State::Null);
+    res
+}
+
+/// Problems with a variable-rate file: it must not be constant-rate, must reach `end_ns`, and
+/// must have a keyframe at least every ~2 s.
+fn check_vfr(frames: &[(u64, bool)], end_ns: u64) -> Result<serde_json::Value, String> {
+    if frames.len() < 10 {
+        return Err(format!("only {} frames", frames.len()));
+    }
+    let mut deltas: Vec<u64> = frames
+        .windows(2)
+        .map(|w| (w[1].0 - w[0].0 + 500_000) / 1_000_000)
+        .collect();
+    deltas.sort_unstable();
+    let mut distinct = deltas.clone();
+    distinct.dedup();
+    let keys: Vec<u64> = frames.iter().filter(|f| f.1).map(|f| f.0).collect();
+    let max_key_gap = keys.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+    let last = frames.last().map_or(0, |f| f.0);
+    let json = serde_json::json!({
+        "frames": frames.len(), "distinct_deltas_ms": distinct.len(),
+        "min_delta_ms": deltas.first(), "max_delta_ms": deltas.last(),
+        "keyframes": keys.len(), "max_keyframe_gap_s": max_key_gap as f64 / 1e9,
+        "last_frame_s": last as f64 / 1e9,
+    });
+    if distinct.len() < 3 {
+        return Err(format!("frame intervals look constant: {json}"));
+    }
+    if keys.len() < 2 || max_key_gap > 2_600_000_000 {
+        return Err(format!("keyframes not every ~2 s: {json}"));
+    }
+    if last + 400_000_000 < end_ns {
+        return Err(format!(
+            "last frame at {:.3}s, segment ends {:.3}s",
+            last as f64 / 1e9,
+            end_ns as f64 / 1e9
+        ));
+    }
+    Ok(json)
+}
+
 pub fn run(dir: &Path) -> i32 {
     match run_inner(dir) {
         Ok(ok) => i32::from(!ok),
@@ -228,6 +383,23 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     config.output_root = dir.clone();
     config.enable_portal = false;
     config.fake = false;
+    config.test_sources = vec![
+        (
+            LATE_ID,
+            TestBehaviour {
+                late: Some(LATE),
+                ..Default::default()
+            },
+        ),
+        (
+            SILENT_ID,
+            TestBehaviour {
+                silent: true,
+                ..Default::default()
+            },
+        ),
+    ];
+    let load_config = config.clone();
     let (engine, rx) = studio::start(config).map_err(|e: studio::EngineError| e.to_string())?;
     let mut h = Harness {
         rx,
@@ -334,17 +506,28 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         );
     }
     eprintln!("selftest: camera={camera:?} mic={mic:?}");
-    engine.send(EngineCommand::AddTestSource);
+    for _ in 0..4 {
+        engine.send(EngineCommand::AddTestSource);
+    }
+    engine.send(EngineCommand::SetFrameRateMode {
+        source: Some(SourceId(NATIVE_ID)),
+        mode: FrameRateMode::Native,
+    });
     let snap = h
         .wait_for(Duration::from_secs(5), |s| {
             s.sources
                 .iter()
-                .any(|x| x.kind == SourceKind::TestPattern && x.state == SourceState::Ready)
+                .filter(|x| x.kind == SourceKind::TestPattern && x.state == SourceState::Ready)
+                .count()
+                == 4
+                && s.sources
+                    .iter()
+                    .any(|x| x.id == SourceId(NATIVE_ID) && x.frame_rate == FrameRateMode::Native)
                 && s.selected_camera == camera
                 && s.selected_microphone == mic
                 && s.can_record
         })
-        .ok_or("test source never became Ready / can_record")?;
+        .ok_or("test sources never became Ready / can_record")?;
     let test_id = snap
         .sources
         .iter()
@@ -352,9 +535,37 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         .map(|x| x.id)
         .ok_or("no test source")?;
     let test_key = InputKey::Source(test_id);
-
-    // 3. Record.
+    let (native_key, late_key, silent_key) = (
+        InputKey::Source(SourceId(NATIVE_ID)),
+        InputKey::Source(SourceId(LATE_ID)),
+        InputKey::Source(SourceId(SILENT_ID)),
+    );
+    eprintln!("selftest: capacity plan: {:?}", snap.capacity);
+    let plan_json = serde_json::json!({
+        "gpu_load_pct": snap.capacity.gpu_load_pct, "over": snap.capacity.over,
+        "inputs": snap.capacity.inputs.iter().map(|p| serde_json::json!({
+            "input": format!("{:?}", p.input), "encoder": p.encoder.element_name(),
+            "fps": p.fps, "native": p.native})).collect::<Vec<_>>(),
+        "notes": snap.capacity.notes,
+    });
+    // P1-6: a recording window with no frame yet says so.
     engine.send(EngineCommand::Record);
+    let waiting = h.wait_for(Duration::from_secs(15), |s| {
+        s.session.as_ref().is_some_and(|x| {
+            x.segments.iter().any(|g| {
+                g.status == SegmentStatus::Recording
+                    && g.files
+                        .iter()
+                        .any(|f| f.input == silent_key && f.waiting_for_frame)
+                    && matches!(s.phase, Phase::Recording { segment: 1, .. })
+            })
+        })
+    });
+    if waiting.is_none() {
+        h.fail("the silent source never showed waiting_for_frame while recording");
+    }
+
+    // 3. Record (sent above).
     h.wait_for(Duration::from_secs(15), |s| {
         matches!(s.phase, Phase::Recording { segment: 1, .. })
     })
@@ -392,9 +603,29 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         if seg.status != SegmentStatus::Complete {
             h.fail(format!("segment {} status {:?}", seg.index, seg.status));
         }
+        if seg.index == 2 && seg.files.iter().any(|f| f.input == silent_key) {
+            h.fail("segment 2 recorded the silent source again after it failed");
+        }
         for f in &seg.files {
-            let critical = f.input == test_key || (camera_critical && f.input == InputKey::Camera);
+            let critical = f.input == test_key
+                || f.input == native_key
+                || f.input == late_key
+                || (camera_critical && f.input == InputKey::Camera);
             let mut problem: Option<String> = None;
+            if f.input == silent_key {
+                // P1-6: zero frames is a failure, never a complete (empty) file.
+                match &f.status {
+                    InputStatus::Failed { reason } if reason.contains("no frames received") => {}
+                    s => h.fail(format!(
+                        "segment {} silent source: {s:?}, expected Failed \"no frames received\"",
+                        seg.index
+                    )),
+                }
+                if f.path.exists() {
+                    h.fail("the silent source left a file behind");
+                }
+                continue;
+            }
             if f.status != InputStatus::Complete {
                 problem = Some(format!("status {:?}", f.status));
             } else {
@@ -446,12 +677,44 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
                                     ));
                                 }
                             }
+                            // P1-7: every video file starts at segment time zero.
+                            let mut frames_json = serde_json::Value::Null;
+                            if f.input != InputKey::Microphone {
+                                match frame_times(&f.path) {
+                                    Ok(frames) => {
+                                        let first = frames.first().map_or(u64::MAX, |x| x.0);
+                                        if first > START_SLACK_NS {
+                                            problem = Some(format!(
+                                                "first frame at {:.3}s, not at zero",
+                                                first as f64 / 1e9
+                                            ));
+                                        }
+                                        if f.input == native_key {
+                                            let end = seg_dur.map_or(0, |d| d.as_nanos() as u64);
+                                            match check_vfr(&frames, end) {
+                                                Ok(j) => frames_json = j,
+                                                Err(e) => problem = Some(format!("native: {e}")),
+                                            }
+                                        }
+                                    }
+                                    Err(e) => problem = Some(format!("cannot read frames: {e}")),
+                                }
+                            }
                             files_json.push(serde_json::json!({
                                 "file": f.path.file_name().map(|n| n.to_string_lossy().to_string()),
                                 "width": fc.width, "height": fc.height,
                                 "framerate": fc.fps.map(|(n, d)| format!("{n}/{d}")),
                                 "profile": fc.profile, "level": fc.level,
                                 "duration_s": fc.duration.map(|d| d.as_secs_f64()),
+                                "quality": f.quality.as_ref().map(|q| serde_json::json!({
+                                    "encoder": q.encoder.map(|e| e.element_name()),
+                                    "frames_in": q.frames_in, "encoded": q.encoded,
+                                    "duplicated": q.duplicated, "padded": q.padded,
+                                    "dropped_queue": q.dropped_queue, "dropped_corrupt": q.dropped_corrupt,
+                                    "effective_fps": q.effective_fps, "repeat_pct": q.repeat_pct,
+                                    "start_offset_s": q.start_offset.map(|d| d.as_secs_f64()),
+                                })),
+                                "vfr": frames_json,
                             }));
                         }
                     }
@@ -492,6 +755,7 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         camera.is_some(),
     );
     let _ = manifest_ok;
+    check_manifest_extras(&mut h, &session.manifest);
 
     // 7b. Transcription (§12.12), through the worker child like the app.
     let transcription_json = check_transcription(&mut h, &mut warnings, &engine, &session.manifest);
@@ -545,6 +809,13 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     if mic.is_some() && h.levels == 0 {
         warnings.push("no Level events while recording".into());
     }
+    // 9. Concurrent load (camera + two 4K sources), only with a named camera.
+    let load_json = match &want_camera {
+        Some(want) => check_load(&mut h, load_config, &dir, want),
+        None => serde_json::json!("skipped: CHINSTRAP_SELFTEST_CAMERA not set"),
+    };
+    let mut seg_json = seg_json;
+    seg_json.push(serde_json::json!({"plan": plan_json, "load": load_json}));
     Ok(summary(
         &h,
         &caps,
@@ -680,13 +951,17 @@ fn check_transcription(
                     .unwrap_or_default();
                 let (e, n) = wer::wer(&reference_text, &text);
                 let rate = wer::wer_rate(&reference_text, &text);
-                eprintln!("selftest: speech WER {e}/{n} = {rate:.3} ({})", r.backend);
+                eprintln!(
+                    "selftest: speech WER {e}/{n} = {rate:.3} ({}): {text:?}",
+                    r.backend
+                );
                 if rate > 0.10 {
                     h.fail(format!("speech WER {rate:.3} > 0.10: {text:?}"));
                 }
+                let style = check_transcript_style(h, &r.json, &text);
                 out.insert(
                     "speech".into(),
-                    serde_json::json!({"wer": rate, "errors": e, "words": n, "backend": r.backend, "rtf": r.rtf}),
+                    serde_json::json!({"wer": rate, "errors": e, "words": n, "backend": r.backend, "rtf": r.rtf, "text": text, "style": style}),
                 );
             }
             Err((_, msg)) => {
@@ -699,6 +974,72 @@ fn check_transcription(
         }
     }
     out.into()
+}
+
+/// P0-2/P0-3/P0-4 on a transcript: cased and punctuated text, no word starting in silence,
+/// no text left that a replacement rule should have changed, and the words of
+/// `CHINSTRAP_SELFTEST_SPEECH_EXPECT` (comma-separated) present.
+fn check_transcript_style(h: &mut Harness, json: &Path, text: &str) -> serde_json::Value {
+    use studio::transcribe::vocab;
+    let t: serde_json::Value = std::fs::read(json)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let cased = text.chars().any(char::is_uppercase);
+    let punctuated = text.chars().any(|c| matches!(c, '.' | ',' | '?' | '!'));
+    if !cased || !punctuated {
+        h.fail(format!("transcript is not cased and punctuated: {text:?}"));
+    }
+    let spans: Vec<(f64, f64)> = t["speech"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| Some((s["start"].as_f64()?, s["end"].as_f64()?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut in_silence = Vec::new();
+    for seg in t["segments"].as_array().cloned().unwrap_or_default() {
+        for w in seg["words"].as_array().cloned().unwrap_or_default() {
+            let start = w["start"].as_f64().unwrap_or(0.0);
+            if !spans.is_empty() && !spans.iter().any(|(a, b)| *a - 0.05 <= start && start < *b) {
+                in_silence.push(format!("{}@{start}", w["word"]));
+            }
+        }
+    }
+    if !in_silence.is_empty() {
+        h.fail(format!("words start in silence: {in_silence:?}"));
+    }
+    let (rules, _) = vocab::load_replacements(&vocab::replacements_path());
+    let mut leftover = Vec::new();
+    for r in &rules {
+        let to_has_from = vocab::replace_text(&r.to, r).1 > 0;
+        if !to_has_from && vocab::replace_text(text, r).1 > 0 {
+            leftover.push(r.from.clone());
+        }
+    }
+    if !leftover.is_empty() {
+        h.fail(format!(
+            "replacement rules not applied: {leftover:?} in {text:?}"
+        ));
+    }
+    let expect: Vec<String> = std::env::var("CHINSTRAP_SELFTEST_SPEECH_EXPECT")
+        .unwrap_or_default()
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect();
+    for w in &expect {
+        if !text.contains(w.as_str()) {
+            h.fail(format!("transcript lacks {w:?}: {text:?}"));
+        }
+    }
+    serde_json::json!({
+        "cased": cased, "punctuated": punctuated,
+        "first_word_s": t["segments"][0]["words"][0]["start"],
+        "speech": spans.len(), "rules": rules.len(), "expect": expect,
+        "replacements": t["replacements"], "prompt": t["prompt"]["text"],
+    })
 }
 
 /// PipeWire targeting regression (portal `target-object` bug):
@@ -806,6 +1147,197 @@ fn linked_check(
             serde_json::json!({ "object_id": id, "result": format!("failed: {e}") })
         }
     }
+}
+
+/// P1-6/P1-7 manifest facts: the late source's first_pts is its real start and its file was
+/// padded; the native source is recorded as variable rate; every video input has quality.
+fn check_manifest_extras(h: &mut Harness, path: &Path) {
+    let Ok(m) = studio_manifest(path) else {
+        return;
+    };
+    let seg1 = &m["segments"][0]["inputs"];
+    let find = |key: &str| {
+        seg1.as_array()
+            .and_then(|a| a.iter().find(|i| i["key"] == key).cloned())
+            .unwrap_or_default()
+    };
+    let late = find(&format!("source:{LATE_ID}"));
+    let first = late["first_pts_ns"].as_u64().unwrap_or(0);
+    if first < LATE.as_nanos() as u64 - 200_000_000 {
+        h.fail(format!(
+            "late source first_pts_ns {first} is not its real (late) start"
+        ));
+    }
+    if late["quality"]["padded"].as_u64().unwrap_or(0) == 0 {
+        h.fail(format!(
+            "late source was not padded to zero: {}",
+            late["quality"]
+        ));
+    }
+    let native = find(&format!("source:{NATIVE_ID}"));
+    if native["framerate"] != "variable" {
+        h.fail(format!(
+            "native source framerate is {}",
+            native["framerate"]
+        ));
+    }
+    for i in seg1.as_array().cloned().unwrap_or_default() {
+        if i["codec"] != "opus" && i["status"] == "complete" && i["quality"].is_null() {
+            h.fail(format!("{} has no quality in the manifest", i["key"]));
+        }
+    }
+    let silent = find(&format!("source:{SILENT_ID}"));
+    if silent["status"] != "failed" {
+        h.fail(format!(
+            "silent source manifest status {}",
+            silent["status"]
+        ));
+    }
+}
+
+/// P0-1 acceptance: the named camera plus two 4K test sources for 60 s, < 1% repeated camera
+/// frames by the counters and by consecutive-frame differences (after the first 5 s).
+fn check_load(
+    h: &mut Harness,
+    mut config: studio::EngineConfig,
+    dir: &Path,
+    want: &str,
+) -> serde_json::Value {
+    let secs: u64 = std::env::var("CHINSTRAP_SELFTEST_LOAD_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(60);
+    let uhd = TestBehaviour {
+        size: Some((3840, 2160)),
+        ..Default::default()
+    };
+    config.test_sources = vec![(1, uhd), (2, uhd)];
+    config.output_root = dir.join("load");
+    let (engine, rx) = match studio::start(config) {
+        Ok(x) => x,
+        Err(e) => {
+            h.fail(format!("load: engine: {e}"));
+            return serde_json::Value::Null;
+        }
+    };
+    let mut l = Harness {
+        rx,
+        snap: None,
+        levels: 0,
+        errors: Vec::new(),
+    };
+    let result = (|| -> Result<serde_json::Value, String> {
+        let first = l
+            .wait_for(Duration::from_secs(60), |_| true)
+            .ok_or("no first Snapshot")?;
+        let cam = first
+            .cameras
+            .iter()
+            .find(|c| c.name.to_lowercase().contains(&want.to_lowercase()))
+            .ok_or("camera gone")?
+            .id;
+        engine.send(EngineCommand::SelectCamera(Some(cam)));
+        engine.send(EngineCommand::SelectMicrophone(
+            first.microphones.first().map(|m| m.id),
+        ));
+        engine.send(EngineCommand::AddTestSource);
+        engine.send(EngineCommand::AddTestSource);
+        let ready = l
+            .wait_for(Duration::from_secs(10), |s| {
+                s.sources
+                    .iter()
+                    .filter(|x| x.state == SourceState::Ready)
+                    .count()
+                    == 2
+                    && s.selected_camera == Some(cam)
+                    && s.can_record
+            })
+            .ok_or("load sources never ready")?;
+        eprintln!("selftest: load plan: {:?}", ready.capacity);
+        engine.send(EngineCommand::Record);
+        l.wait_for(Duration::from_secs(20), |s| {
+            matches!(s.phase, Phase::Recording { .. })
+        })
+        .ok_or("load never reached Recording")?;
+        l.sleep(Duration::from_secs(secs));
+        engine.send(EngineCommand::Stop);
+        let done = l
+            .wait_for(Duration::from_secs(30), |s| s.phase == Phase::Idle)
+            .ok_or("load Stop never reached Idle")?;
+        let seg = done
+            .session
+            .as_ref()
+            .and_then(|s| s.segments.first().cloned())
+            .ok_or("no load segment")?;
+        let mut files = Vec::new();
+        let mut camera_counter_pct = None;
+        let mut camera_path = None;
+        for f in &seg.files {
+            if let Some(q) = &f.quality {
+                files.push(serde_json::json!({
+                    "input": format!("{:?}", f.input), "status": format!("{:?}", f.status),
+                    "encoder": q.encoder.map(|e| e.element_name()),
+                    "frames_in": q.frames_in, "encoded": q.encoded, "duplicated": q.duplicated,
+                    "padded": q.padded, "dropped_queue": q.dropped_queue,
+                    "dropped_corrupt": q.dropped_corrupt, "effective_fps": q.effective_fps,
+                    "repeat_pct": q.repeat_pct, "bitrate_kbps": q.bitrate_kbps,
+                }));
+                if f.input == InputKey::Camera {
+                    camera_counter_pct = Some(q.repeat_pct);
+                    camera_path = Some(f.path.clone());
+                    if f.status != InputStatus::Complete {
+                        l.fail(format!("load camera status {:?}", f.status));
+                    }
+                }
+            }
+        }
+        let counter_pct = camera_counter_pct.ok_or("no camera quality")?;
+        if counter_pct >= MAX_REPEAT_PCT {
+            l.fail(format!(
+                "camera repeated {counter_pct:.2}% of frames (counters)"
+            ));
+        }
+        let diffs = frame_diffs(&camera_path.ok_or("no camera file")?)?;
+        let late: Vec<f64> = diffs
+            .iter()
+            .filter(|(pts, _)| *pts >= 5_000_000_000)
+            .map(|x| x.1)
+            .collect();
+        let repeats = late.iter().filter(|d| **d < REPEAT_DIFF).count();
+        let pct = repeats as f64 * 100.0 / late.len().max(1) as f64;
+        let mut sorted = late.clone();
+        sorted.sort_by(f64::total_cmp);
+        let median = sorted.get(sorted.len() / 2).copied().unwrap_or(0.0);
+        eprintln!(
+            "selftest: load: camera repeats {repeats}/{} pairs after 5 s ({pct:.2}%), median diff {median:.3}; counters {counter_pct:.2}%",
+            late.len()
+        );
+        if pct >= MAX_REPEAT_PCT {
+            l.fail(format!(
+                "camera: {repeats} of {} frame pairs after 5 s are repeats ({pct:.2}%)",
+                late.len()
+            ));
+        }
+        Ok(serde_json::json!({
+            "seconds": secs, "files": files,
+            "camera_repeat_pct_counters": counter_pct,
+            "camera_repeat_pct_diff": pct, "camera_pairs": late.len(),
+            "camera_median_diff": median,
+        }))
+    })();
+    engine.shutdown_blocking(Duration::from_secs(10));
+    l.drain();
+    let out = match result {
+        Ok(j) => j,
+        Err(e) => {
+            l.fail(format!("load: {e}"));
+            serde_json::Value::Null
+        }
+    };
+    for e in l.errors {
+        h.fail(e);
+    }
+    out
 }
 
 fn studio_manifest(path: &Path) -> Result<serde_json::Value, String> {
@@ -919,7 +1451,7 @@ fn check_manifest(
             }
         }
         for i in &inputs {
-            if i["codec"] == "h264" {
+            if i["codec"] == "h264" || i["codec"] == "hevc" {
                 eprintln!(
                     "selftest: segment {idx} {}: {}×{} @{} via {}",
                     i["key"].as_str().unwrap_or("?"),

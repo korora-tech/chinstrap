@@ -5,6 +5,11 @@
 //!
 //! Transcription is simulated too (§12): the model starts Missing, `DownloadModel` "downloads"
 //! it in about 4 s, and each finished segment is "transcribed" in about 2 s.
+//!
+//! Frame rates, the capacity plan, camera modes, quality counters and the vocabulary follow the
+//! real contract: the plan is the real planner over a fake encoder table (this host's measured
+//! rates), windows wait ~2 s for their first frame, quality numbers tick while recording, and
+//! the vocabulary is kept in memory (no files are written).
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -13,7 +18,10 @@ use std::time::{Duration, Instant};
 
 use gstreamer as gst;
 
+use super::encoders::EncoderCap;
 use super::engine::{EngineConfig, Msg};
+use super::plan::{self, Demand};
+use super::transcribe::vocab;
 use super::types::*;
 
 const TICK: Duration = Duration::from_millis(50);
@@ -26,6 +34,14 @@ const BYTES_EVERY: Duration = Duration::from_secs(1);
 const FAKE_MODEL_BYTES: u64 = 874_188_075;
 const FAKE_VAD_BYTES: u64 = 885_098;
 const TX_STEP: Duration = Duration::from_millis(200);
+/// Windows deliver their first frame this long after recording starts.
+const FIRST_FRAME_AFTER: Duration = Duration::from_secs(2);
+/// The fake encoder table: this host's measured 4K throughput.
+const FAKE_ENCODERS: [(VideoEncoder, f64); 3] = [
+    (VideoEncoder::Va, 98.0),
+    (VideoEncoder::VaHevc, 136.0),
+    (VideoEncoder::X264, 118.0),
+];
 
 pub(super) fn spawn(
     config: EngineConfig,
@@ -76,6 +92,21 @@ struct FakeEngine {
     auto: bool,
     cancel_at: Option<Instant>,
     last_tx_step: Instant,
+    frame_rate_default: FrameRateMode,
+    camera_mode: Option<String>,
+    vocabulary: VocabularyInfo,
+}
+
+fn fake_mode(w: i32, h: i32, fps: i32, format: &str, auto: bool) -> CameraModeInfo {
+    CameraModeInfo {
+        label: format!("{w}×{h} @{fps} · {format}"),
+        width: w,
+        height: h,
+        fps_n: fps,
+        fps_d: 1,
+        format: format.into(),
+        auto,
+    }
 }
 
 impl FakeEngine {
@@ -88,7 +119,8 @@ impl FakeEngine {
             }
         };
         let caps = Capabilities {
-            h264_encoder: Some(config.preferred_encoder.unwrap_or(H264Encoder::X264)),
+            h264_encoder: Some(config.preferred_encoder.unwrap_or(VideoEncoder::Va)),
+            encoders: FAKE_ENCODERS.to_vec(),
             gpu_convert: Some(config.preferred_convert.unwrap_or(GpuConvert::Va)),
             missing_elements: Vec::new(),
             portal,
@@ -100,6 +132,12 @@ impl FakeEngine {
                 name: "Fake HD Webcam".into(),
                 detail: "fake #80 · 1920×1080 @30 · MJPEG".into(),
                 unsupported: None,
+                modes: vec![
+                    fake_mode(1920, 1080, 30, "MJPEG", true),
+                    fake_mode(3840, 2160, 25, "NV12", false),
+                    fake_mode(1280, 720, 60, "MJPEG", false),
+                    fake_mode(1920, 1080, 5, "YUY2", false),
+                ],
             },
             DeviceInfo {
                 id: DeviceId(2),
@@ -107,6 +145,7 @@ impl FakeEngine {
                 name: "Fake Loopback Dummy".into(),
                 detail: "fake #81 · 3840×2160 @25 · DMA-BUF NV12".into(),
                 unsupported: Some("no usable format: video/x-raw(memory:DMABuf)".into()),
+                modes: Vec::new(),
             },
         ];
         let microphones = vec![
@@ -116,6 +155,7 @@ impl FakeEngine {
                 name: "Fake USB Microphone".into(),
                 detail: "fake #61 · 48 kHz · 2 ch".into(),
                 unsupported: None,
+                modes: Vec::new(),
             },
             DeviceInfo {
                 id: DeviceId(4),
@@ -123,6 +163,7 @@ impl FakeEngine {
                 name: "Fake Built-in Audio".into(),
                 detail: "fake #62 · 44.1 kHz · 1 ch".into(),
                 unsupported: None,
+                modes: Vec::new(),
             },
         ];
         let now = Instant::now();
@@ -154,6 +195,105 @@ impl FakeEngine {
             auto: true,
             cancel_at: None,
             last_tx_step: now,
+            frame_rate_default: config.frame_rate,
+            camera_mode: None,
+            vocabulary: VocabularyInfo {
+                terms: vec!["Rawkode".into(), "Kubernetes".into()],
+                replacements: vec![ReplacementRule {
+                    from: "raw code".into(),
+                    to: "Rawkode".into(),
+                }],
+                glossary_path: PathBuf::from("/fake/chinstrap/glossary.txt"),
+                replacements_path: PathBuf::from("/fake/chinstrap/replacements.txt"),
+                warnings: Vec::new(),
+            },
+        }
+    }
+
+    /// The selected camera's mode (override or automatic).
+    fn camera_mode_info(&self) -> Option<&CameraModeInfo> {
+        let cam = self
+            .selected_camera
+            .and_then(|id| self.cameras.iter().find(|c| c.id == id))?;
+        match &self.camera_mode {
+            Some(l) => cam.modes.iter().find(|m| &m.label == l),
+            None => cam.modes.iter().find(|m| m.auto),
+        }
+    }
+
+    /// The real planner over the fake encoder table.
+    fn capacity(&self) -> CapacityPlan {
+        let table: Vec<EncoderCap> = FAKE_ENCODERS
+            .iter()
+            .map(|&(enc, fps)| EncoderCap {
+                enc,
+                max: (4096, 2160),
+                fps_at_max: fps,
+            })
+            .collect();
+        let mut demands = Vec::new();
+        for key in self.frozen_inputs() {
+            match key {
+                InputKey::Microphone => {}
+                InputKey::Camera => {
+                    if let Some(m) = self.camera_mode_info() {
+                        demands.push(Demand {
+                            key,
+                            label: "Camera".into(),
+                            size: (m.width, m.height),
+                            fps: m.fps_n as f64 / m.fps_d.max(1) as f64,
+                            native: false,
+                            gpu_path: false,
+                            camera: true,
+                        });
+                    }
+                }
+                InputKey::Source(id) => {
+                    if let Some(s) = self.sources.iter().find(|s| s.id == id) {
+                        let (fps, native) = match s.frame_rate.cfr_fps() {
+                            Some(f) => (f as f64, false),
+                            None => (s.refresh.map_or(60.0, |(n, d)| n as f64 / d as f64), true),
+                        };
+                        demands.push(Demand {
+                            key,
+                            label: s.label.clone(),
+                            size: s.size.unwrap_or((3840, 2160)),
+                            fps,
+                            native,
+                            gpu_path: true,
+                            camera: false,
+                        });
+                    }
+                }
+            }
+        }
+        let gpu_ok: Vec<VideoEncoder> = FAKE_ENCODERS.iter().map(|e| e.0).collect();
+        let p = plan::plan(&demands, &table, &gpu_ok);
+        CapacityPlan {
+            inputs: p
+                .inputs
+                .iter()
+                .map(|a| {
+                    let size = demands
+                        .iter()
+                        .find(|d| d.key == a.key)
+                        .map_or((3840, 2160), |d| d.size);
+                    PlannedInput {
+                        input: a.key,
+                        encoder: a.enc,
+                        width: size.0,
+                        height: size.1,
+                        fps: a.fps,
+                        native: a.native,
+                        load_pct: (a.load * 100.0).round() as u32,
+                    }
+                })
+                .collect(),
+            gpu_load_pct: (p.gpu_load / plan::GPU_BUDGET * 100.0).round() as u32,
+            cpu_load_pct: (p.cpu_load / plan::CPU_BUDGET * 100.0).round() as u32,
+            over: p.over,
+            warning: p.warning(),
+            notes: p.notes,
         }
     }
 
@@ -212,6 +352,10 @@ impl FakeEngine {
                 }),
                 other_sessions: None,
             },
+            frame_rate_default: self.frame_rate_default,
+            selected_camera_mode: self.camera_mode.clone(),
+            capacity: self.capacity(),
+            vocabulary: self.vocabulary.clone(),
         };
         let _ = self
             .events
@@ -286,17 +430,107 @@ impl FakeEngine {
             | EngineCommand::RemoveSource(_)
             | EngineCommand::SetOutputRoot(_)
             | EngineCommand::EndSession
+            | EngineCommand::SetFrameRateMode { .. }
+            | EngineCommand::SelectCameraMode(_)
                 if busy =>
             {
                 self.reject(&cmd, "not allowed while recording");
             }
+            EngineCommand::SetFrameRateMode { source, mode } => match source {
+                None => {
+                    self.frame_rate_default = *mode;
+                    for s in &mut self.sources {
+                        if s.kind != SourceKind::TestPattern {
+                            s.frame_rate = *mode;
+                        }
+                    }
+                    self.snapshot();
+                }
+                Some(id) => match self.sources.iter_mut().find(|s| s.id == *id) {
+                    Some(s) => {
+                        s.frame_rate = *mode;
+                        self.snapshot();
+                    }
+                    None => self.reject(&cmd, "unknown source"),
+                },
+            },
+            EngineCommand::SelectCameraMode(label) => {
+                let known = match label {
+                    None => true,
+                    Some(l) => self
+                        .selected_camera
+                        .and_then(|id| self.cameras.iter().find(|c| c.id == id))
+                        .is_some_and(|c| c.modes.iter().any(|m| &m.label == l)),
+                };
+                if known {
+                    self.camera_mode = label.clone();
+                    self.snapshot();
+                } else {
+                    self.reject(&cmd, "the selected camera has no such mode");
+                }
+            }
+            EngineCommand::AddVocabularyTerm(t) => match vocab::term(t) {
+                Ok(t)
+                    if self
+                        .vocabulary
+                        .terms
+                        .iter()
+                        .any(|x| x.eq_ignore_ascii_case(&t)) =>
+                {
+                    self.reject(&cmd, &format!("{t:?} is already in the glossary"))
+                }
+                Ok(t) => {
+                    self.vocabulary.terms.push(t);
+                    self.snapshot();
+                }
+                Err(e) => self.reject(&cmd, &e),
+            },
+            EngineCommand::RemoveVocabularyTerm(t) => {
+                let before = self.vocabulary.terms.len();
+                self.vocabulary
+                    .terms
+                    .retain(|x| !x.eq_ignore_ascii_case(t.trim()));
+                if self.vocabulary.terms.len() == before {
+                    self.reject(&cmd, "not in the glossary");
+                } else {
+                    self.snapshot();
+                }
+            }
+            EngineCommand::AddReplacement { from, to } => match vocab::rule(from, to) {
+                Ok(r) => {
+                    self.vocabulary
+                        .replacements
+                        .retain(|x| !x.from.eq_ignore_ascii_case(&r.from));
+                    self.vocabulary.replacements.push(ReplacementRule {
+                        from: r.from,
+                        to: r.to,
+                    });
+                    self.snapshot();
+                }
+                Err(e) => self.reject(&cmd, &e),
+            },
+            EngineCommand::RemoveReplacement { from } => {
+                let before = self.vocabulary.replacements.len();
+                self.vocabulary
+                    .replacements
+                    .retain(|x| !x.from.eq_ignore_ascii_case(from.trim()));
+                if self.vocabulary.replacements.len() == before {
+                    self.reject(&cmd, "no such replacement");
+                } else {
+                    self.snapshot();
+                }
+            }
             EngineCommand::SelectCamera(id) => match id {
                 None => {
                     self.selected_camera = None;
+                    self.camera_mode = None;
                     self.snapshot();
                 }
                 Some(id) => match self.cameras.iter().find(|c| c.id == *id) {
                     Some(c) if c.unsupported.is_none() => {
+                        if self.selected_camera != Some(*id) {
+                            self.camera_mode = None;
+                        }
                         self.selected_camera = Some(*id);
                         self.snapshot();
                     }
@@ -335,6 +569,9 @@ impl FakeEngine {
                     label: format!("Test pattern {}", id.0),
                     logical_size: Some((1280, 720)),
                     state: SourceState::Checking,
+                    frame_rate: FrameRateMode::Cfr30,
+                    refresh: Some((60, 1)),
+                    size: Some((1280, 720)),
                 });
                 self.after(CHECK_DELAY, Timer::SourceReady(id));
                 self.snapshot();
@@ -632,10 +869,13 @@ impl FakeEngine {
             path: dir.join(file),
             status: InputStatus::Starting,
             bytes: 0,
+            waiting_for_frame: false,
+            quality: None,
         }
     }
 
     /// Appends a new segment row for the frozen input set and returns its index.
+    // (Quality numbers are filled in by `poll` while recording.)
     fn begin_segment(&mut self, gap_before: Option<Duration>) -> u32 {
         let session = self
             .session
@@ -751,6 +991,10 @@ impl FakeEngine {
             }
             if now.duration_since(self.last_bytes) >= BYTES_EVERY {
                 self.last_bytes = now;
+                let since = self
+                    .segment_started
+                    .map_or(Duration::ZERO, |(_, t)| t.elapsed());
+                let plan = self.capacity();
                 if let Some(seg) = self.segment_mut(segment) {
                     for file in &mut seg.files {
                         if file.status == InputStatus::Recording {
@@ -758,6 +1002,7 @@ impl FakeEngine {
                                 InputKey::Microphone => 24_000,
                                 _ => 1_500_000,
                             };
+                            fake_quality(file, since, &plan);
                         }
                     }
                 }
@@ -789,6 +1034,9 @@ impl FakeEngine {
                         label: format!("Window {}", id.0),
                         logical_size: Some((1600, 1000)),
                         state: SourceState::Checking,
+                        frame_rate: self.frame_rate_default,
+                        refresh: Some((143_999, 1000)),
+                        size: Some((3840, 2082)),
                     });
                     self.after(CHECK_DELAY, Timer::SourceReady(id));
                 }
@@ -934,6 +1182,62 @@ impl FakeEngine {
     }
 }
 
+/// Plausible live counters: windows wait for their first frame, then run near their planned
+/// rate; the camera repeats a few frames; quality is a pure function of elapsed time.
+fn fake_quality(file: &mut InputFile, since: Duration, plan: &CapacityPlan) {
+    if file.input == InputKey::Microphone {
+        return;
+    }
+    let window = matches!(file.input, InputKey::Source(_));
+    let p = plan.inputs.iter().find(|p| p.input == file.input);
+    let fps = p.map_or(30.0, |p| p.fps);
+    let wait = if window {
+        FIRST_FRAME_AFTER
+    } else {
+        Duration::ZERO
+    };
+    file.waiting_for_frame = since < wait;
+    let live = since.saturating_sub(wait).as_secs_f64();
+    let secs = since.as_secs_f64().max(0.001);
+    // Native windows send frames on damage: about a third of the cap.
+    let rate = if p.is_some_and(|p| p.native) {
+        fps / 3.0
+    } else {
+        fps
+    };
+    let fresh = (live * rate) as u64;
+    let padded = if window {
+        (wait.as_secs_f64() * fps.min(30.0)) as u64
+    } else {
+        0
+    };
+    let duplicated = if window { 0 } else { fresh / 400 };
+    let encoded = fresh + padded + duplicated;
+    file.quality = Some(InputQuality {
+        encoder: p.map(|p| p.encoder),
+        nominal_fps: p.filter(|p| !p.native).map(|p| p.fps),
+        max_fps: p.filter(|p| p.native).map(|p| p.fps),
+        frames_in: fresh,
+        dropped_corrupt: u64::from(!window) * 3,
+        dropped_queue: 0,
+        duplicated,
+        padded,
+        encoded,
+        effective_fps: fresh as f64 / secs,
+        repeat_pct: if encoded > 0 {
+            duplicated as f64 * 100.0 / encoded as f64
+        } else {
+            0.0
+        },
+        bitrate_kbps: (file.bytes as f64 * 8.0 / secs / 1000.0) as u32,
+        start_offset: Some(if window {
+            wait
+        } else {
+            Duration::from_millis(280)
+        }),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::engine::{EngineConfig, start};
@@ -946,6 +1250,8 @@ mod tests {
             preferred_convert: None,
             enable_portal: true,
             fake: true,
+            frame_rate: FrameRateMode::Native,
+            test_sources: Vec::new(),
         }
     }
 
@@ -1024,6 +1330,71 @@ mod tests {
             last.session.unwrap().segments[2].status,
             SegmentStatus::Complete
         );
+    }
+
+    #[test]
+    fn new_contract_commands() {
+        let (engine, rx) = start(config()).expect("start fake engine");
+        let first = wait_for(&rx, Duration::from_secs(1), |_| true);
+        assert_eq!(first.frame_rate_default, FrameRateMode::Native);
+        assert!(first.cameras[0].modes.iter().filter(|m| m.auto).count() == 1);
+        assert_eq!(first.vocabulary.terms, vec!["Rawkode", "Kubernetes"]);
+        engine.send(EngineCommand::SelectCamera(Some(DeviceId(1))));
+        engine.send(EngineCommand::SelectCameraMode(Some(
+            "3840×2160 @25 · NV12".into(),
+        )));
+        let s = wait_for(&rx, Duration::from_secs(1), |s| {
+            s.selected_camera_mode.is_some()
+        });
+        assert_eq!(s.capacity.inputs.len(), 1);
+        assert_eq!(s.capacity.inputs[0].width, 3840);
+        engine.send(EngineCommand::AddPortalSources);
+        let s = wait_for(&rx, Duration::from_secs(5), |s| {
+            s.sources.len() == 2 && s.sources.iter().all(|x| x.state == SourceState::Ready)
+        });
+        // Two native 144 Hz windows plus a 4K camera: the plan fits by moving load around.
+        assert_eq!(s.capacity.inputs.len(), 3);
+        assert!(!s.capacity.over, "{:?}", s.capacity);
+        engine.send(EngineCommand::SetFrameRateMode {
+            source: None,
+            mode: FrameRateMode::Cfr60,
+        });
+        let s = wait_for(&rx, Duration::from_secs(1), |s| {
+            s.sources
+                .iter()
+                .all(|x| x.frame_rate == FrameRateMode::Cfr60)
+        });
+        assert_eq!(s.frame_rate_default, FrameRateMode::Cfr60);
+        engine.send(EngineCommand::AddVocabularyTerm("Talos".into()));
+        engine.send(EngineCommand::AddReplacement {
+            from: "rock wood".into(),
+            to: "Rawkode".into(),
+        });
+        engine.send(EngineCommand::RemoveVocabularyTerm("kubernetes".into()));
+        let s = wait_for(&rx, Duration::from_secs(1), |s| {
+            s.vocabulary.terms == vec!["Rawkode", "Talos"] && s.vocabulary.replacements.len() == 2
+        });
+        assert_eq!(s.vocabulary.replacements[1].to, "Rawkode");
+        engine.send(EngineCommand::Record);
+        let s = wait_for(&rx, Duration::from_secs(4), |s| {
+            s.session
+                .as_ref()
+                .is_some_and(|x| x.segments[0].files.iter().any(|f| f.waiting_for_frame))
+        });
+        assert!(matches!(s.phase, Phase::Recording { .. }));
+        let s = wait_for(&rx, Duration::from_secs(5), |s| {
+            s.session.as_ref().is_some_and(|x| {
+                x.segments[0]
+                    .files
+                    .iter()
+                    .filter(|f| f.input != InputKey::Microphone)
+                    .all(|f| {
+                        f.quality.as_ref().is_some_and(|q| q.encoded > 0) && !f.waiting_for_frame
+                    })
+            })
+        });
+        assert!(s.session.is_some());
+        assert!(engine.shutdown_blocking(Duration::from_secs(2)));
     }
 
     #[test]
