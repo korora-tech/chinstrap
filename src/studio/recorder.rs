@@ -144,6 +144,17 @@ pub struct TestBehaviour {
     pub late: Option<Duration>,
     /// No frame at all (a window that is never redrawn).
     pub silent: bool,
+    /// Native mode: the source's refresh (its maximum rate) instead of [`TEST_NATIVE_FPS`].
+    pub refresh: Option<i32>,
+    /// Never renegotiated by the selftest resize (the load test keeps its 4K frames and rate).
+    pub keep_size: bool,
+}
+
+impl TestBehaviour {
+    /// The refresh a Native test pattern reports (and renders at, unless capped).
+    pub fn refresh_fps(&self) -> i32 {
+        self.refresh.filter(|r| *r > 0).unwrap_or(TEST_NATIVE_FPS)
+    }
 }
 
 /// Where a video input's frames come from.
@@ -448,6 +459,33 @@ fn mux_probe(
     Ok((first, last))
 }
 
+/// Rewrites the framerate of every caps event leaving `pad` to `fps`.
+fn rewrite_framerate(pad: &gst::Pad, fps: (i32, i32)) {
+    pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        let Some(gst::PadProbeData::Event(ev)) = info.data.as_ref() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let gst::EventView::Caps(c) = ev.view() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        let mut caps = c.caps_owned();
+        let want = gst::Fraction::new(fps.0, fps.1);
+        if caps
+            .structure(0)
+            .and_then(|s| s.get::<gst::Fraction>("framerate").ok())
+            == Some(want)
+        {
+            return gst::PadProbeReturn::Ok;
+        }
+        if let Some(s) = caps.make_mut().structure_mut(0) {
+            s.set("framerate", want);
+        }
+        let new = gst::event::Caps::builder(&caps).seqnum(ev.seqnum()).build();
+        info.data = Some(gst::PadProbeData::Event(new));
+        gst::PadProbeReturn::Ok
+    });
+}
+
 /// Forces a keyframe at least every [`KEYFRAME_EVERY_NS`] of stream time on `pad` (upstream of
 /// the encoder): variable-rate input makes a frame-counted GOP arbitrary in time.
 fn install_timed_keyframes(pad: &gst::Pad) {
@@ -514,13 +552,19 @@ pub fn build_video(
             set_prop(&src, "horizontal-speed", "4");
             let rate = match target.rate {
                 Rate::Cfr(f) => f,
-                Rate::Native { .. } => (TEST_NATIVE_FPS, 1),
+                // Like a compositor: the refresh, or the requested maximum when lower.
+                Rate::Native { cap, .. } => (
+                    cap.map_or(behaviour.refresh_fps(), |c| c.min(behaviour.refresh_fps())),
+                    1,
+                ),
             };
             let caps = capsfilter(&test_caps_at(rate, behaviour.size))?;
             if behaviour.silent || behaviour.late.is_some() {
                 gate = Some(*behaviour);
             }
-            resize_filter = Some(caps.clone());
+            if !behaviour.keep_size {
+                resize_filter = Some(caps.clone());
+            }
             src_chain.push(src);
             src_chain.push(caps);
             bursty = native;
@@ -683,12 +727,20 @@ pub fn build_video(
     let mut tail = None;
     if let Some(q) = &leaky {
         stamp::count_buffers(&sink_pad(q)?, counters.clone(), |c| &c.queue_in);
-        stamp::count_buffers(&src_pad(q)?, counters.clone(), |c| &c.queue_out);
         if native {
             let last: Arc<Mutex<Option<gst::Buffer>>> = Arc::new(Mutex::new(None));
             let store = last.clone();
             src_pad(q)?.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
                 if let (Some(b), Ok(mut slot)) = (info.buffer(), store.lock()) {
+                    // The stop-time repeat (Tail::push_at) enters from another thread; a frame
+                    // stamped before it but still in the convert stage must not follow it with
+                    // an earlier PTS.
+                    let prev = slot.as_ref().and_then(|p| p.pts());
+                    if let (Some(prev), Some(pts)) = (prev, b.pts())
+                        && pts <= prev
+                    {
+                        return gst::PadProbeReturn::Drop;
+                    }
                     *slot = Some(b.clone());
                 }
                 gst::PadProbeReturn::Ok
@@ -699,6 +751,7 @@ pub fn build_video(
                 counters: counters.clone(),
             });
         }
+        stamp::count_buffers(&src_pad(q)?, counters.clone(), |c| &c.queue_out);
     }
     let rate_el = videorate.clone().or(repeater_el.clone());
     if let Some(r) = &rate_el {
@@ -713,8 +766,15 @@ pub fn build_video(
         stamp::count_buffers(&input, counters.clone(), |c| &c.rate_in);
         stamp::count_rate_out(&src_pad(r)?, counters.clone());
     }
-    if native {
+    if let Rate::Native { gop_fps, .. } = target.rate {
         install_timed_keyframes(&src_pad(&enc_queue)?);
+        // The encoder budgets each frame as bitrate / caps framerate. Tell it the planned rate
+        // (what the bitrate was computed for), not the source's maximum (e.g. 144/1, which left
+        // native inputs a quarter of their bitrate) nor 0/1 (a portal cast; the encoder then
+        // assumes its own default). It also picks the codec level from it.
+        rewrite_framerate(&src_pad(&enc_queue)?, (gop_fps.max(1), 1));
+        // The file is variable-rate: no Matroska DefaultDuration claiming the maximum rate.
+        rewrite_framerate(&src_pad(&coded)?, (0, 1));
     }
     let size = Arc::new(Mutex::new(None));
     let out_rate = target.rate.cfr();

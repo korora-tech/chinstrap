@@ -8,8 +8,10 @@
 //! keyframes, last frame held to the stop); 3 starts 1.5 s late (its file must still start at
 //! zero); 4 never sends a frame (it must end Failed "no frames received", never complete).
 //! With `CHINSTRAP_SELFTEST_CAMERA`, a second engine then records that camera with two 4K test
-//! sources for `CHINSTRAP_SELFTEST_LOAD_SECS` (default 60) and asserts < 1% repeated camera
-//! frames, by the counters and by consecutive-frame differences.
+//! windows (Native at 144 Hz by default, `CHINSTRAP_SELFTEST_LOAD_MODE=30|60` for CFR) for
+//! `CHINSTRAP_SELFTEST_LOAD_SECS` (default 60) and asserts < 1% repeated camera frames over the
+//! whole recording, by the counters and by consecutive-frame differences
+//! (`CHINSTRAP_SELFTEST_LOAD=standin` without a camera: a 4K30 test pattern in its place).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -811,9 +813,13 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         warnings.push("no Level events while recording".into());
     }
     // 9. Concurrent load (camera + two 4K sources), only with a named camera.
-    let load_json = match &want_camera {
-        Some(want) => check_load(&mut h, load_config, &dir, want),
-        None => serde_json::json!("skipped: CHINSTRAP_SELFTEST_CAMERA not set"),
+    let load_json = match (
+        &want_camera,
+        std::env::var("CHINSTRAP_SELFTEST_LOAD").as_deref(),
+    ) {
+        (Some(want), _) => check_load(&mut h, load_config, &dir, want),
+        (None, Ok("standin")) => check_load(&mut h, load_config, &dir, "standin"),
+        _ => serde_json::json!("skipped: CHINSTRAP_SELFTEST_CAMERA not set"),
     };
     let mut seg_json = seg_json;
     seg_json.push(serde_json::json!({"plan": plan_json, "load": load_json}));
@@ -1196,8 +1202,45 @@ fn check_manifest_extras(h: &mut Harness, path: &Path) {
     }
 }
 
-/// P0-1 acceptance: the named camera plus two 4K test sources for 60 s, < 1% repeated camera
-/// frames by the counters and by consecutive-frame differences (after the first 5 s).
+/// Load windows' frame-rate mode: `CHINSTRAP_SELFTEST_LOAD_MODE` = native (default, the app's
+/// default for windows: VFR up to a 144 Hz refresh), 30 or 60.
+fn load_mode() -> FrameRateMode {
+    match std::env::var("CHINSTRAP_SELFTEST_LOAD_MODE")
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("30") => FrameRateMode::Cfr30,
+        Ok("60") => FrameRateMode::Cfr60,
+        _ => FrameRateMode::Native,
+    }
+}
+
+/// Repeats among consecutive-frame differences after `from_ns` (the start padding before the
+/// first real frame is excluded): (repeats, pairs, percent, median diff).
+fn repeat_stats(diffs: &[(u64, f64)], from_ns: u64) -> (usize, usize, f64, f64) {
+    let kept: Vec<f64> = diffs
+        .iter()
+        .filter(|(pts, _)| *pts > from_ns)
+        .map(|x| x.1)
+        .collect();
+    let repeats = kept.iter().filter(|d| **d < REPEAT_DIFF).count();
+    let pct = repeats as f64 * 100.0 / kept.len().max(1) as f64;
+    let mut sorted = kept.clone();
+    sorted.sort_by(f64::total_cmp);
+    let median = sorted.get(sorted.len() / 2).copied().unwrap_or(0.0);
+    (repeats, kept.len(), pct, median)
+}
+
+/// P0-1 acceptance: the named camera plus two 4K test windows (Native at a 144 Hz refresh by
+/// default, like real niri windows on this host's monitors) for 60 s: < 1% repeated camera
+/// frames by the counters and by consecutive-frame differences over the whole recording (only
+/// the start padding before the camera's first real frame is left out). Logs the plan.
+///
+/// `CHINSTRAP_SELFTEST_LOAD=standin` (no camera named) records a third 4K test pattern at 30 fps
+/// CFR instead of a camera: it exercises the planner and encoders, not the camera's path.
+///
+/// Also checks the Native bitrate: bytes per frame of a Native window are within 2x of a CFR
+/// input's with the same content (the stand-in), and never below half of it.
 fn check_load(
     h: &mut Harness,
     mut config: studio::EngineConfig,
@@ -1208,11 +1251,20 @@ fn check_load(
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(60);
-    let uhd = TestBehaviour {
+    let standin = want.eq_ignore_ascii_case("standin");
+    let mode = load_mode();
+    let window = TestBehaviour {
         size: Some((3840, 2160)),
+        refresh: Some(144),
+        keep_size: true,
         ..Default::default()
     };
-    config.test_sources = vec![(1, uhd), (2, uhd)];
+    let uhd = TestBehaviour {
+        size: Some((3840, 2160)),
+        keep_size: true,
+        ..Default::default()
+    };
+    config.test_sources = vec![(1, window), (2, window), (3, uhd)];
     config.output_root = dir.join("load");
     let (engine, rx) = match studio::start(config) {
         Ok(x) => x,
@@ -1231,30 +1283,66 @@ fn check_load(
         let first = l
             .wait_for(Duration::from_secs(60), |_| true)
             .ok_or("no first Snapshot")?;
-        let cam = first
-            .cameras
-            .iter()
-            .find(|c| c.name.to_lowercase().contains(&want.to_lowercase()))
-            .ok_or("camera gone")?
-            .id;
-        engine.send(EngineCommand::SelectCamera(Some(cam)));
+        let cam = if standin {
+            None
+        } else {
+            Some(
+                first
+                    .cameras
+                    .iter()
+                    .find(|c| c.name.to_lowercase().contains(&want.to_lowercase()))
+                    .ok_or("camera gone")?
+                    .id,
+            )
+        };
+        engine.send(EngineCommand::SelectCamera(cam));
         engine.send(EngineCommand::SelectMicrophone(
             first.microphones.first().map(|m| m.id),
         ));
-        engine.send(EngineCommand::AddTestSource);
-        engine.send(EngineCommand::AddTestSource);
+        let n = if standin { 3 } else { 2 };
+        for _ in 0..n {
+            engine.send(EngineCommand::AddTestSource);
+        }
+        for id in [1, 2] {
+            engine.send(EngineCommand::SetFrameRateMode {
+                source: Some(SourceId(id)),
+                mode,
+            });
+        }
+        if standin {
+            engine.send(EngineCommand::SetFrameRateMode {
+                source: Some(SourceId(3)),
+                mode: FrameRateMode::Cfr30,
+            });
+        }
         let ready = l
             .wait_for(Duration::from_secs(10), |s| {
                 s.sources
                     .iter()
                     .filter(|x| x.state == SourceState::Ready)
                     .count()
-                    == 2
-                    && s.selected_camera == Some(cam)
+                    == n
+                    && s.sources
+                        .iter()
+                        .filter(|x| x.id.0 <= 2 && x.frame_rate == mode)
+                        .count()
+                        == 2
+                    && s.selected_camera == cam
                     && s.can_record
             })
             .ok_or("load sources never ready")?;
-        eprintln!("selftest: load plan: {:?}", ready.capacity);
+        eprintln!(
+            "selftest: load ({mode:?} windows): plan {:?}",
+            ready.capacity
+        );
+        let plan = serde_json::json!({
+            "gpu_load_pct": ready.capacity.gpu_load_pct,
+            "cpu_load_pct": ready.capacity.cpu_load_pct,
+            "over": ready.capacity.over, "warning": ready.capacity.warning,
+            "inputs": ready.capacity.inputs.iter().map(|p| serde_json::json!({
+                "input": format!("{:?}", p.input), "encoder": p.encoder.element_name(),
+                "fps": p.fps, "native": p.native})).collect::<Vec<_>>(),
+        });
         engine.send(EngineCommand::Record);
         l.wait_for(Duration::from_secs(20), |s| {
             matches!(s.phase, Phase::Recording { .. })
@@ -1270,60 +1358,82 @@ fn check_load(
             .as_ref()
             .and_then(|s| s.segments.first().cloned())
             .ok_or("no load segment")?;
+        let reference = if standin {
+            InputKey::Source(SourceId(3))
+        } else {
+            InputKey::Camera
+        };
         let mut files = Vec::new();
-        let mut camera_counter_pct = None;
-        let mut camera_path = None;
+        let mut camera = None;
+        let mut per_frame = Vec::new();
         for f in &seg.files {
-            if let Some(q) = &f.quality {
-                files.push(serde_json::json!({
-                    "input": format!("{:?}", f.input), "status": format!("{:?}", f.status),
-                    "encoder": q.encoder.map(|e| e.element_name()),
-                    "frames_in": q.frames_in, "encoded": q.encoded, "duplicated": q.duplicated,
-                    "padded": q.padded, "dropped_queue": q.dropped_queue,
-                    "dropped_corrupt": q.dropped_corrupt, "effective_fps": q.effective_fps,
-                    "repeat_pct": q.repeat_pct, "bitrate_kbps": q.bitrate_kbps,
-                }));
-                if f.input == InputKey::Camera {
-                    camera_counter_pct = Some(q.repeat_pct);
-                    camera_path = Some(f.path.clone());
-                    if f.status != InputStatus::Complete {
-                        l.fail(format!("load camera status {:?}", f.status));
-                    }
+            let Some(q) = &f.quality else { continue };
+            let bytes = std::fs::metadata(&f.path).map_or(0, |m| m.len());
+            let bpf = bytes as f64 / q.encoded.max(1) as f64;
+            files.push(serde_json::json!({
+                "input": format!("{:?}", f.input), "status": format!("{:?}", f.status),
+                "encoder": q.encoder.map(|e| e.element_name()),
+                "max_fps": q.max_fps, "nominal_fps": q.nominal_fps,
+                "frames_in": q.frames_in, "encoded": q.encoded, "duplicated": q.duplicated,
+                "padded": q.padded, "dropped_queue": q.dropped_queue,
+                "dropped_corrupt": q.dropped_corrupt, "effective_fps": q.effective_fps,
+                "repeat_pct": q.repeat_pct, "bitrate_kbps": q.bitrate_kbps,
+                "bytes_per_frame": bpf.round(),
+            }));
+            per_frame.push((f.input, q.nominal_fps.is_none(), bpf));
+            if f.input == reference {
+                if f.status != InputStatus::Complete {
+                    l.fail(format!("load {reference:?} status {:?}", f.status));
                 }
+                camera = Some((q.clone(), f.path.clone()));
             }
         }
-        let counter_pct = camera_counter_pct.ok_or("no camera quality")?;
+        let (q, path) = camera.ok_or("no camera quality")?;
+        let counter_pct = q.repeat_pct;
         if counter_pct >= MAX_REPEAT_PCT {
             l.fail(format!(
-                "camera repeated {counter_pct:.2}% of frames (counters)"
+                "{reference:?} repeated {counter_pct:.2}% of frames (counters)"
             ));
         }
-        let diffs = frame_diffs(&camera_path.ok_or("no camera file")?)?;
-        let late: Vec<f64> = diffs
-            .iter()
-            .filter(|(pts, _)| *pts >= 5_000_000_000)
-            .map(|x| x.1)
-            .collect();
-        let repeats = late.iter().filter(|d| **d < REPEAT_DIFF).count();
-        let pct = repeats as f64 * 100.0 / late.len().max(1) as f64;
-        let mut sorted = late.clone();
-        sorted.sort_by(f64::total_cmp);
-        let median = sorted.get(sorted.len() / 2).copied().unwrap_or(0.0);
+        let diffs = frame_diffs(&path)?;
+        // The camera's first real frame: everything before it is start padding.
+        let from = q
+            .start_offset
+            .map_or(0, |d| d.as_nanos() as u64)
+            .saturating_add(1_000_000);
+        let (repeats, pairs, pct, median) = repeat_stats(&diffs, from);
+        let (_, late_pairs, late_pct, _) = repeat_stats(&diffs, 5_000_000_000);
         eprintln!(
-            "selftest: load: camera repeats {repeats}/{} pairs after 5 s ({pct:.2}%), median diff {median:.3}; counters {counter_pct:.2}%",
-            late.len()
+            "selftest: load: {reference:?} repeats {repeats}/{pairs} pairs over the whole \
+             recording ({pct:.2}%; after 5 s {late_pct:.2}% of {late_pairs}), median diff \
+             {median:.3}; counters {counter_pct:.2}%"
         );
         if pct >= MAX_REPEAT_PCT {
             l.fail(format!(
-                "camera: {repeats} of {} frame pairs after 5 s are repeats ({pct:.2}%)",
-                late.len()
+                "{reference:?}: {repeats} of {pairs} frame pairs are repeats ({pct:.2}%)"
             ));
         }
+        // Native bitrate: per-frame budget comparable to the CFR input with the same content.
+        let cfr_bpf = per_frame
+            .iter()
+            .find(|(k, native, _)| *k == reference && !native)
+            .map(|x| x.2);
+        if standin && let Some(cfr) = cfr_bpf {
+            for (k, native, bpf) in &per_frame {
+                if *native && !(cfr / 2.0..=cfr * 2.0).contains(bpf) {
+                    l.fail(format!(
+                        "{k:?}: Native {bpf:.0} bytes/frame vs CFR {cfr:.0} (not within 2x)"
+                    ));
+                }
+            }
+        }
         Ok(serde_json::json!({
-            "seconds": secs, "files": files,
-            "camera_repeat_pct_counters": counter_pct,
-            "camera_repeat_pct_diff": pct, "camera_pairs": late.len(),
-            "camera_median_diff": median,
+            "seconds": secs, "windows": format!("{mode:?}"), "reference": format!("{reference:?}"),
+            "plan": plan, "files": files,
+            "repeat_pct_counters": counter_pct,
+            "repeat_pct_diff": pct, "pairs": pairs,
+            "repeat_pct_diff_after_5s": late_pct,
+            "median_diff": median,
         }))
     })();
     engine.shutdown_blocking(Duration::from_secs(10));

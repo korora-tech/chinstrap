@@ -1243,7 +1243,7 @@ impl Engine {
                         } else {
                             FrameRateMode::Cfr30
                         },
-                        refresh: Some((recorder::TEST_NATIVE_FPS, 1)),
+                        refresh: Some((self.test_behaviour(id).refresh_fps(), 1)),
                         size: Some(
                             self.test_behaviour(id)
                                 .size
