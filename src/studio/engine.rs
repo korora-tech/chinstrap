@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -194,11 +194,48 @@ impl EngineHandle {
     }
 }
 
+/// Is `msg` one of the criticals PipeWire's GStreamer plugin (1.6.x, gstpipewireformat.c
+/// `handle_fraction_prop`) logs for every format whose frame-rate "range" has min == max (169
+/// per device scan here, also from a plain `gst-device-monitor-1.0`)? GStreamer then keeps the
+/// fixed rate; nothing is lost.
+fn is_pipewire_fraction_critical(msg: &str) -> bool {
+    msg.contains("gst_value_collect_fraction_range: assertion")
+        || msg.contains("range start is not smaller than end for `GstFractionRange'")
+}
+
+/// Hides [`is_pipewire_fraction_critical`] messages (one summary line instead) so real errors
+/// stay visible; every other GStreamer message goes to GLib's default handler.
+fn quiet_pipewire_fraction_criticals() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let seen = AtomicBool::new(false);
+        gst::glib::log_set_handler(
+            Some("GStreamer"),
+            gst::glib::LogLevels::LEVEL_CRITICAL,
+            false,
+            false,
+            move |domain, level, msg| {
+                if is_pipewire_fraction_critical(msg) {
+                    if !seen.swap(true, Ordering::AcqRel) {
+                        eprintln!(
+                            "chinstrap: ignoring GStreamer FractionRange criticals from the PipeWire \
+                             plugin (a fixed frame rate sent as a range; harmless)"
+                        );
+                    }
+                    return;
+                }
+                gst::glib::log_default_handler(domain, level, Some(msg));
+            },
+        );
+    });
+}
+
 /// Calls gst::init() (idempotent), spawns "chinstrap-engine" (and, if enabled, "chinstrap-portal").
 pub fn start(
     config: EngineConfig,
 ) -> Result<(EngineHandle, async_channel::Receiver<EngineEvent>), EngineError> {
     gst::init().map_err(|e| EngineError::GstInit(e.to_string()))?;
+    quiet_pipewire_fraction_criticals();
     let (events_tx, events_rx) = async_channel::unbounded();
     let (tx, rx) = mpsc::channel();
     let join = if config.fake {
