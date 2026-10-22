@@ -439,6 +439,14 @@ fn run_job(job: &Job) -> Result<WorkerLine, String> {
     }
     progress(proto::STAGE_WRITING, 98);
     let mut segments = output::assemble(&raw, ctx.token_eot(), speech.as_deref(), audio_s);
+    // Whisper sometimes repeats its prompt in a quiet window instead of transcribing.
+    let before = segments.len();
+    segments.retain(|s| !prompt::is_prompt_echo(&s.text, &fitted.text, speech.is_some()));
+    if segments.len() != before {
+        for (i, s) in segments.iter_mut().enumerate() {
+            s.id = i as u32;
+        }
+    }
     // Replacement rules (§12.6), read per job like the glossary.
     let (rules, rule_warnings) = vocab::load_replacements(&vocab::replacements_path());
     for w in &rule_warnings {

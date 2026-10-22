@@ -182,6 +182,24 @@ pub const STYLE_SEED: &str = "Okay, let's begin.";
 /// Bytes the seed takes at the end of a prompt (with its separating space).
 const SEED_BYTES: usize = STYLE_SEED.len() + 1;
 
+/// Is a transcript segment's `text` Whisper repeating its prompt instead of transcribing?
+/// Whisper may echo the initial prompt in a window with little or no speech. A segment that is
+/// exactly the glossary sentence or the whole prompt is always an echo. One that is exactly the
+/// style seed is treated as one only without VAD (`vad == false`): with VAD, segments in
+/// silence are already dropped, and a speaker really saying "Okay, let's begin." is kept.
+pub fn is_prompt_echo(text: &str, prompt: &str, vad: bool) -> bool {
+    let norm = |t: &str| super::wer::normalize(t).join(" ");
+    let t = norm(text);
+    if t.is_empty() {
+        return false;
+    }
+    let glossary = prompt
+        .find("Glossary:")
+        .map(|i| norm(&prompt[i..]))
+        .filter(|g| !g.is_empty());
+    t == norm(prompt) || glossary.is_some_and(|g| t == g) || (!vad && t == norm(STYLE_SEED))
+}
+
 fn render_text(hint: Option<&str>, terms: &[String]) -> String {
     let mut parts = Vec::new();
     if let Some(h) = hint {
@@ -315,6 +333,22 @@ mod tests {
             .split_whitespace()
             .map(|w| w.len().div_ceil(4))
             .sum())
+    }
+
+    #[test]
+    fn prompt_echoes() {
+        let p = "Okay, let's begin. Glossary: Rawkode, Cilium.";
+        assert!(is_prompt_echo(" Glossary: Rawkode, Cilium.", p, true));
+        assert!(is_prompt_echo(
+            "Okay, let's begin. Glossary: Rawkode, Cilium.",
+            p,
+            true
+        ));
+        assert!(is_prompt_echo("Okay let's begin", p, false));
+        // With VAD a spoken "Okay, let's begin." is real speech.
+        assert!(!is_prompt_echo("Okay, let's begin.", p, true));
+        assert!(!is_prompt_echo("Welcome to the Rawkode Academy.", p, false));
+        assert!(!is_prompt_echo("...", p, false));
     }
 
     #[test]
