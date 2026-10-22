@@ -33,7 +33,7 @@ Use the panel to pick a camera and a microphone. **Add windows/screens…** open
 - **Camera mode.** Under the camera list, the selected camera's advertised modes (size, rate, format) are listed with **Automatic** (the mode Chinstrap would pick, shown underneath) as the default. Pick one to override it; the choice is locked while recording.
 - **Frame rate.** Each window, screen and test pattern has a **Native · 60 · 30** picker, and **Frame rate for all windows/screens** sets the default for new ones and applies it to the current ones. See [Frame rate of windows and screens](#frame-rate-of-windows-and-screens).
 - **Encoding plan.** Once inputs are selected, the plan lists each video input's encoder, size, rate and share of the video engine. If the selection is beyond the measured encoder capacity, a warning appears there (and next to **Record**) *before* you record, instead of frames being dropped silently.
-- **Waiting for first frame.** While recording, a source that has not delivered a frame yet shows **Waiting for first frame** (windows only send frames when they change). If it never sends one, its input ends as **failed: no frames received** and its empty file is removed; it is never marked complete.
+- **Waiting for first frame.** While recording, a source that has not delivered a frame yet shows **Waiting for first frame** (windows only send frames when they change). If it never sends one, its input ends as **failed: no frames received** and its empty file is removed; it is never marked complete. It stays selected after a Cut, so a window that was only static in one segment is recorded again in the next.
 - **Quality per input.** Each video file in a segment row shows its encoder, constant (`CFR`) or variable (`VFR ≤144`) rate, effective fps, repeated frames (%), dropped frames (with how many were corrupt), bitrate and start offset. The line turns amber when more than 1% of frames are repeats or any frame was dropped. The same numbers are in `session.json`.
 - **Vocabulary.** Glossary terms and replacement rules, see [Vocabulary](#vocabulary).
 
@@ -53,7 +53,7 @@ Use the panel to pick a camera and a microphone. **Add windows/screens…** open
     segment-002/ …
 ```
 
-Every file in a segment is timestamped against the same base time, and every video file starts at the segment's time zero: a source whose first frame arrives late is padded with that first frame repeated, so all files line up when dropped into an editor at the same position. The manifest records the real first timestamp (`first_pts_ns`) and last timestamp of each file, so drift and start latency can still be measured. Each manifest write is atomic, and quitting during a recording finalizes the files first.
+Every file in a segment is timestamped against the same base time, and every video file starts at the segment's time zero: a source whose first frame arrives late is padded with that first frame repeated, so all video files line up when dropped into an editor at the same position. `mic.mkv` is not padded: it starts at its first sample (usually a few tens of milliseconds after time zero), recorded as `first_pts_ns` in the manifest. Editors that honour a Matroska file's start time line it up; one that starts every file at zero puts the audio that much early, so shift it by `first_pts_ns`. The manifest records the real first timestamp (`first_pts_ns`) and last timestamp of each file, so drift and start latency can still be measured. Each manifest write is atomic, and quitting during a recording finalizes the files first.
 
 Each video input in `session.json` also carries its frame accounting: frames in, dropped by the queue (encoder too slow), dropped as corrupt, duplicated (repeated to fill gaps), padded (repeated to start at zero), encoded, effective fps, repeat %, bitrate and start offset. The UI shows the same numbers live and per segment.
 
@@ -70,7 +70,8 @@ Each video input in `session.json` also carries its frame accounting: frames in,
 - **Encoding** uses `vah264enc` (H.264), `vah265enc` (HEVC), `x264enc` or `openh264enc`, always in Matroska.
   - At startup each encoder is timed on 3840×2160 frames (at most about 4 s per encoder); the Notices panel shows the result (on the tested RX 7900 XT: about 100 fps H.264, 130 fps HEVC, 120 fps x264).
   - A planner then gives every video input an encoder and a rate from those numbers. It assumes the worst case, that every GPU encode shares one encode engine. If the selection does not fit, it moves inputs from H.264 to HEVC, then moves the camera to `x264enc` (2–3 CPU cores at 4K25), then lowers the cap of Native windows and screens (not below 30 fps). The plan and any change it made are shown in the **Encoding plan** panel; if it still does not fit, a warning is shown before you record.
-  - H.264 is never planned above 60 fps at more than 1080p (level 5.2 is the highest that editors and hardware decoders reliably accept); faster 4K sources get HEVC.
+  - Above 1080p, Native sources are never planned on H.264 above 60 fps (level 5.2 is the highest that editors and hardware decoders reliably accept); faster ones get HEVC, or are capped at 60 fps when no HEVC encoder works. A constant rate above 60 fps at more than 1080p that only H.264 can take is recorded as chosen, with a warning before you record.
+  - Every Native cap the planner lowers is shown as a warning before you record, not only in the plan.
   - The H.264 encoders use one reference frame: three references halved `vah264enc`'s 4K throughput and made the camera repeat frames when recorded next to two 4K windows.
   - Screens and the test pattern only get an encoder that the GPU conversion path was checked with at startup.
   - If no encoder can do 4K, inputs are downscaled to 1080p.
@@ -87,7 +88,9 @@ Each window, screen and test-pattern source has a frame-rate mode:
 | **60** | Constant 60 fps (CFR): frames are repeated or dropped to hit the rate. |
 | **30** | Constant 30 fps. |
 
-Set the default for new sources with **Frame rate for all windows/screens** or `CHINSTRAP_FRAME_RATE=native|60|30`. The planner may lower a Native source's cap (shown as, for example, `vah265enc · ≤50 fps`) to fit the encoder capacity.
+Set the default for new sources with **Frame rate for all windows/screens** or `CHINSTRAP_FRAME_RATE=native|60|30`. The planner may lower a Native source's cap (shown as, for example, `vah265enc · ≤50 fps`) to fit the encoder capacity. When a source's refresh is unknown, the planner assumes 60 fps and asks the source for no more than that.
+
+A Native file's bitrate is computed for its cap, and the encoder is told that rate, so each frame gets the same budget as a constant-rate recording at that rate; a window that changes less often makes a smaller file. Native files declare no fixed frame rate in the container (no Matroska default duration); each frame carries its own time.
 
 **Editors and VFR.** Native files are variable frame rate. Some editors (notably DaVinci Resolve and older Premiere versions) handle VFR poorly: audio drift or stutter on import. If yours does, record with **60** or **30**, or convert a copy to constant rate before editing, for example:
 
@@ -112,13 +115,13 @@ nix develop -c cargo run --release -- --download-model large-v3-turbo
 
 Files go to `$XDG_DATA_HOME/chinstrap/models` (default `~/.local/share/chinstrap/models`). Each file comes from a commit-pinned Hugging Face URL and is checked against a pinned SHA-256 before it is used. The download goes to a `.part` file, can be cancelled, and resumes where it stopped.
 
-**When.** With **Transcribe segments automatically** on (the default), each segment is queued when it finishes. Each segment row also has **Transcribe**, **Cancel** and **Retry**, and **Re-transcribe** once a transcript exists: it transcribes the segment again with the current glossary and replacement rules, replacing the previous transcript files. Jobs run one at a time in a separate low-priority process. GPU jobs keep running while you record. CPU jobs pause while recording and continue afterwards. If a job crashes on Vulkan, it is retried on the CPU; if that happens twice and both retries succeed, Chinstrap switches to the CPU for the rest of the run.
+**When.** With **Transcribe segments automatically** on (the default), each segment is queued when it finishes. Each segment row also has **Transcribe**, **Cancel** and **Retry**, and **Re-transcribe** once a transcript exists: it transcribes the segment again with the current glossary and replacement rules, replacing the previous transcript files. If a re-transcription is cancelled or fails, the segment keeps its earlier transcript. Jobs run one at a time in a separate low-priority process. GPU jobs keep running while you record. CPU jobs pause while recording and continue afterwards. If a job crashes on Vulkan, it is retried on the CPU; if that happens twice and both retries succeed, Chinstrap switches to the CPU for the rest of the run.
 
 ### Vocabulary
 
-The **Vocabulary** panel in the Studio view edits two files in `$XDG_CONFIG_HOME/chinstrap/` (default `~/.config/chinstrap/`). Both are read at the start of every transcription job, so a change applies to the next job; use **Re-transcribe** to apply it to a finished segment. You can also edit the files by hand.
+The **Vocabulary** panel in the Studio view edits two files in `$XDG_CONFIG_HOME/chinstrap/` (default `~/.config/chinstrap/`). Both are read at the start of every transcription job, so a change applies to the next job; use **Re-transcribe** to apply it to a finished segment. You can also edit the files by hand. A symlinked file (for example one managed by home-manager) is edited through the link, and a read-only one is refused with an error, as is a file over 1 MiB or not UTF-8. An edit is refused if the file changed since it was read (try again).
 
-- **Glossary terms** (`glossary.txt`): names and jargon Whisper should spell your way ("Rawkode", "Kubernetes"), one term per line; `#` starts a comment. Add a term in the field and press `Enter` or **Add**; click **✕** on a term to remove it. The terms, plus the session folder's name when it is not the default timestamp, are given to Whisper as its initial prompt, after a short punctuated sentence that keeps Whisper's capitals and punctuation (at most 1 KiB and 200 tokens; terms past the limit are dropped). Whisper sees the prompt directly only in the first 30-second window of each file; later windows are conditioned on the text already transcribed, which carries the spellings forward. `transcript.json` records the prompt that was used.
+- **Glossary terms** (`glossary.txt`): names and jargon Whisper should spell your way ("Rawkode", "Kubernetes"), one term per line; `#` starts a comment. Add a term in the field and press `Enter` or **Add**; click **✕** on a term to remove it. The terms, plus the session folder's name when it is not the default timestamp (timestamp-named sessions give no hint), are given to Whisper as its initial prompt, after a short punctuated sentence that keeps Whisper's capitals and punctuation (at most 1 KiB and 200 tokens; terms past the limit are dropped). Whisper sees the prompt directly only in the first 30-second window of each file; later windows are conditioned on the text already transcribed, which carries the spellings forward. `transcript.json` records the prompt that was used. A transcript segment that only repeats the prompt (Whisper sometimes echoes it in a quiet window) is dropped.
 - **Replacement rules** (`replacements.txt`): fixes applied after transcription, for words the glossary alone does not fix. One rule per line, `from => to`, `#` comments:
 
   ```
@@ -126,7 +129,9 @@ The **Vocabulary** panel in the Studio view edits two files in `$XDG_CONFIG_HOME
   cube control => kubectl
   ```
 
-  Matching is case-insensitive, on whole words, with any whitespace between words. A rule changes the transcript text, the word list (matched words merge into one word spanning their times), the SRT and the VTT. `transcript.json` keeps the text from before the rules (`text_original`) and lists which rules matched and how often. In the panel, type what Whisper hears and what to write instead, then **Add**; adding a rule with the same `from` replaces it.
+  Matching is case-insensitive, on whole words, with any whitespace between words. A rule changes the transcript text, the word list (matched words merge into one word spanning their times), the SRT and the VTT. `transcript.json` keeps the text from before the rules (`text_original`) and lists which rules matched and how often. All rules are applied in one left-to-right pass: where several match, the longest wins, and the text a rule writes is never matched again by another rule. In the panel, type what Whisper hears and what to write instead, then **Add**; adding a rule with the same `from` replaces it.
+
+  The glossary does not always win: the same audio can come out as "Rawkode", "Rawko" or "Rockhold" depending on the rest of the prompt. Add a rule for each mishearing you see (`Rawko => Rawkode`, `Rockhold => Rawkode`).
 
 **Casing and timing.** Transcripts keep Whisper's capitals and punctuation; punctuation is attached to the neighbouring word rather than dropped. Word times are kept inside the speech the VAD detected, so no word or caption starts in silence, and a pause longer than a second starts a new caption.
 
@@ -179,10 +184,11 @@ The self-test runs the real engine without the portal: a test pattern, the first
 
 When the Whisper model is already downloaded, the self-test also transcribes segment 1's microphone file through the worker process and checks `transcript.json`, the SRT and VTT files, and the manifest status. A quiet room should give 0 words; anything else is reported as a warning. Without the model this check is skipped with a warning, unless `CHINSTRAP_SELFTEST_REQUIRE_MODEL=1`. `CHINSTRAP_SELFTEST_SPEECH=<file.mkv>:<reference.txt>` also transcribes a known recording and fails if the word error rate is above 10%.
 
-Two variables change the test:
+These variables change the test:
 
 - `CHINSTRAP_TEST_SIZE=WxH` sets the test pattern's size.
-- `CHINSTRAP_SELFTEST_CAMERA=<name substring>` picks a specific camera. Its file must then be H.264 at the camera's native size and rate. The test also checks that PipeWire links that camera's node rather than the default source.
+- `CHINSTRAP_SELFTEST_CAMERA=<name substring>` picks a specific camera. Its file must then be H.264 at the camera's native size and rate. The test also checks that PipeWire links that camera's node rather than the default source. A second run then records that camera next to two 4K test windows for `CHINSTRAP_SELFTEST_LOAD_SECS` (default 60) and fails if 1% or more of the camera's frames are repeats, counted over the whole recording both by the quality counters and by comparing consecutive frames. The windows are Native with a 144 Hz refresh, the app's default; `CHINSTRAP_SELFTEST_LOAD_MODE=30` or `60` records them at a constant rate instead. The plan the engine chose is in the JSON output.
+- `CHINSTRAP_SELFTEST_LOAD=standin` runs the same load test without a camera, with a third 4K test pattern at 30 fps in its place. It also fails when a Native window's bytes per frame are not within 2× of that constant-rate pattern's.
 
 The self-test also checks PipeWire targeting whenever PipeWire is reachable:
 
@@ -211,6 +217,8 @@ These have not been checked:
 - Long recordings.
 
 The ILCE-7CM2 delivers truncated frames for a short time after it is reopened. Chinstrap drops frames that PipeWire marks as corrupted and fills the gap by repeating frames, so the first second or two of a camera file can contain a few repeats; they are counted in the quality numbers (`dropped_corrupt`, `duplicated`).
+
+A constant-rate source whose first frame arrives late gets its start padding as one burst of repeated frames when that frame arrives. At 4K the encoder takes a moment to catch up, so a few of the following real frames can be dropped (in the 4K self-test, 1.5 s late at 30 fps: 45 padded frames, then 4 to 6 dropped and repeated). They are counted in the quality numbers.
 
 Also not yet checked: recording real niri windows in Native mode end to end, the camera with `vah265enc` or `x264enc`, and opening Native (VFR) or HEVC files in editors.
 
