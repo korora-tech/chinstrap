@@ -30,6 +30,7 @@ Use the panel to pick a camera and a microphone. **Add windows/screens…** open
 
 ### Studio panels
 
+- **Preview.** A live tile (about 15 fps, at most 480×300) for the selected camera and every window, screen and test pattern, so you can see what each file will show. While idle each input has its own small preview pipeline; pressing **Record** stops those first (only one reader per PipeWire node), and while recording the frames come from a branch of the recording pipeline itself, framed in red. A preview that fails says why on its tile and is retried; it never stops or fails a recording. `CHINSTRAP_PREVIEW=0` turns previews off.
 - **Camera mode.** Under the camera list, the selected camera's advertised modes (size, rate, format) are listed with **Automatic** (the mode Chinstrap would pick, shown underneath) as the default. Pick one to override it; the choice is locked while recording.
 - **Frame rate.** Each window, screen and test pattern has a **Native · 60 · 30** picker, and **Frame rate for all windows/screens** sets the default for new ones and applies it to the current ones. See [Frame rate of windows and screens](#frame-rate-of-windows-and-screens).
 - **Encoding plan.** Once inputs are selected, the plan lists each video input's encoder, size, rate and share of the video engine. If the selection is beyond the measured encoder capacity, a warning appears there (and next to **Record**) *before* you record, instead of frames being dropped silently.
@@ -157,7 +158,8 @@ This writes `recording.transcript.json`, `recording.srt` and `recording.vtt` nex
 | `CHINSTRAP_GPU_CONVERT` | Preferred GPU conversion path for DMA-BUF video: `va` or `gl` |
 | `CHINSTRAP_SCREEN_FPS` | Test-pattern frame rate, 30 (default) or 60 |
 | `CHINSTRAP_SCREEN_BITRATE_KBPS`, `CHINSTRAP_CAMERA_BITRATE_KBPS` | Fixed bitrates |
-| `CHINSTRAP_FAKE_ENGINE=1` | UI-only run with a simulated engine |
+| `CHINSTRAP_FAKE_ENGINE=1` | UI-only run with a simulated engine (synthetic previews) |
+| `CHINSTRAP_PREVIEW=0` | No live previews (no preview pipelines, no preview branch in recordings) |
 | `CHINSTRAP_WHISPER_MODEL` | Model name (`large-v3-turbo-q8_0`, `large-v3-turbo-q5_0`, `large-v3-turbo`) or a path to any ggml Whisper file (not hash-checked) |
 | `CHINSTRAP_WHISPER_LANG` | Language code, or `auto` (default) |
 | `CHINSTRAP_WHISPER_BACKEND=cpu` | Never use the GPU |
@@ -181,6 +183,7 @@ The self-test runs the real engine without the portal: a test pattern, the first
 - The gap between segments is under 1.5 s.
 - The manifest matches the files on disk.
 - Files are finalized on quit.
+- Previews: test patterns 1-3 deliver at least 5 opaque, non-blank frames within 480×300 in 3 s while idle, and from the recording pipelines (at least 8 fps) while recording; the pattern that never draws delivers none; idle previews come back after Stop. Skipped with `CHINSTRAP_PREVIEW=0`, which also lets you compare the dropped and repeated frame counts with and without previews.
 
 When the Whisper model is already downloaded, the self-test also transcribes segment 1's microphone file through the worker process and checks `transcript.json`, the SRT and VTT files, and the manifest status. A quiet room should give 0 words; anything else is reported as a warning. Without the model this check is skipped with a warning, unless `CHINSTRAP_SELFTEST_REQUIRE_MODEL=1`. `CHINSTRAP_SELFTEST_SPEECH=<file.mkv>:<reference.txt>` also transcribes a known recording and fails if the word error rate is above 10%.
 
@@ -210,7 +213,8 @@ These have been checked on one machine: NixOS, niri, PipeWire 1.6.9 and WirePlum
 
 These have not been checked:
 
-- Screen and window capture through the portal in an automated test. It needs a person to pick a source.
+- Screen and window capture through the portal in an automated test. It needs a person to pick a source. This includes the previews of portal sources (VA: `vapostproc` straight from DMA-BUF; GL: converted to NV12 before download).
+- Camera previews from a real camera: on this machine only the v4l2loopback dummy was attached while previews were built, and it delivers no frames.
 - Other compositors and portal backends.
 - NVIDIA and Intel hardware.
 - MJPEG and DMA-BUF cameras at 4K, and camera frame rates above 30 fps.
