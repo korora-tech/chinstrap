@@ -10,6 +10,9 @@
 //! real contract: the plan is the real planner over a fake encoder table (this host's measured
 //! rates), windows wait ~2 s for their first frame, quality numbers tick while recording, and
 //! the vocabulary is kept in memory (no files are written).
+//!
+//! Previews are synthetic: every ~66 ms each previewed input gets a 480×270 frame in its own
+//! hue with a moving bar, framed in red while it is being recorded.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -21,6 +24,7 @@ use gstreamer as gst;
 use super::encoders::EncoderCap;
 use super::engine::{EngineConfig, Msg};
 use super::plan::{self, Demand};
+use super::preview::{self, Previews};
 use super::transcribe::vocab;
 use super::types::*;
 
@@ -47,10 +51,11 @@ pub(super) fn spawn(
     config: EngineConfig,
     rx: Receiver<Msg>,
     events: async_channel::Sender<EngineEvent>,
+    previews: Previews,
 ) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("chinstrap-engine".into())
-        .spawn(move || FakeEngine::new(config, events).run(rx))
+        .spawn(move || FakeEngine::new(config, events, previews).run(rx))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +100,13 @@ struct FakeEngine {
     frame_rate_default: FrameRateMode,
     camera_mode: Option<String>,
     vocabulary: VocabularyInfo,
+    previews: Previews,
+    preview_on: bool,
+    last_preview: Instant,
+    /// Clock of the synthetic preview animation.
+    born: Instant,
+    /// The preview states last sent (a change sends a Snapshot).
+    preview_sent: Vec<(InputKey, PreviewState)>,
 }
 
 fn fake_mode(w: i32, h: i32, fps: i32, format: &str, auto: bool) -> CameraModeInfo {
@@ -110,7 +122,11 @@ fn fake_mode(w: i32, h: i32, fps: i32, format: &str, auto: bool) -> CameraModeIn
 }
 
 impl FakeEngine {
-    fn new(config: EngineConfig, events: async_channel::Sender<EngineEvent>) -> Self {
+    fn new(
+        config: EngineConfig,
+        events: async_channel::Sender<EngineEvent>,
+        previews: Previews,
+    ) -> Self {
         let portal = if config.enable_portal {
             PortalAvailability::Available { version: 5 }
         } else {
@@ -207,6 +223,11 @@ impl FakeEngine {
                 replacements_path: PathBuf::from("/fake/chinstrap/replacements.txt"),
                 warnings: Vec::new(),
             },
+            previews,
+            preview_on: config.preview,
+            last_preview: now,
+            born: now,
+            preview_sent: Vec::new(),
         }
     }
 
@@ -321,7 +342,8 @@ impl FakeEngine {
 
     // ---- events ---------------------------------------------------------------------------
 
-    fn snapshot(&self) {
+    fn snapshot(&mut self) {
+        self.preview_sent = self.preview_states();
         let snap = Snapshot {
             capabilities: self.caps.clone(),
             cameras: self.cameras.clone(),
@@ -356,6 +378,7 @@ impl FakeEngine {
             selected_camera_mode: self.camera_mode.clone(),
             capacity: self.capacity(),
             vocabulary: self.vocabulary.clone(),
+            previews: self.preview_sent.clone(),
         };
         let _ = self
             .events
@@ -412,6 +435,93 @@ impl FakeEngine {
 
     fn after(&mut self, delay: Duration, timer: Timer) {
         self.timers.push((Instant::now() + delay, timer));
+    }
+
+    // ---- previews -------------------------------------------------------------------------
+
+    /// Inputs with a preview tile: the selected camera, then every source.
+    fn preview_keys(&self) -> Vec<InputKey> {
+        self.selected_camera
+            .map(|_| InputKey::Camera)
+            .into_iter()
+            .chain(self.sources.iter().map(|s| InputKey::Source(s.id)))
+            .collect()
+    }
+
+    /// Inputs that get frames now: idle, every usable one; busy, the recorded ones.
+    fn previewed(&self) -> Vec<InputKey> {
+        let ready = |k: &InputKey| match k {
+            InputKey::Camera => self.camera_ok(),
+            InputKey::Microphone => false,
+            InputKey::Source(id) => self
+                .sources
+                .iter()
+                .any(|s| s.id == *id && s.state == SourceState::Ready),
+        };
+        if !self.preview_on {
+            return Vec::new();
+        }
+        match self.current_segment() {
+            None => self.preview_keys().into_iter().filter(ready).collect(),
+            Some(_) => self.inputs.iter().copied().filter(ready).collect(),
+        }
+    }
+
+    fn current_segment(&self) -> Option<u32> {
+        match self.phase {
+            Phase::Idle => None,
+            Phase::Starting { segment }
+            | Phase::Recording { segment, .. }
+            | Phase::Stopping { segment } => Some(segment),
+            Phase::Cutting { from } => Some(from),
+        }
+    }
+
+    fn preview_states(&self) -> Vec<(InputKey, PreviewState)> {
+        let previewed = self.previewed();
+        self.preview_keys()
+            .into_iter()
+            .map(|k| {
+                let state = if !self.preview_on {
+                    PreviewState::Unavailable {
+                        reason: "previews are off (CHINSTRAP_PREVIEW=0)".into(),
+                    }
+                } else if previewed.contains(&k) && self.previews.generation(k) > 0 {
+                    PreviewState::Live
+                } else {
+                    match self.sources.iter().find(|s| InputKey::Source(s.id) == k) {
+                        Some(SourceInfo {
+                            state:
+                                SourceState::Unsupported { reason } | SourceState::Lost { reason },
+                            ..
+                        }) => PreviewState::Unavailable {
+                            reason: reason.clone(),
+                        },
+                        _ => PreviewState::Starting,
+                    }
+                };
+                (k, state)
+            })
+            .collect()
+    }
+
+    fn publish_previews(&mut self) {
+        let keys = self.preview_keys();
+        self.previews.retain(&keys);
+        let origin = match self.phase {
+            Phase::Recording { segment, .. } => PreviewOrigin::Recording { segment },
+            _ => PreviewOrigin::Idle,
+        };
+        // Starting/Stopping/Cutting: the recording pipelines are not producing yet / anymore.
+        if self.current_segment().is_none() || origin != PreviewOrigin::Idle {
+            let t = self.born.elapsed().as_secs_f64();
+            for key in self.previewed() {
+                self.previews.publish(key, fake_frame(key, origin, t));
+            }
+        }
+        if self.preview_states() != self.preview_sent {
+            self.snapshot();
+        }
     }
 
     // ---- commands -------------------------------------------------------------------------
@@ -975,6 +1085,10 @@ impl FakeEngine {
             self.fire(t);
         }
         self.poll_transcription();
+        if now.duration_since(self.last_preview) >= preview::PREVIEW_EVERY {
+            self.last_preview = now;
+            self.publish_previews();
+        }
 
         if let Phase::Recording { segment, .. } = self.phase {
             if now.duration_since(self.last_level) >= LEVEL_EVERY {
@@ -1182,6 +1296,58 @@ impl FakeEngine {
     }
 }
 
+/// A synthetic 480×270 preview frame: a gradient in the input's own hue, a bar sweeping
+/// across every 2 s, and a red frame while recording.
+fn fake_frame(key: InputKey, origin: PreviewOrigin, t: f64) -> PreviewFrame {
+    let (w, h) = preview::fit(1920, 1080);
+    let (w, h) = (w as usize, h as usize);
+    let hue = match key {
+        InputKey::Camera => 200.0,
+        InputKey::Microphone => 0.0,
+        InputKey::Source(id) => (id.0 as f64 * 67.0) % 360.0,
+    };
+    let bar = ((t / 2.0).fract() * w as f64) as usize;
+    let recording = matches!(origin, PreviewOrigin::Recording { .. });
+    let mut bgra = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        for x in 0..w {
+            let border = recording && (x < 6 || y < 6 || x >= w - 6 || y >= h - 6);
+            let (r, g, b) = if border {
+                (230, 40, 50)
+            } else if x.abs_diff(bar) < 8 {
+                (240, 240, 240)
+            } else {
+                hsv(hue, 0.6, 0.25 + 0.55 * y as f64 / h as f64)
+            };
+            bgra.extend_from_slice(&[b, g, r, 255]);
+        }
+    }
+    PreviewFrame {
+        width: w as u32,
+        height: h as u32,
+        bgra,
+        origin,
+        at: Instant::now(),
+    }
+}
+
+/// HSV (hue in degrees) to 8-bit RGB.
+fn hsv(h: f64, s: f64, v: f64) -> (u8, u8, u8) {
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let (r, g, b) = match (h / 60.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = v - c;
+    let q = |v: f64| ((v + m) * 255.0).round() as u8;
+    (q(r), q(g), q(b))
+}
+
 /// Plausible live counters: windows wait for their first frame, then run near their planned
 /// rate; the camera repeats a few frames; quality is a pure function of elapsed time.
 fn fake_quality(file: &mut InputFile, since: Duration, plan: &CapacityPlan) {
@@ -1252,6 +1418,7 @@ mod tests {
             fake: true,
             frame_rate: FrameRateMode::Native,
             test_sources: Vec::new(),
+            preview: true,
         }
     }
 
@@ -1394,6 +1561,51 @@ mod tests {
             })
         });
         assert!(s.session.is_some());
+        assert!(engine.shutdown_blocking(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn synthetic_previews_follow_selection_and_recording() {
+        let (engine, rx) = start(config()).expect("start fake engine");
+        let hub = engine.previews();
+        engine.send(EngineCommand::SelectCamera(Some(DeviceId(1))));
+        engine.send(EngineCommand::AddTestSource);
+        let source = InputKey::Source(SourceId(1));
+        let s = wait_for(&rx, Duration::from_secs(3), |s| {
+            s.previews.contains(&(InputKey::Camera, PreviewState::Live))
+                && s.previews.contains(&(source, PreviewState::Live))
+        });
+        assert_eq!(s.previews.len(), 2);
+        let (g0, f) = hub.latest(InputKey::Camera).expect("camera frame");
+        assert_eq!((f.width, f.height), (480, 270));
+        assert_eq!(f.bgra.len(), 480 * 270 * 4);
+        assert_eq!(f.origin, PreviewOrigin::Idle);
+        std::thread::sleep(Duration::from_millis(500));
+        let g1 = hub.generation(InputKey::Camera);
+        assert!((4..=9).contains(&(g1 - g0)), "{} frames in 0.5 s", g1 - g0);
+
+        engine.send(EngineCommand::Record);
+        wait_for(&rx, Duration::from_secs(2), |s| {
+            matches!(s.phase, Phase::Recording { segment: 1, .. })
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let (_, f) = hub.latest(source).expect("source frame");
+        assert_eq!(f.origin, PreviewOrigin::Recording { segment: 1 });
+        // The red recording frame.
+        assert_eq!(&f.bgra[..4], &[50, 40, 230, 255]);
+
+        engine.send(EngineCommand::Stop);
+        wait_for(&rx, Duration::from_secs(2), |s| s.phase == Phase::Idle);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(hub.latest(source).unwrap().1.origin, PreviewOrigin::Idle);
+
+        engine.send(EngineCommand::RemoveSource(SourceId(1)));
+        wait_for(&rx, Duration::from_secs(1), |s| s.previews.len() == 1);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            hub.latest(source).is_none(),
+            "a removed source keeps no frame"
+        );
         assert!(engine.shutdown_blocking(Duration::from_secs(2)));
     }
 

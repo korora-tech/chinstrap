@@ -12,6 +12,10 @@
 //! `CHINSTRAP_SELFTEST_LOAD_SECS` (default 60) and asserts < 1% repeated camera frames over the
 //! whole recording, by the counters and by consecutive-frame differences
 //! (`CHINSTRAP_SELFTEST_LOAD=standin` without a camera: a 4K30 test pattern in its place).
+//!
+//! Previews (unless `CHINSTRAP_PREVIEW=0`): sources 1-3 deliver preview frames while idle and,
+//! from the recording pipelines, while recording; the silent source never does; idle previews
+//! come back after Stop.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -23,8 +27,8 @@ use gstreamer_pbutils::prelude::*;
 
 use crate::studio::{
     self, EngineCommand, EngineEvent, FrameRateMode, InputKey, InputStatus, ModelState, Phase,
-    SegmentStatus, Severity, Snapshot, SourceId, SourceKind, SourceState, TestBehaviour,
-    TranscriptStatus,
+    PreviewOrigin, Previews, SegmentStatus, Severity, Snapshot, SourceId, SourceKind, SourceState,
+    TestBehaviour, TranscriptStatus,
 };
 
 const DURATION_TOLERANCE: Duration = Duration::from_millis(600);
@@ -40,6 +44,11 @@ const START_SLACK_NS: u64 = 50_000_000;
 /// identical frame measures 0.10-0.15 on this camera, a fresh one 0.3 and up.
 const REPEAT_DIFF: f64 = 0.2;
 const MAX_REPEAT_PCT: f64 = 1.0;
+/// Preview frames measured over this long; at least this many frames, this rate while
+/// recording (one frame per 66 ms is ~15 fps).
+const PREVIEW_WINDOW: Duration = Duration::from_secs(3);
+const PREVIEW_MIN_FRAMES: u64 = 5;
+const PREVIEW_MIN_FPS: f64 = 8.0;
 
 struct Harness {
     rx: async_channel::Receiver<EngineEvent>,
@@ -402,7 +411,9 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         ),
     ];
     let load_config = config.clone();
+    let preview_on = config.preview;
     let (engine, rx) = studio::start(config).map_err(|e: studio::EngineError| e.to_string())?;
+    let previews = engine.previews();
     let mut h = Harness {
         rx,
         snap: None,
@@ -550,6 +561,19 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
             "fps": p.fps, "native": p.native})).collect::<Vec<_>>(),
         "notes": snap.capacity.notes,
     });
+    let preview_keys = [test_key, native_key, late_key];
+    let mut previews_json = serde_json::json!("disabled (CHINSTRAP_PREVIEW=0)");
+    if preview_on {
+        let idle = check_previews(
+            &mut h,
+            &previews,
+            &preview_keys,
+            silent_key,
+            PreviewOrigin::Idle,
+            None,
+        );
+        previews_json = serde_json::json!({ "idle": idle });
+    }
     // P1-6: a recording window with no frame yet says so.
     engine.send(EngineCommand::Record);
     let waiting = h.wait_for(Duration::from_secs(15), |s| {
@@ -572,7 +596,20 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         matches!(s.phase, Phase::Recording { segment: 1, .. })
     })
     .ok_or("segment 1 never reached Recording")?;
-    h.sleep(Duration::from_secs(3));
+    if preview_on {
+        // Measured over the 3 s segment 1 runs anyway.
+        let recording = check_previews(
+            &mut h,
+            &previews,
+            &preview_keys,
+            silent_key,
+            PreviewOrigin::Recording { segment: 1 },
+            Some(late_key),
+        );
+        previews_json["recording"] = recording;
+    } else {
+        h.sleep(Duration::from_secs(3));
+    }
 
     // 4. Cut.
     engine.send(EngineCommand::Cut);
@@ -589,6 +626,26 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         .ok_or("Stop never reached Idle")?;
     let session = done.session.clone().ok_or("no session after Stop")?;
     eprintln!("selftest: session {}", session.dir.display());
+    if preview_on {
+        // Idle previews come back once the recording pipelines are gone.
+        let t0 = Instant::now();
+        let resumed = loop {
+            let all = preview_keys.iter().all(|k| {
+                previews
+                    .latest(*k)
+                    .is_some_and(|(_, f)| f.origin == PreviewOrigin::Idle && f.at > t0)
+            });
+            if all || t0.elapsed() > Duration::from_secs(10) {
+                break all;
+            }
+            h.sleep(Duration::from_millis(50));
+        };
+        if !resumed {
+            h.fail("previews did not resume within 10 s of Stop");
+        }
+        previews_json["resumed_after_stop_s"] =
+            serde_json::json!(resumed.then(|| t0.elapsed().as_secs_f64()));
+    }
 
     // 6. Validate files. The test file keeps the first caps size (CHINSTRAP_TEST_SIZE).
     let (test_w, test_h) = {
@@ -822,7 +879,8 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         _ => serde_json::json!("skipped: CHINSTRAP_SELFTEST_CAMERA not set"),
     };
     let mut seg_json = seg_json;
-    seg_json.push(serde_json::json!({"plan": plan_json, "load": load_json}));
+    seg_json
+        .push(serde_json::json!({"plan": plan_json, "load": load_json, "previews": previews_json}));
     Ok(summary(
         &h,
         &caps,
@@ -831,6 +889,106 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         targeting_json,
         transcription_json,
     ))
+}
+
+/// Preview frames of `keys` over [`PREVIEW_WINDOW`] (after each has its first one): enough of
+/// them, the newest from `origin`, 480×270-ish BGRA with opaque alpha and real content.
+/// `silent` must have none. Recording: at least [`PREVIEW_MIN_FPS`], except for `late` (whose
+/// source only starts 1.5 s in).
+fn check_previews(
+    h: &mut Harness,
+    hub: &Previews,
+    keys: &[InputKey],
+    silent: InputKey,
+    origin: PreviewOrigin,
+    late: Option<InputKey>,
+) -> serde_json::Value {
+    let what = match origin {
+        PreviewOrigin::Idle => "idle",
+        PreviewOrigin::Recording { .. } => "recording",
+    };
+    let from = Instant::now();
+    let start: Vec<u64> = keys.iter().map(|k| hub.generation(*k)).collect();
+    if origin == PreviewOrigin::Idle {
+        // Idle previews start once the sources are Ready.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && keys.iter().any(|k| hub.generation(*k) == 0) {
+            h.sleep(Duration::from_millis(50));
+        }
+    }
+    let start = if origin == PreviewOrigin::Idle {
+        keys.iter().map(|k| hub.generation(*k)).collect()
+    } else {
+        start
+    };
+    let t0 = Instant::now();
+    h.sleep(PREVIEW_WINDOW);
+    let secs = t0.elapsed().as_secs_f64();
+    let mut out = serde_json::Map::new();
+    for (key, g0) in keys.iter().zip(start) {
+        let Some((g1, frame)) = hub.latest(*key) else {
+            h.fail(format!("{what} preview of {key:?}: no frame"));
+            continue;
+        };
+        let frames = g1 - g0;
+        let fps = frames as f64 / secs;
+        let mut problems = Vec::new();
+        if frames < PREVIEW_MIN_FRAMES {
+            problems.push(format!("{frames} frames in {secs:.1} s"));
+        }
+        if matches!(origin, PreviewOrigin::Recording { .. })
+            && Some(*key) != late
+            && fps < PREVIEW_MIN_FPS
+        {
+            problems.push(format!("{fps:.1} fps"));
+        }
+        if frame.origin != origin || frame.at < from {
+            problems.push(format!("newest frame is from {:?}", frame.origin));
+        }
+        let (w, hh) = (frame.width, frame.height);
+        if w > 480 || hh > 300 || (w != 480 && hh != 300) {
+            problems.push(format!("{w}×{hh}, expected to fit 480×300"));
+        }
+        if frame.bgra.len() != (w * hh * 4) as usize
+            || frame.bgra.as_chunks::<4>().0.iter().any(|p| p[3] != 255)
+        {
+            problems.push("not opaque BGRA".into());
+        }
+        let luma: Vec<f64> = frame
+            .bgra
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| 0.114 * p[0] as f64 + 0.587 * p[1] as f64 + 0.299 * p[2] as f64)
+            .collect();
+        let mean = luma.iter().sum::<f64>() / luma.len().max(1) as f64;
+        let variance =
+            luma.iter().map(|l| (l - mean).powi(2)).sum::<f64>() / luma.len().max(1) as f64;
+        if variance < 100.0 {
+            problems.push(format!("flat image (luma variance {variance:.0})"));
+        }
+        eprintln!(
+            "selftest: {what} preview {key:?}: {frames} frames in {secs:.1} s ({fps:.1} fps),              {w}×{hh}, luma variance {variance:.0}"
+        );
+        for p in &problems {
+            h.fail(format!("{what} preview of {key:?}: {p}"));
+        }
+        out.insert(
+            format!("{key:?}"),
+            serde_json::json!({
+                "frames": frames, "fps": (fps * 10.0).round() / 10.0,
+                "size": format!("{w}×{hh}"), "variance": variance.round(),
+            }),
+        );
+    }
+    let silent_frames = hub.generation(silent);
+    if silent_frames != 0 {
+        h.fail(format!(
+            "{what}: the silent source has {silent_frames} preview frames"
+        ));
+    }
+    out.insert("silent_frames".into(), serde_json::json!(silent_frames));
+    serde_json::Value::Object(out)
 }
 
 /// Segment 1's mic transcript through the engine (only when the model is already present; the

@@ -258,6 +258,28 @@ pub struct Snapshot {
     pub selected_camera_mode: Option<String>,
     pub capacity: CapacityPlan,
     pub vocabulary: VocabularyInfo,
+    /// Live preview state of the selected camera and every source; the frames themselves come
+    /// from `EngineHandle::previews()`, never through the Snapshot.
+    pub previews: Vec<(InputKey, PreviewState)>,
+}
+
+// ---- Live previews -----------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PreviewState { Starting, Live, Unavailable { reason: String } }
+
+/// Where a preview frame came from: an idle preview pipeline, or the recording pipeline's tee.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewOrigin { Idle, Recording { segment: u32 } }
+
+/// One downscaled frame (fits in 480×300): tightly packed BGRA, alpha always 255.
+#[derive(Clone, Debug)]
+pub struct PreviewFrame {
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
+    pub origin: PreviewOrigin,
+    pub at: Instant,
 }
 
 /// Custom vocabulary (P0-2): glossary terms (Whisper prompt) and replacement rules.

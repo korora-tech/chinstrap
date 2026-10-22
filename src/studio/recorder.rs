@@ -6,7 +6,7 @@
 use std::os::fd::RawFd;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,6 +15,7 @@ use gstreamer::prelude::*;
 
 use super::devices::{CameraMode, CameraPath, Entry};
 use super::encoders::{self, Role, set_prop};
+use super::preview::{self, Scaler, Tap};
 use super::stamp::{self, Counters, SizeSlot, UNSET};
 use super::types::{GpuConvert, VideoEncoder};
 
@@ -228,14 +229,16 @@ pub struct InputPipeline {
     pub leaky: Option<gst::Element>,
     /// Variable-rate inputs: the last frame, repeated at the stop time.
     pub tail: Option<Tail>,
+    /// Video inputs with a preview branch: set once that branch has failed.
+    pub preview: Option<Arc<AtomicBool>>,
 }
 
-fn make(factory: &str) -> Result<gst::Element, String> {
+pub(super) fn make(factory: &str) -> Result<gst::Element, String> {
     gst::ElementFactory::make(factory)
         .build()
         .map_err(|e| format!("cannot create {factory}: {e}"))
 }
-fn capsfilter(caps: &str) -> Result<gst::Element, String> {
+pub(super) fn capsfilter(caps: &str) -> Result<gst::Element, String> {
     let caps = gst::Caps::from_str(caps).map_err(|e| format!("bad caps {caps}: {e}"))?;
     gst::ElementFactory::make("capsfilter")
         .property("caps", caps)
@@ -517,7 +520,8 @@ fn install_timed_keyframes(pad: &gst::Pad) {
     });
 }
 
-/// Builds a video input (§5.2 screen/window/test, §5.4 camera) in NULL.
+/// Builds a video input (§5.2 screen/window/test, §5.4 camera) in NULL. With `preview`, a tee
+/// feeds a throttled preview branch (see `preview.rs`) that can never fail the input.
 #[allow(clippy::too_many_arguments)]
 pub fn build_video(
     name: &str,
@@ -528,6 +532,7 @@ pub fn build_video(
     target: VideoTarget,
     clock: &gst::Clock,
     path: &Path,
+    preview: Option<Tap>,
 ) -> Result<InputPipeline, String> {
     let pipeline = new_pipeline(name, clock);
     let base = Arc::new(AtomicU64::new(UNSET));
@@ -593,6 +598,13 @@ pub fn build_video(
     let mut videorate = None;
     let mut repeater_el = None;
     let mut leaky = None;
+    // The preview tee and how its branch scales.
+    let mut tee = None;
+    let tee_el = || -> Result<gst::Element, String> {
+        let t = make("tee")?;
+        set_prop(&t, "allow-not-linked", "true");
+        Ok(t)
+    };
     let format = encoders::encoder_format(enc);
     let (add_borders_missing, effective_convert) = match &camera_mode {
         Some(mode) if mode.path != CameraPath::DmaBuf => {
@@ -601,6 +613,18 @@ pub fn build_video(
             if mode.path == CameraPath::Jpeg {
                 mid.push(make("jpegparse")?);
                 mid.push(make("jpegdec")?);
+            }
+            // Preview: decoded frames at the camera's own size, scaled on the GPU when VA is
+            // available.
+            if preview.is_some() {
+                let t = tee_el()?;
+                let scaler = if convert == Some(GpuConvert::Va) {
+                    Scaler::Va
+                } else {
+                    Scaler::Cpu
+                };
+                tee = Some((t.clone(), scaler));
+                mid.push(t);
             }
             mid.push(queue()?);
             let (block, missing) = convert_block(None, format)?;
@@ -627,6 +651,18 @@ pub fn build_video(
             mid.push(capsfilter(&caps)?);
             let (block, missing) = convert_block(convert, format)?;
             mid.extend(block);
+            // Preview: after the convert step (VA: VAMemory at the recorded size; vapostproc
+            // scales it again on the GPU), ahead of the encoder's leaky queue.
+            if preview.is_some() {
+                let t = tee_el()?;
+                let scaler = if convert == Some(GpuConvert::Va) {
+                    Scaler::Va
+                } else {
+                    Scaler::Cpu
+                };
+                tee = Some((t.clone(), scaler));
+                mid.push(t);
+            }
             let q = leaky_queue()?;
             leaky = Some(q.clone());
             mid.push(q);
@@ -810,6 +846,20 @@ pub fn build_video(
     );
     let (first_pts, last_pts) = mux_probe(&coded, counters.clone())?;
     let bus = pipeline.bus().ok_or("pipeline has no bus")?;
+    let mut preview_killed = None;
+    if let (Some((t, scaler)), Some(tap)) = (&tee, &preview) {
+        preview::isolate_errors(&bus, tap.killed.clone());
+        let attached = t
+            .request_pad_simple("src_%u")
+            .ok_or_else(|| "tee has no request pad".to_string())
+            .and_then(|pad| preview::branch(&pipeline, &pad, tap, Vec::new(), *scaler, true));
+        if let Err(e) = attached {
+            // Recording goes on without a preview.
+            eprintln!("chinstrap: {name}: no preview: {e}");
+            tap.killed.store(true, Ordering::Release);
+        }
+        preview_killed = Some(tap.killed.clone());
+    }
     Ok(InputPipeline {
         pipeline,
         bus,
@@ -828,6 +878,7 @@ pub fn build_video(
         videorate,
         leaky,
         tail,
+        preview: preview_killed,
     })
 }
 
@@ -882,7 +933,95 @@ pub fn build_mic(
         videorate: None,
         leaky: None,
         tail: None,
+        preview: None,
     })
+}
+
+/// Builds an idle preview pipeline (`PipeKind::Preview`) in NULL: the input's source and its
+/// caps, then the preview branch (`preview.rs`). The only consumer of its node while it runs:
+/// recording starts only once it is Null again (D4).
+pub fn build_preview(
+    name: &str,
+    source: VideoSource<'_>,
+    convert: Option<GpuConvert>,
+    tap: &Tap,
+) -> Result<(gst::Pipeline, gst::Bus), String> {
+    let pipeline = gst::Pipeline::with_name(name);
+    // DMA-BUF in: VA scales it directly; GL brings it to system memory as NV12 first (never
+    // RGBA: gldownload of RGBA crashes in Mesa here, see `convert_block`).
+    let dmabuf = |convert: Option<GpuConvert>| -> Result<(Vec<gst::Element>, Scaler), String> {
+        match convert {
+            Some(GpuConvert::Va) => Ok((Vec::new(), Scaler::Va)),
+            Some(GpuConvert::Gl) => Ok((
+                vec![
+                    make("glupload")?,
+                    make("glcolorconvert")?,
+                    capsfilter("video/x-raw(memory:GLMemory),format=NV12")?,
+                    make("gldownload")?,
+                ],
+                Scaler::Cpu,
+            )),
+            None => Err("no GPU conversion path".into()),
+        }
+    };
+    let (chain, pre, scaler) = match source {
+        VideoSource::Test(b) => {
+            // Rendered at preview size and rate: nothing to scale.
+            let src = make("videotestsrc")?;
+            set_prop(&src, "is-live", "true");
+            set_prop(&src, "pattern", "smpte");
+            set_prop(&src, "horizontal-speed", "4");
+            let (w, h) = b.size.unwrap_or_else(test_size);
+            let (w, h) = preview::fit(w, h);
+            let caps = capsfilter(&format!("video/x-raw,width={w},height={h},framerate=15/1"))?;
+            if b.silent {
+                // Selftest: a window that never draws previews nothing either.
+                src_pad(&src)?
+                    .add_probe(gst::PadProbeType::BUFFER, |_, _| gst::PadProbeReturn::Drop);
+            }
+            (vec![src, caps], Vec::new(), Scaler::Cpu)
+        }
+        VideoSource::Portal { fd, node } => {
+            let (pre, scaler) = dmabuf(convert)?;
+            (
+                vec![
+                    portal_source("src", Some(fd), node)?,
+                    capsfilter(SOURCE_CAPS)?,
+                ],
+                pre,
+                scaler,
+            )
+        }
+        VideoSource::Camera { entry, mode } => {
+            let (pre, scaler) = match mode.path {
+                CameraPath::DmaBuf => dmabuf(convert)?,
+                // Only kept frames are decoded.
+                CameraPath::Jpeg => (
+                    vec![make("jpegparse")?, make("jpegdec")?],
+                    if convert == Some(GpuConvert::Va) {
+                        Scaler::Va
+                    } else {
+                        Scaler::Cpu
+                    },
+                ),
+                CameraPath::Raw if convert == Some(GpuConvert::Va) => (Vec::new(), Scaler::Va),
+                CameraPath::Raw => (Vec::new(), Scaler::Cpu),
+            };
+            (
+                vec![
+                    entry.create_source("cam-src")?,
+                    capsfilter(&mode.source_caps())?,
+                ],
+                pre,
+                scaler,
+            )
+        }
+    };
+    link_chain(&pipeline, &chain)?;
+    let from = src_pad(chain.last().expect("source chain"))?;
+    preview::branch(&pipeline, &from, tap, pre, scaler, false)?;
+    let bus = pipeline.bus().ok_or("pipeline has no bus")?;
+    Ok((pipeline, bus))
 }
 
 /// Source-negotiation probe (§5.2): `pipewiresrc ! capsfilter ! <CONVERT> ! outcaps-format !

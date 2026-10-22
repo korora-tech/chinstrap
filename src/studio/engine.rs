@@ -23,6 +23,7 @@ use super::encoders::{self, Role};
 use super::fake;
 use super::plan::{self, Demand, Plan};
 use super::portal::{self, PortalCmd, PortalOutcome};
+use super::preview::{self, Previews, Tap};
 use super::recorder::{self, InputPipeline, Rate, VideoSource};
 use super::session::{self, Manifest, ManifestInput, ManifestQuality, ManifestSegment};
 use super::stamp::{self, Counters, SizeSlot, UNSET};
@@ -42,6 +43,8 @@ pub struct EngineConfig {
     pub frame_rate: FrameRateMode,
     /// Selftest only: behaviour of the test pattern with this source id.
     pub test_sources: Vec<(u32, recorder::TestBehaviour)>,
+    /// Live previews of the camera and sources (`CHINSTRAP_PREVIEW=0` turns them off).
+    pub preview: bool,
 }
 
 /// `CHINSTRAP_FRAME_RATE`: native (default), 60, 30.
@@ -91,6 +94,7 @@ impl EngineConfig {
             fake,
             frame_rate,
             test_sources: Vec::new(),
+            preview: preview::enabled_from_env(),
         }
     }
 }
@@ -137,6 +141,7 @@ pub(super) enum Msg {
 
 struct Inner {
     tx: mpsc::Sender<Msg>,
+    previews: Previews,
     done: Mutex<Option<bool>>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -163,6 +168,11 @@ impl EngineHandle {
         if let Err(mpsc::SendError(Msg::Cmd(cmd))) = self.inner.tx.send(Msg::Cmd(cmd)) {
             eprintln!("chinstrap: engine thread is gone; dropped command {cmd:?}");
         }
+    }
+
+    /// The newest preview frame of every previewed input (the camera and each source).
+    pub fn previews(&self) -> Previews {
+        self.inner.previews.clone()
     }
 
     /// Finalizes any active segment, closes portal sessions, then joins the thread only if it acked.
@@ -238,8 +248,10 @@ pub fn start(
     quiet_pipewire_fraction_criticals();
     let (events_tx, events_rx) = async_channel::unbounded();
     let (tx, rx) = mpsc::channel();
+    let previews = Previews::default();
+    let hub = previews.clone();
     let join = if config.fake {
-        fake::spawn(config, rx, events_tx).map_err(EngineError::Spawn)?
+        fake::spawn(config, rx, events_tx, hub).map_err(EngineError::Spawn)?
     } else {
         let portal = if config.enable_portal {
             Some(portal::spawn(tx.clone()).map_err(EngineError::Spawn)?)
@@ -249,11 +261,12 @@ pub fn start(
         let engine_tx = tx.clone();
         std::thread::Builder::new()
             .name("chinstrap-engine".into())
-            .spawn(move || Engine::new(config, engine_tx, events_tx, portal).run(rx))
+            .spawn(move || Engine::new(config, engine_tx, events_tx, portal, hub).run(rx))
             .map_err(EngineError::Spawn)?
     };
     let inner = Arc::new(Inner {
         tx,
+        previews,
         done: Mutex::new(None),
         join: Mutex::new(Some(join)),
     });
@@ -282,6 +295,10 @@ const DEFAULT_NATIVE_FPS: f64 = 60.0;
 /// Re-read the vocabulary files this often (edits made outside the app).
 const VOCAB_EVERY: Duration = Duration::from_secs(5);
 const NO_FRAMES: &str = "no frames received";
+/// A preview that failed is retried after this long.
+const PREVIEW_RETRY: Duration = Duration::from_secs(5);
+/// An idle preview not Playing by then is given up (and retried).
+const PREVIEW_START: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq)]
 enum Stage {
@@ -325,6 +342,9 @@ enum PipeKind {
         /// Negotiated source caps (size, maximum rate).
         caps: recorder::CapsSlot,
     },
+    /// Idle live preview of one input; `ident` names what it shows (a changed camera or mode
+    /// replaces it). Its failures are silent: it is retried, never reported as an input error.
+    Preview { key: InputKey, ident: String },
 }
 
 struct Pipe {
@@ -350,8 +370,12 @@ impl Pipe {
     fn input(&self) -> Option<(u32, InputKey)> {
         match &self.kind {
             PipeKind::Input { seg, key, .. } => Some((*seg, *key)),
-            PipeKind::Probe { .. } => None,
+            PipeKind::Probe { .. } | PipeKind::Preview { .. } => None,
         }
+    }
+
+    fn is_preview(&self) -> bool {
+        matches!(self.kind, PipeKind::Preview { .. })
     }
 }
 
@@ -445,6 +469,18 @@ struct Engine {
     pending_notices: Vec<Notice>,
     /// Transcription state (§12.3); this thread is its only owner.
     transcription: Transcription,
+    /// Live preview frames (shared with the UI) and whether previews are on at all.
+    previews: Previews,
+    preview_on: bool,
+    /// What `Snapshot::previews` reports per input.
+    preview_state: HashMap<InputKey, PreviewState>,
+    /// Hub generation of each input when its preview (re)started: Live once it moves.
+    preview_seen: HashMap<InputKey, u64>,
+    /// A failed idle preview is not restarted before this.
+    preview_retry: HashMap<InputKey, Instant>,
+    /// Record was accepted while previews ran: the segment starts from tick() once every
+    /// preview pipeline is Null (break-before-make, D4: one consumer per node).
+    record_pending: bool,
 }
 
 fn kind_name(kind: SourceKind) -> &'static str {
@@ -583,6 +619,7 @@ impl Engine {
         tx: mpsc::Sender<Msg>,
         events: async_channel::Sender<EngineEvent>,
         portal: Option<(async_channel::Sender<PortalCmd>, JoinHandle<()>)>,
+        previews: Previews,
     ) -> Self {
         let clock = gst::SystemClock::obtain();
         clock.set_property("clock-type", gst::ClockType::Monotonic);
@@ -754,6 +791,12 @@ impl Engine {
             warned: HashSet::new(),
             pending_notices: notices,
             transcription,
+            previews,
+            preview_on: cfg.preview,
+            preview_state: HashMap::new(),
+            preview_seen: HashMap::new(),
+            preview_retry: HashMap::new(),
+            record_pending: false,
         }
     }
 
@@ -875,6 +918,11 @@ impl Engine {
             selected_camera_mode: self.camera_mode.clone(),
             capacity: self.capacity(),
             vocabulary: self.vocabulary.clone(),
+            previews: self
+                .preview_keys()
+                .into_iter()
+                .filter_map(|k| self.preview_state.get(&k).map(|s| (k, s.clone())))
+                .collect(),
         };
         let _ = self
             .events
@@ -1039,6 +1087,7 @@ impl Engine {
 
     fn can_record(&self) -> bool {
         self.phase == Phase::Idle
+            && !self.record_pending
             && self.shutdown.is_none()
             && !self.portal_busy
             && !self
@@ -1110,7 +1159,7 @@ impl Engine {
             self.reject(&cmd, "the engine is shutting down");
             return;
         }
-        let busy = self.phase.is_busy();
+        let busy = self.phase.is_busy() || self.record_pending;
         match &cmd {
             EngineCommand::RefreshDevices => {
                 self.refresh_devices();
@@ -1384,7 +1433,7 @@ impl Engine {
 
     fn record(&mut self, cmd: &EngineCommand) {
         if !self.can_record() {
-            let why = if self.phase.is_busy() {
+            let why = if self.phase.is_busy() || self.record_pending {
                 "the engine is busy"
             } else if self.portal_busy {
                 "the picker is open"
@@ -1394,6 +1443,20 @@ impl Engine {
             self.reject(cmd, why);
             return;
         }
+        // Break-before-make (D4): every idle preview lets go of its node first; tick() starts
+        // the segment once they are all Null.
+        if self.pipes.iter().any(|p| p.is_preview() && !p.abandoned) {
+            self.record_pending = true;
+            self.stop_previews();
+            self.dirty = true;
+            return;
+        }
+        self.begin_recording();
+    }
+
+    /// Record, once nothing else uses the inputs: opens the session if needed and starts a
+    /// segment with the frozen input set.
+    fn begin_recording(&mut self) {
         if self.session.is_none() {
             match session::create_session_dir(&self.output_root, &session::session_name_now()) {
                 Ok((name, dir)) => {
@@ -1603,6 +1666,9 @@ impl Engine {
                             rec.meta.max_framerate = cap.map(|c| format!("{c}/1"));
                         }
                         None => {}
+                    }
+                    if ip.preview.is_some() {
+                        self.preview_restarted(key);
                     }
                     rec.counters = Some(ip.counters.clone());
                     rec.first = Some(ip.first_pts.clone());
@@ -1827,6 +1893,13 @@ impl Engine {
         plan: &Plan,
     ) -> Result<InputPipeline, String> {
         let name = format!("seg{seg:03}-{}", key_string(key).replace(':', "-"));
+        let tap = self.preview_on.then(|| {
+            Tap::new(
+                &self.previews,
+                key,
+                PreviewOrigin::Recording { segment: seg },
+            )
+        });
         match key {
             InputKey::Microphone => {
                 let e = self
@@ -1863,6 +1936,7 @@ impl Engine {
                     target,
                     &self.clock,
                     path,
+                    tap,
                 )
             }
             InputKey::Source(id) => {
@@ -1900,6 +1974,7 @@ impl Engine {
                     target,
                     &self.clock,
                     path,
+                    tap,
                 )
             }
         }
@@ -2134,6 +2209,7 @@ impl Engine {
             },
             (gst::State::Playing, Stage::Starting) => {
                 let is_probe = matches!(p.kind, PipeKind::Probe { .. });
+                let is_preview = p.is_preview();
                 match &w.result {
                     Ok(()) => {
                         let input = p.input();
@@ -2141,7 +2217,7 @@ impl Engine {
                             p.stage = Stage::Running {
                                 since: Instant::now(),
                             };
-                            if !is_probe {
+                            if !is_probe || is_preview {
                                 p.deadline = None;
                             }
                             if let PipeKind::Input {
@@ -2178,6 +2254,8 @@ impl Engine {
                         let r = reason(p, e);
                         if is_probe {
                             self.probe_done(w.id, Err(r));
+                        } else if is_preview {
+                            self.preview_failed(w.id, r);
                         } else {
                             self.fail_input(w.id, r);
                         }
@@ -2268,6 +2346,7 @@ impl Engine {
                 let caps = caps.lock().ok().and_then(|c| c.clone());
                 self.apply_probe(source, convert, result, caps);
             }
+            PipeKind::Preview { .. } => drop(p.pipeline),
         }
     }
 
@@ -2288,9 +2367,12 @@ impl Engine {
             return;
         };
         let is_probe = matches!(p.kind, PipeKind::Probe { .. });
+        let is_preview = p.is_preview();
         match msg.view() {
             gst::MessageView::Eos(_) => {
-                if is_probe {
+                if is_preview {
+                    self.preview_failed(id, "the preview ended".into());
+                } else if is_probe {
                     self.probe_done(id, Ok(()));
                 } else if matches!(p.stage, Stage::Draining { .. }) {
                     let outcome = p.outcome.clone().unwrap_or(Outcome::Complete);
@@ -2323,7 +2405,9 @@ impl Engine {
                 if p.last_error.is_none() {
                     p.last_error = Some(text.clone());
                 }
-                if is_probe {
+                if is_preview {
+                    self.preview_failed(id, text);
+                } else if is_probe {
                     self.probe_done(id, Err(text));
                 } else {
                     match p.stage {
@@ -2652,6 +2736,296 @@ impl Engine {
         }
     }
 
+    // ---- previews ----------------------------------------------------------------------------
+
+    /// Inputs with a preview: the selected camera, then every source.
+    fn preview_keys(&self) -> Vec<InputKey> {
+        self.selected_camera
+            .map(|_| InputKey::Camera)
+            .into_iter()
+            .chain(self.sources.iter().map(|s| InputKey::Source(s.info.id)))
+            .collect()
+    }
+
+    /// Idle previews to run now, each with what it shows. Every source of a capture that is
+    /// still being checked waits: its probe is the node's consumer until then.
+    fn preview_wanted(&self) -> Vec<(InputKey, String)> {
+        let mut out = Vec::new();
+        if self.input_recordable(InputKey::Camera) {
+            out.push((
+                InputKey::Camera,
+                format!("{:?}/{:?}", self.selected_camera, self.camera_mode),
+            ));
+        }
+        for s in &self.sources {
+            let checking = s.info.capture.is_some()
+                && self.sources.iter().any(|o| {
+                    o.info.capture == s.info.capture && o.info.state == SourceState::Checking
+                });
+            if !checking && self.input_recordable(InputKey::Source(s.info.id)) {
+                out.push((InputKey::Source(s.info.id), format!("{:?}", s.convert)));
+            }
+        }
+        out
+    }
+
+    fn set_preview_state(&mut self, key: InputKey, state: PreviewState) {
+        if self.preview_state.get(&key) != Some(&state) {
+            self.preview_state.insert(key, state);
+            self.dirty = true;
+        }
+    }
+
+    /// A preview of `key` (idle pipeline or recording branch) started; Live with its next frame.
+    fn preview_restarted(&mut self, key: InputKey) {
+        self.preview_seen.insert(key, self.previews.generation(key));
+        self.set_preview_state(key, PreviewState::Starting);
+    }
+
+    fn stop_previews(&mut self) {
+        let ids: Vec<u64> = self
+            .pipes
+            .iter()
+            .filter(|p| p.is_preview() && !p.abandoned)
+            .map(|p| p.id)
+            .collect();
+        for id in ids {
+            self.request_null(id, None);
+        }
+    }
+
+    /// An idle preview failed: stopped and retried after [`PREVIEW_RETRY`]. Never a notice and
+    /// never an input failure.
+    fn preview_failed(&mut self, id: u64, reason: String) {
+        let key = match self.pipes.iter().find(|p| p.id == id) {
+            Some(p) if p.stage == Stage::Nulling => return,
+            Some(Pipe {
+                kind: PipeKind::Preview { key, .. },
+                ..
+            }) => *key,
+            _ => return,
+        };
+        eprintln!("chinstrap: preview of {key:?} stopped: {reason}");
+        self.preview_retry
+            .insert(key, Instant::now() + PREVIEW_RETRY);
+        self.set_preview_state(key, PreviewState::Unavailable { reason });
+        self.request_null(id, None);
+    }
+
+    fn start_preview(&mut self, key: InputKey, ident: String) {
+        let tap = Tap::new(&self.previews, key, PreviewOrigin::Idle);
+        let name = format!("preview-{}", key_string(key).replace(':', "-"));
+        let mut capture = None;
+        let built = match key {
+            InputKey::Microphone => return,
+            InputKey::Camera => match self.selected_camera.and_then(|id| self.devices.camera(id)) {
+                Some(entry) => match entry.mode(self.camera_mode.as_deref()) {
+                    Some(mode) => recorder::build_preview(
+                        &name,
+                        VideoSource::Camera {
+                            entry,
+                            mode: mode.clone(),
+                        },
+                        self.caps.gpu_convert,
+                        &tap,
+                    ),
+                    None => Err("camera is not usable".into()),
+                },
+                None => Err("the camera is gone".into()),
+            },
+            InputKey::Source(id) => {
+                let Some(s) = self.sources.iter().find(|s| s.info.id == id) else {
+                    return;
+                };
+                let convert = s.convert.or(self.caps.gpu_convert);
+                match s.info.kind {
+                    SourceKind::TestPattern => recorder::build_preview(
+                        &name,
+                        VideoSource::Test(self.test_behaviour(id)),
+                        convert,
+                        &tap,
+                    ),
+                    _ => {
+                        capture = s.info.capture;
+                        let fd = s
+                            .info
+                            .capture
+                            .and_then(|c| self.captures.get(&c))
+                            .and_then(|c| c.fd.as_ref())
+                            .map(|f| f.as_raw_fd());
+                        match (fd, s.node) {
+                            (Some(fd), Some(node)) => recorder::build_preview(
+                                &name,
+                                VideoSource::Portal { fd, node },
+                                convert,
+                                &tap,
+                            ),
+                            _ => Err("the screen share is gone".into()),
+                        }
+                    }
+                }
+            }
+        };
+        match built {
+            Ok((pipeline, bus)) => {
+                let id = self.next_pipe;
+                self.next_pipe += 1;
+                self.pipes.push(Pipe {
+                    id,
+                    capture,
+                    pipeline: pipeline.clone(),
+                    bus,
+                    kind: PipeKind::Preview { key, ident },
+                    stage: Stage::Starting,
+                    deadline: Some(Instant::now() + PREVIEW_START),
+                    outcome: None,
+                    abandoned: false,
+                    last_error: None,
+                    in_flight: None,
+                    null_pending: false,
+                });
+                self.spawn_state(id, pipeline, gst::State::Playing);
+                self.preview_restarted(key);
+            }
+            Err(reason) => {
+                self.preview_retry
+                    .insert(key, Instant::now() + PREVIEW_RETRY);
+                self.set_preview_state(key, PreviewState::Unavailable { reason });
+            }
+        }
+    }
+
+    /// Record accepted while previews ran: starts the segment once every preview is Null.
+    fn start_pending_record(&mut self) {
+        if !self.record_pending || self.pipes.iter().any(|p| p.is_preview() && !p.abandoned) {
+            return;
+        }
+        self.record_pending = false;
+        self.dirty = true;
+        if self.can_record() {
+            self.begin_recording();
+        } else {
+            self.notice(
+                Severity::Warning,
+                None,
+                "Recording did not start: nothing recordable is selected any more",
+            );
+        }
+    }
+
+    /// Runs exactly the idle previews that are wanted (none while busy) and keeps
+    /// `Snapshot::previews` current.
+    fn reconcile_previews(&mut self) {
+        let keys = self.preview_keys();
+        self.previews.retain(&keys);
+        self.preview_state.retain(|k, _| keys.contains(k));
+        if !self.preview_on {
+            for key in keys {
+                self.set_preview_state(
+                    key,
+                    PreviewState::Unavailable {
+                        reason: "previews are off (CHINSTRAP_PREVIEW=0)".into(),
+                    },
+                );
+            }
+            return;
+        }
+        let idle = self.phase == Phase::Idle && !self.record_pending && self.shutdown.is_none();
+        let wanted = if idle {
+            self.preview_wanted()
+        } else {
+            Vec::new()
+        };
+        let stale: Vec<u64> = self
+            .pipes
+            .iter()
+            .filter(|p| !p.abandoned && p.stage != Stage::Nulling)
+            .filter(|p| match &p.kind {
+                PipeKind::Preview { key, ident } => {
+                    !wanted.iter().any(|(k, i)| k == key && i == ident)
+                }
+                _ => false,
+            })
+            .map(|p| p.id)
+            .collect();
+        for id in stale {
+            self.request_null(id, None);
+        }
+        let now = Instant::now();
+        for (key, ident) in &wanted {
+            // One consumer per node: a replaced preview is started once the old one is gone.
+            let present = self
+                .pipes
+                .iter()
+                .any(|p| matches!(&p.kind, PipeKind::Preview { key: k, .. } if k == key));
+            if !present && self.preview_retry.get(key).is_none_or(|t| now >= *t) {
+                self.start_preview(*key, ident.clone());
+            }
+        }
+        // A recording branch that failed (the recording goes on).
+        let killed: Vec<InputKey> = self
+            .pipes
+            .iter()
+            .filter_map(|p| match &p.kind {
+                PipeKind::Input { key, rec, .. }
+                    if rec
+                        .preview
+                        .as_ref()
+                        .is_some_and(|k| k.load(Ordering::Acquire)) =>
+                {
+                    Some(*key)
+                }
+                _ => None,
+            })
+            .collect();
+        for key in killed {
+            self.set_preview_state(
+                key,
+                PreviewState::Unavailable {
+                    reason: "the preview stopped; recording continues".into(),
+                },
+            );
+        }
+        for key in keys {
+            match self.preview_state.get(&key) {
+                Some(PreviewState::Starting)
+                    if self.previews.generation(key)
+                        > self.preview_seen.get(&key).copied().unwrap_or(0) =>
+                {
+                    self.set_preview_state(key, PreviewState::Live);
+                }
+                // Idle and not previewable: say why.
+                _ if idle
+                    && !wanted.iter().any(|(k, _)| *k == key)
+                    && self.preview_retry.get(&key).is_none_or(|t| now >= *t) =>
+                {
+                    let state = self.preview_blocked(key);
+                    self.set_preview_state(key, state);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Why an idle input has no preview.
+    fn preview_blocked(&self, key: InputKey) -> PreviewState {
+        let source = match key {
+            InputKey::Source(id) => self.sources.iter().find(|s| s.info.id == id),
+            _ => None,
+        };
+        match source.map(|s| &s.info.state) {
+            Some(SourceState::Checking | SourceState::Ready) => PreviewState::Starting,
+            Some(SourceState::Unsupported { reason } | SourceState::Lost { reason }) => {
+                PreviewState::Unavailable {
+                    reason: reason.clone(),
+                }
+            }
+            None => PreviewState::Unavailable {
+                reason: "this input cannot be previewed".into(),
+            },
+        }
+    }
+
     // ---- periodic work -----------------------------------------------------------------------
 
     fn tick(&mut self) {
@@ -2666,6 +3040,8 @@ impl Engine {
         }
         self.check_deadlines();
         self.drive_phase();
+        self.start_pending_record();
+        self.reconcile_previews();
         self.start_gl_retries();
         self.release_idle_captures();
         self.periodic();
@@ -2679,7 +3055,7 @@ impl Engine {
             if p.abandoned {
                 continue;
             }
-            let probe = matches!(p.kind, PipeKind::Probe { .. });
+            let probe = matches!(p.kind, PipeKind::Probe { .. } | PipeKind::Preview { .. });
             match &p.stage {
                 Stage::Draining {
                     inject_at,
@@ -2778,7 +3154,13 @@ impl Engine {
                         };
                     }
                 }
-                _ if probe => self.probe_done(id, Err("no frames within 3 s".into())),
+                _ if probe => {
+                    if self.pipes.iter().any(|p| p.id == id && p.is_preview()) {
+                        self.preview_failed(id, "did not start".into());
+                    } else {
+                        self.probe_done(id, Err("no frames within 3 s".into()));
+                    }
+                }
                 Stage::Pausing | Stage::Starting => {
                     self.fail_input(id, "did not start within 3 s".into())
                 }
@@ -3118,11 +3500,12 @@ impl Engine {
         {
             self.shutdown_clean = false;
         }
-        // Stop probes; their results no longer matter.
+        // Stop probes and previews; their results no longer matter.
+        self.record_pending = false;
         let probes: Vec<u64> = self
             .pipes
             .iter()
-            .filter(|p| matches!(p.kind, PipeKind::Probe { .. }))
+            .filter(|p| matches!(p.kind, PipeKind::Probe { .. } | PipeKind::Preview { .. }))
             .map(|p| p.id)
             .collect();
         for id in probes {
