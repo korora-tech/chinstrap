@@ -1,16 +1,18 @@
 //! Stateless building blocks for `StudioView`. Disabled controls never get an `on_click`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    App, ClickEvent, Div, ElementId, FocusHandle, FontWeight, SharedString, Stateful, Window, div,
-    prelude::*, px, relative, rgb,
+    App, ClickEvent, Div, ElementId, FocusHandle, FontWeight, ObjectFit, RenderImage, SharedString,
+    Stateful, Window, div, img, prelude::*, px, relative, rgb,
 };
 
 use super::theme::*;
 use crate::studio::{
-    InputFile, InputQuality, InputStatus, Notice, SegmentStatus, SegmentSummary, Severity,
-    SourceInfo, SourceKind, SourceState, TranscribeStage, TranscriptStatus, WhisperBackend,
+    InputFile, InputQuality, InputStatus, Notice, PreviewState, SegmentStatus, SegmentSummary,
+    Severity, SourceInfo, SourceKind, SourceState, TranscribeStage, TranscriptStatus,
+    WhisperBackend,
 };
 
 pub type OnClick = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
@@ -98,6 +100,77 @@ pub fn icon_button(
             .on_click(handler),
         None => el,
     }
+}
+
+/// Live preview tile (16:9 box, the frame fitted inside). `image` is the newest frame, shown
+/// even when the preview has since stopped; `state` explains a missing or stale one.
+pub fn preview_tile(
+    label: impl Into<SharedString>,
+    image: Option<Arc<RenderImage>>,
+    state: Option<&PreviewState>,
+    recording: bool,
+) -> Div {
+    let status: Option<(SharedString, u32)> = match state {
+        Some(PreviewState::Live) => None,
+        Some(PreviewState::Unavailable { reason }) => {
+            Some((format!("No preview: {reason}").into(), AMBER))
+        }
+        Some(PreviewState::Starting) | None if image.is_none() => {
+            Some(("Starting preview…".into(), MUTED))
+        }
+        Some(PreviewState::Starting) | None => None,
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .w(px(240.0))
+        .child(
+            div()
+                .relative()
+                .w_full()
+                .h(px(135.0))
+                .rounded_md()
+                .overflow_hidden()
+                .border_1()
+                .border_color(rgb(if recording { RED } else { BORDER }))
+                .bg(rgb(0x07090d))
+                .when_some(image, |d, image| {
+                    d.child(img(image).size_full().object_fit(ObjectFit::Contain))
+                })
+                .when_some(status, |d, (text, color)| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .right_0()
+                            .px_2()
+                            .py_1()
+                            .bg(gpui::rgba(0x0d0f14cc))
+                            .text_size(px(10.0))
+                            .text_color(rgb(color))
+                            .child(text),
+                    )
+                })
+                .when(recording, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .top(px(6.0))
+                            .left(px(6.0))
+                            .child(badge("REC", RED)),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(SECONDARY))
+                .truncate()
+                .child(label.into()),
+        )
 }
 
 /// Uppercase section caption, matching the explorer's "BROWSE LIBRARY" style.

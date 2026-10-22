@@ -3,29 +3,65 @@
 //! The view never reconstructs engine state: every `Snapshot` replaces the previous one, and
 //! the engine re-validates every command, so disabled controls are a convenience, not a gate.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
     App, ClickEvent, Context, Div, EventEmitter, FocusHandle, Focusable, FontWeight, KeyDownEvent,
-    ScrollHandle, SharedString, Stateful, Task, Window, div, prelude::*, px, rgb,
+    RenderImage, ScrollHandle, SharedString, Stateful, Task, Window, div, prelude::*, px, rgb,
 };
+use smallvec::SmallVec;
 
 use super::theme::*;
 use super::widgets::{
     ButtonStyle, OnClick, SegmentActions, SourceRowExtras, badge, button, caption, checkbox_row,
     chip, format_bytes, format_duration, format_fps, format_rate, icon_button, level_meter,
-    notice_row, progress_bar, radio_row, segment_row, segmented, source_row, text_field,
+    notice_row, preview_tile, progress_bar, radio_row, segment_row, segmented, source_row,
+    text_field,
 };
 use super::{Cut, ToggleRecord};
 use crate::studio::{
     CaptureId, DeviceId, DeviceInfo, DeviceKind, EngineCommand, EngineEvent, EngineHandle,
     FrameRateMode, InputKey, InputStatus, ModelState, Notice, Phase, PlannedInput,
-    PortalAvailability, SegmentStatus, SegmentSummary, Snapshot, SourceId, SourceInfo, SourceKind,
-    SourceState, TranscriptStatus, WhisperBackend,
+    PortalAvailability, PreviewFrame, Previews, SegmentStatus, SegmentSummary, Snapshot, SourceId,
+    SourceInfo, SourceKind, SourceState, TranscriptStatus, WhisperBackend,
 };
 
 const NOTICE_CAP: usize = 50;
 const CLOSE_FALLBACK: Duration = Duration::from_secs(10);
+/// New preview frames redraw the view at most this often.
+const PREVIEW_REDRAW: Duration = Duration::from_millis(66);
+
+/// A preview on screen: the frame drawn now and the one before it. As in Zed's
+/// `remote_video_track_view`, the previous image is kept one more frame (the last scene may
+/// still use it) and then dropped from the GPU sprite atlas, which would otherwise keep every
+/// frame ever shown.
+struct Shown {
+    generation: u64,
+    current: Arc<RenderImage>,
+    previous: Option<Arc<RenderImage>>,
+}
+
+impl Shown {
+    fn release(self, window: &mut Window) {
+        if let Some(previous) = self.previous
+            && previous.id != self.current.id
+        {
+            let _ = window.drop_image(previous);
+        }
+        let _ = window.drop_image(self.current);
+    }
+}
+
+/// gpui images are BGRA, which is what the engine delivers.
+fn render_image(frame: &PreviewFrame) -> Option<Arc<RenderImage>> {
+    let buffer = image::RgbaImage::from_raw(frame.width, frame.height, frame.bgra.clone())?;
+    Some(Arc::new(RenderImage::new(SmallVec::from_elem(
+        image::Frame::new(buffer),
+        1,
+    ))))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseIntent {
@@ -85,8 +121,11 @@ pub struct StudioView {
     term: Draft,
     rule_from: Draft,
     rule_to: Draft,
+    previews: Previews,
+    shown: HashMap<InputKey, Shown>,
     _events: Task<()>,
     _ticker: Option<Task<()>>,
+    _preview_redraw: Task<()>,
 }
 
 impl EventEmitter<CloseWindowNow> for StudioView {}
@@ -95,9 +134,25 @@ impl StudioView {
     pub fn new(
         engine: EngineHandle,
         events: async_channel::Receiver<EngineEvent>,
-        _w: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let previews = engine.previews();
+        let wake = previews.changed();
+        let _preview_redraw = cx.spawn(async move |this, cx| {
+            while wake.recv().await.is_ok() {
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+                cx.background_executor().timer(PREVIEW_REDRAW).await;
+            }
+        });
+        cx.on_release_in(window, |this: &mut Self, window, _| {
+            for (_, shown) in this.shown.drain() {
+                shown.release(window);
+            }
+        })
+        .detach();
         let _events = cx.spawn(async move |this, cx| {
             while let Ok(ev) = events.recv().await {
                 if this
@@ -123,8 +178,11 @@ impl StudioView {
             term: Draft::new(cx),
             rule_from: Draft::new(cx),
             rule_to: Draft::new(cx),
+            previews,
+            shown: HashMap::new(),
             _events,
             _ticker: None,
+            _preview_redraw,
         }
     }
 
@@ -804,6 +862,99 @@ impl StudioView {
                         .child("Selection is locked until the engine is idle."),
                 )
             })
+    }
+
+    /// Brings `shown` up to date with the newest frame of each previewed input.
+    fn refresh_previews(&mut self, keys: &[InputKey], window: &mut Window) {
+        let gone: Vec<InputKey> = self
+            .shown
+            .keys()
+            .filter(|k| !keys.contains(k))
+            .copied()
+            .collect();
+        for key in gone {
+            if let Some(shown) = self.shown.remove(&key) {
+                shown.release(window);
+            }
+        }
+        for &key in keys {
+            let Some((generation, frame)) = self.previews.latest(key) else {
+                if let Some(shown) = self.shown.remove(&key) {
+                    shown.release(window);
+                }
+                continue;
+            };
+            if self
+                .shown
+                .get(&key)
+                .is_some_and(|s| s.generation == generation)
+            {
+                continue;
+            }
+            let Some(image) = render_image(&frame) else {
+                continue;
+            };
+            match self.shown.get_mut(&key) {
+                Some(shown) => {
+                    if let Some(previous) = shown.previous.take()
+                        && previous.id != shown.current.id
+                    {
+                        let _ = window.drop_image(previous);
+                    }
+                    shown.previous = Some(std::mem::replace(&mut shown.current, image));
+                    shown.generation = generation;
+                }
+                None => {
+                    self.shown.insert(
+                        key,
+                        Shown {
+                            generation,
+                            current: image,
+                            previous: None,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Live previews of the selected camera and every source (what each file will show).
+    fn previews_section(&mut self, snap: &Snapshot, window: &mut Window) -> Option<Div> {
+        let keys: Vec<InputKey> = snap.previews.iter().map(|(k, _)| *k).collect();
+        self.refresh_previews(&keys, window);
+        if keys.is_empty() {
+            return None;
+        }
+        let recorded = |key: InputKey| {
+            matches!(snap.phase, Phase::Recording { segment, .. }
+            if snap.session.as_ref().is_some_and(|s| s.segments.iter().any(|g| {
+                g.index == segment
+                    && g.files.iter().any(|f| f.input == key && f.status == InputStatus::Recording)
+            })))
+        };
+        let mut tiles = div().flex().flex_wrap().gap_3();
+        for (key, state) in &snap.previews {
+            tiles = tiles.child(preview_tile(
+                Self::input_label(snap, *key),
+                self.shown.get(key).map(|s| s.current.clone()),
+                Some(state),
+                recorded(*key),
+            ));
+        }
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .text_size(px(16.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(TEXT))
+                        .child("Preview"),
+                )
+                .child(tiles),
+        )
     }
 
     /// Why a Ready source still cannot record, from the engine capabilities.
@@ -1657,6 +1808,7 @@ impl Render for StudioView {
             );
         };
 
+        let previews = self.previews_section(&snap, window);
         let main = div()
             .id("studio-scroll")
             .flex_1()
@@ -1669,6 +1821,7 @@ impl Render for StudioView {
             .flex()
             .flex_col()
             .gap_6()
+            .when_some(previews, |d, p| d.child(p))
             .child(self.sources_section(&snap, cx))
             .child(self.output_section(&snap))
             .child(self.transcription_section(&snap, cx))
