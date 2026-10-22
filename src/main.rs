@@ -56,8 +56,8 @@ fn main() {
 
     application().run(move |cx: &mut App| {
         cx.bind_keys([
-            KeyBinding::new("r", ToggleRecord, Some("Studio")),
-            KeyBinding::new("c", Cut, Some("Studio")),
+            KeyBinding::new("r", ToggleRecord, Some("Studio && !TextField")),
+            KeyBinding::new("c", Cut, Some("Studio && !TextField")),
             KeyBinding::new("ctrl-q", Quit, None),
             KeyBinding::new("ctrl-1", ShowStudio, None),
             KeyBinding::new("ctrl-2", ShowExplorer, None),

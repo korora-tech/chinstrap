@@ -3,14 +3,14 @@
 use std::time::Duration;
 
 use gpui::{
-    App, ClickEvent, Div, ElementId, FontWeight, SharedString, Stateful, Window, div, prelude::*,
-    px, relative, rgb,
+    App, ClickEvent, Div, ElementId, FocusHandle, FontWeight, SharedString, Stateful, Window, div,
+    prelude::*, px, relative, rgb,
 };
 
 use super::theme::*;
 use crate::studio::{
-    InputFile, InputStatus, Notice, SegmentStatus, SegmentSummary, Severity, SourceInfo,
-    SourceKind, SourceState, TranscribeStage, TranscriptStatus, WhisperBackend,
+    InputFile, InputQuality, InputStatus, Notice, SegmentStatus, SegmentSummary, Severity,
+    SourceInfo, SourceKind, SourceState, TranscribeStage, TranscriptStatus, WhisperBackend,
 };
 
 pub type OnClick = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
@@ -352,25 +352,169 @@ fn source_kind_tag(kind: SourceKind) -> &'static str {
     }
 }
 
-/// One source row. `blocked` explains why a Ready source still cannot record.
-pub fn source_row(info: &SourceInfo, blocked: Option<String>, on_remove: Option<OnClick>) -> Div {
+/// Formats a rational rate: "144", "29.97".
+pub fn format_rate(n: i32, d: i32) -> String {
+    if d <= 0 {
+        return "?".into();
+    }
+    format_fps(n as f64 / d as f64)
+}
+
+/// "60", "29.97", "143.86" without trailing zeros.
+pub fn format_fps(fps: f64) -> String {
+    let s = format!("{fps:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// A row of pill choices (frame-rate modes). Options without a click are disabled.
+pub fn segmented(options: Vec<(Stateful<Div>, bool, Option<OnClick>)>) -> Div {
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .gap(px(2.0))
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(BORDER))
+        .bg(rgb(SIDEBAR))
+        .p(px(2.0))
+        .children(options.into_iter().map(|(el, selected, click)| {
+            let enabled = click.is_some();
+            let el = el
+                .rounded_sm()
+                .px(px(7.0))
+                .py(px(2.0))
+                .text_size(px(10.0))
+                .font_weight(if selected {
+                    FontWeight::SEMIBOLD
+                } else {
+                    FontWeight::MEDIUM
+                })
+                .text_color(rgb(match (selected, enabled) {
+                    (true, _) => ACCENT_TEXT,
+                    (false, true) => SECONDARY,
+                    (false, false) => DISABLED,
+                }))
+                .when(selected, |d| d.bg(rgb(SELECTED)));
+            match click {
+                Some(handler) => el
+                    .hover(|s| s.bg(rgb(HOVER)).cursor_pointer())
+                    .on_click(handler),
+                None => el,
+            }
+        }))
+}
+
+/// A single-line text field drawn by hand (GPUI has no stock input). The caller attaches the
+/// key handler; `focused` shows the caret and the accent border.
+pub fn text_field(
+    id: impl Into<ElementId>,
+    focus: &FocusHandle,
+    value: &str,
+    placeholder: &'static str,
+    focused: bool,
+) -> Stateful<Div> {
+    let empty = value.is_empty();
+    div()
+        .id(id)
+        .key_context("TextField")
+        .track_focus(focus)
+        .flex_1()
+        .min_w(px(80.0))
+        .flex()
+        .items_center()
+        .h(px(28.0))
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(if focused { SELECTED_BORDER } else { BORDER }))
+        .bg(rgb(if focused { PANEL_RAISED } else { SIDEBAR }))
+        .px_2()
+        .overflow_hidden()
+        .cursor_text()
+        .text_size(px(11.0))
+        .child(
+            div()
+                .min_w(px(0.0))
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis_start()
+                .text_color(rgb(if empty { DISABLED } else { TEXT }))
+                .child(if empty && !focused {
+                    placeholder.to_string()
+                } else {
+                    value.to_string()
+                }),
+        )
+        .when(focused, |d| {
+            d.child(div().flex_shrink_0().w(px(1.5)).h(px(14.0)).bg(rgb(ACCENT)))
+        })
+}
+
+/// A removable chip ("Rawkode ✕").
+pub fn chip(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    on_remove: Option<OnClick>,
+) -> Div {
+    div()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .gap_1()
+        .rounded_full()
+        .border_1()
+        .border_color(rgb(0x303646))
+        .bg(rgb(PANEL_RAISED))
+        .pl_2()
+        .pr(px(2.0))
+        .py(px(1.0))
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(TEXT))
+                .child(label.into()),
+        )
+        .child(icon_button(id, "✕", on_remove))
+}
+
+/// What a source row shows besides the `SourceInfo` itself.
+pub struct SourceRowExtras {
+    /// Why a Ready source still cannot record.
+    pub blocked: Option<String>,
+    /// Recording, but no frame has arrived yet.
+    pub waiting: bool,
+    /// Planned rate/encoder ("vah264enc · ≤50 fps"), appended to the detail line.
+    pub plan: Option<String>,
+    /// The frame-rate picker, when the source has one.
+    pub rate_picker: Option<Div>,
+}
+
+/// One source row.
+pub fn source_row(info: &SourceInfo, extras: SourceRowExtras, on_remove: Option<OnClick>) -> Div {
     let lost = matches!(info.state, SourceState::Lost { .. });
     let (state_text, state_color, reason): (&str, u32, Option<String>) = match &info.state {
         SourceState::Checking => ("Checking…", AMBER, None),
-        SourceState::Ready => match blocked {
+        SourceState::Ready if extras.waiting => ("Waiting for first frame", AMBER, None),
+        SourceState::Ready => match extras.blocked {
             Some(why) => ("Not recordable", AMBER, Some(why)),
             None => ("Ready", GREEN, None),
         },
         SourceState::Unsupported { reason } => ("Unsupported", AMBER, Some(reason.clone())),
         SourceState::Lost { reason } => ("Lost", RED, Some(reason.clone())),
     };
-    let mut detail = match info.logical_size {
+    let mut detail = match info.size.or(info.logical_size) {
         Some((w, h)) => format!("{w}×{h}"),
         None => match info.kind {
             SourceKind::TestPattern => "videotestsrc · 1280×720".to_string(),
             _ => "size unknown".to_string(),
         },
     };
+    if let Some((n, d)) = info.refresh {
+        detail = format!("{detail} · {} Hz", format_rate(n, d));
+    }
+    if let Some(plan) = extras.plan {
+        detail = format!("{detail} · {plan}");
+    }
     if let Some(reason) = reason {
         detail = format!("{detail} · {reason}");
     }
@@ -420,6 +564,7 @@ pub fn source_row(info: &SourceInfo, blocked: Option<String>, on_remove: Option<
                         .child(detail),
                 ),
         )
+        .when_some(extras.rate_picker, |d, p| d.child(p))
         .child(badge(state_text, state_color))
         .child(icon_button(
             ("remove-source", info.id.0 as usize),
@@ -451,9 +596,42 @@ pub fn format_bytes(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
+/// One-line quality summary for a video input, and whether anything in it deserves attention
+/// (repeats over 1 %, any dropped frame).
+pub fn quality_summary(q: &InputQuality) -> (String, bool) {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(enc) = q.encoder {
+        parts.push(enc.element_name().to_string());
+    }
+    parts.push(match (q.nominal_fps, q.max_fps) {
+        (Some(f), _) => format!("{} fps CFR", format_fps(f)),
+        (None, Some(m)) => format!("VFR ≤{} fps", format_fps(m)),
+        (None, None) => "VFR".to_string(),
+    });
+    parts.push(format!("{:.1} fps effective", q.effective_fps));
+    parts.push(format!("{:.1}% repeated", q.repeat_pct));
+    let drops = q.dropped_queue + q.dropped_corrupt;
+    parts.push(if q.dropped_corrupt > 0 {
+        format!("{drops} dropped ({} corrupt)", q.dropped_corrupt)
+    } else {
+        format!("{drops} dropped")
+    });
+    parts.push(if q.bitrate_kbps >= 1000 {
+        format!("{:.1} Mb/s", q.bitrate_kbps as f64 / 1000.0)
+    } else {
+        format!("{} kb/s", q.bitrate_kbps)
+    });
+    if let Some(off) = q.start_offset {
+        parts.push(format!("starts +{:.2} s", off.as_secs_f64()));
+    }
+    (parts.join(" · "), q.repeat_pct > 1.0 || drops > 0)
+}
+
 fn file_line(file: &InputFile) -> Div {
+    let quality = file.quality.as_ref().map(quality_summary);
     let (status, color, reason) = match &file.status {
         InputStatus::Starting => ("starting", AMBER, None),
+        InputStatus::Recording if file.waiting_for_frame => ("waiting", AMBER, None),
         InputStatus::Recording => ("recording", RED, None),
         InputStatus::Finalizing => ("finalizing", AMBER, None),
         InputStatus::Complete => ("complete", GREEN, None),
@@ -509,6 +687,24 @@ fn file_line(file: &InputFile) -> Div {
                         .child(status),
                 ),
         )
+        .when(file.waiting_for_frame, |d| {
+            d.child(
+                div()
+                    .pl(px(122.0))
+                    .text_size(px(10.0))
+                    .text_color(rgb(AMBER))
+                    .child("Waiting for first frame"),
+            )
+        })
+        .when_some(quality, |d, (text, warn)| {
+            d.child(
+                div()
+                    .pl(px(122.0))
+                    .text_size(px(10.0))
+                    .text_color(rgb(if warn { AMBER } else { MUTED }))
+                    .child(text),
+            )
+        })
         .when_some(reason, |d, reason| {
             d.child(
                 div()
@@ -523,7 +719,8 @@ fn file_line(file: &InputFile) -> Div {
 /// Per-segment transcript actions. `None` hides (or disables) the matching control.
 #[derive(Default)]
 pub struct SegmentActions {
-    /// "Transcribe" (no transcript) and "Retry" (failed).
+    /// "Transcribe" (no transcript), "Retry" (failed) and "Re-transcribe" (done: uses the
+    /// current vocabulary).
     pub transcribe: Option<OnClick>,
     /// "Cancel" while queued or transcribing.
     pub cancel: Option<OnClick>,
@@ -625,7 +822,15 @@ fn transcript_line(index: u32, status: &TranscriptStatus, actions: SegmentAction
                     .hover(|s| s.text_color(rgb(ACCENT_TEXT)).cursor_pointer())
                     .on_click(open);
             }
-            row = row.child(badge("Transcript", GREEN)).child(link);
+            row = row
+                .child(badge("Transcript", GREEN))
+                .child(link)
+                .child(div().flex_1())
+                .child(icon_button(
+                    ("retranscribe", id),
+                    "Re-transcribe",
+                    actions.transcribe,
+                ));
         }
         TranscriptStatus::Failed { reason } => {
             let first = reason.lines().next().unwrap_or_default().to_string();
@@ -774,5 +979,36 @@ mod tests {
         assert_eq!(db_to_fraction(-60.0), 0.0);
         assert_eq!(db_to_fraction(0.0), 1.0);
         assert_eq!(db_to_fraction(f32::NEG_INFINITY), 0.0);
+        assert_eq!(format_rate(144, 1), "144");
+        assert_eq!(format_rate(30000, 1001), "29.97");
+        assert_eq!(format_fps(25.0), "25");
+    }
+
+    #[test]
+    fn quality_line() {
+        let q = InputQuality {
+            nominal_fps: Some(25.0),
+            effective_fps: 24.96,
+            repeat_pct: 0.07,
+            bitrate_kbps: 41_300,
+            start_offset: Some(Duration::from_millis(280)),
+            ..Default::default()
+        };
+        let (text, warn) = quality_summary(&q);
+        assert_eq!(
+            text,
+            "25 fps CFR · 25.0 fps effective · 0.1% repeated · 0 dropped · 41.3 Mb/s · starts +0.28 s"
+        );
+        assert!(!warn);
+        let q = InputQuality {
+            max_fps: Some(144.0),
+            repeat_pct: 3.0,
+            dropped_corrupt: 2,
+            ..Default::default()
+        };
+        let (text, warn) = quality_summary(&q);
+        assert!(text.starts_with("VFR ≤144 fps"), "{text}");
+        assert!(text.contains("2 dropped (2 corrupt)"), "{text}");
+        assert!(warn);
     }
 }

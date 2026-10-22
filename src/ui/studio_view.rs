@@ -6,22 +6,22 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, ClickEvent, Context, Div, EventEmitter, FocusHandle, Focusable, FontWeight, ScrollHandle,
-    SharedString, Stateful, Task, Window, div, prelude::*, px, rgb,
+    App, ClickEvent, Context, Div, EventEmitter, FocusHandle, Focusable, FontWeight, KeyDownEvent,
+    ScrollHandle, SharedString, Stateful, Task, Window, div, prelude::*, px, rgb,
 };
 
 use super::theme::*;
 use super::widgets::{
-    ButtonStyle, OnClick, SegmentActions, badge, button, caption, checkbox_row, format_bytes,
-    format_duration, icon_button, level_meter, notice_row, progress_bar, radio_row, segment_row,
-    source_row,
+    ButtonStyle, OnClick, SegmentActions, SourceRowExtras, badge, button, caption, checkbox_row,
+    chip, format_bytes, format_duration, format_fps, format_rate, icon_button, level_meter,
+    notice_row, progress_bar, radio_row, segment_row, segmented, source_row, text_field,
 };
 use super::{Cut, ToggleRecord};
 use crate::studio::{
     CaptureId, DeviceId, DeviceInfo, DeviceKind, EngineCommand, EngineEvent, EngineHandle,
-    InputKey, InputStatus, ModelState, Notice, Phase, PortalAvailability, SegmentStatus,
-    SegmentSummary, Snapshot, SourceInfo, SourceKind, SourceState, TranscriptStatus,
-    WhisperBackend,
+    FrameRateMode, InputKey, InputStatus, ModelState, Notice, Phase, PlannedInput,
+    PortalAvailability, SegmentStatus, SegmentSummary, Snapshot, SourceId, SourceInfo, SourceKind,
+    SourceState, TranscriptStatus, WhisperBackend,
 };
 
 const NOTICE_CAP: usize = 50;
@@ -36,6 +36,42 @@ pub enum CloseIntent {
 /// Emitted when a pending `CloseWindow` may proceed; `AppShell` removes the window.
 pub struct CloseWindowNow;
 
+/// The vocabulary panel's text fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Field {
+    Term,
+    RuleFrom,
+    RuleTo,
+}
+
+impl Field {
+    fn next(self) -> Self {
+        match self {
+            Self::Term => Self::RuleFrom,
+            Self::RuleFrom => Self::RuleTo,
+            Self::RuleTo => Self::Term,
+        }
+    }
+    fn prev(self) -> Self {
+        self.next().next()
+    }
+}
+
+/// Text typed into a field but not yet sent to the engine (UI-only state).
+struct Draft {
+    text: String,
+    focus: FocusHandle,
+}
+
+impl Draft {
+    fn new(cx: &mut App) -> Self {
+        Self {
+            text: String::new(),
+            focus: cx.focus_handle(),
+        }
+    }
+}
+
 pub struct StudioView {
     engine: EngineHandle,
     snap: Option<Snapshot>,
@@ -46,6 +82,9 @@ pub struct StudioView {
     close_pending: Option<CloseIntent>,
     /// The Recording segment a close-driven Stop was already sent for (no duplicate Stops).
     stop_sent_for: Option<u32>,
+    term: Draft,
+    rule_from: Draft,
+    rule_to: Draft,
     _events: Task<()>,
     _ticker: Option<Task<()>>,
 }
@@ -81,6 +120,9 @@ impl StudioView {
             scroll: ScrollHandle::new(),
             close_pending: None,
             stop_sent_for: None,
+            term: Draft::new(cx),
+            rule_from: Draft::new(cx),
+            rule_to: Draft::new(cx),
             _events,
             _ticker: None,
         }
@@ -195,6 +237,191 @@ impl StudioView {
 
     fn send_on_click(&self, cmd: EngineCommand, cx: &mut Context<Self>) -> OnClick {
         Box::new(cx.listener(move |this, _: &ClickEvent, _, _| this.engine.send(cmd.clone())))
+    }
+
+    // ----- vocabulary fields ----------------------------------------------------------------
+
+    fn draft(&mut self, field: Field) -> &mut Draft {
+        match field {
+            Field::Term => &mut self.term,
+            Field::RuleFrom => &mut self.rule_from,
+            Field::RuleTo => &mut self.rule_to,
+        }
+    }
+
+    fn focus_field(&mut self, field: Field, window: &mut Window, cx: &mut App) {
+        let handle = self.draft(field).focus.clone();
+        window.focus(&handle, cx);
+    }
+
+    /// Sends what the field holds. Rules need both halves; Enter in "from" moves to "to".
+    fn submit(&mut self, field: Field, window: &mut Window, cx: &mut App) {
+        match field {
+            Field::Term => {
+                let term = self.term.text.trim().to_string();
+                if !term.is_empty() {
+                    self.engine.send(EngineCommand::AddVocabularyTerm(term));
+                    self.term.text.clear();
+                }
+            }
+            Field::RuleFrom | Field::RuleTo => {
+                let from = self.rule_from.text.trim().to_string();
+                let to = self.rule_to.text.trim().to_string();
+                if from.is_empty() {
+                    self.focus_field(Field::RuleFrom, window, cx);
+                } else if to.is_empty() {
+                    self.focus_field(Field::RuleTo, window, cx);
+                } else {
+                    self.engine.send(EngineCommand::AddReplacement { from, to });
+                    self.rule_from.text.clear();
+                    self.rule_to.text.clear();
+                    self.focus_field(Field::RuleFrom, window, cx);
+                }
+            }
+        }
+    }
+
+    /// Minimal line editing: type, Backspace, Ctrl+Backspace/Ctrl+U (clear), Ctrl+V (paste the
+    /// first line), Enter (add), Tab/Shift+Tab (next/previous field), Escape (leave the field).
+    fn field_key(
+        &mut self,
+        field: Field,
+        ev: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ks = &ev.keystroke;
+        let m = ks.modifiers;
+        match ks.key.as_str() {
+            "enter" => self.submit(field, window, cx),
+            "escape" => window.focus(&self.focus_handle, cx),
+            "tab" => {
+                let to = if m.shift { field.prev() } else { field.next() };
+                self.focus_field(to, window, cx);
+            }
+            "backspace" if m.control => self.draft(field).text.clear(),
+            "backspace" => {
+                self.draft(field).text.pop();
+            }
+            "u" if m.control => self.draft(field).text.clear(),
+            "v" if m.control => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                    let line = text.lines().next().unwrap_or_default().to_string();
+                    self.draft(field)
+                        .text
+                        .extend(line.chars().filter(|c| !c.is_control()));
+                }
+            }
+            _ if m.control || m.alt || m.platform => return,
+            _ => match &ks.key_char {
+                Some(ch) => self
+                    .draft(field)
+                    .text
+                    .extend(ch.chars().filter(|c| !c.is_control())),
+                None => return,
+            },
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn field(
+        &self,
+        field: Field,
+        placeholder: &'static str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let draft = match field {
+            Field::Term => &self.term,
+            Field::RuleFrom => &self.rule_from,
+            Field::RuleTo => &self.rule_to,
+        };
+        let id = match field {
+            Field::Term => "vocab-term",
+            Field::RuleFrom => "vocab-from",
+            Field::RuleTo => "vocab-to",
+        };
+        text_field(
+            id,
+            &draft.focus,
+            &draft.text,
+            placeholder,
+            draft.focus.is_focused(window),
+        )
+        .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+            this.field_key(field, ev, window, cx)
+        }))
+    }
+
+    // ----- helpers --------------------------------------------------------------------------
+
+    fn input_label(snap: &Snapshot, key: InputKey) -> String {
+        match key {
+            InputKey::Camera => snap
+                .selected_camera
+                .and_then(|id| snap.cameras.iter().find(|c| c.id == id))
+                .map_or_else(|| "Camera".to_string(), |c| c.name.clone()),
+            InputKey::Microphone => "Microphone".to_string(),
+            InputKey::Source(id) => snap
+                .sources
+                .iter()
+                .find(|s| s.id == id)
+                .map_or_else(|| format!("Source {}", id.0), |s| s.label.clone()),
+        }
+    }
+
+    /// "vah264enc · ≤50 fps" for a planned input.
+    fn plan_text(p: &PlannedInput) -> String {
+        format!(
+            "{} · {}{} fps",
+            p.encoder.element_name(),
+            if p.native { "≤" } else { "" },
+            format_fps(p.fps)
+        )
+    }
+
+    /// The source has an input in the Recording segment that is still waiting for a frame.
+    fn waiting_for_frame(snap: &Snapshot, id: SourceId) -> bool {
+        snap.session.as_ref().is_some_and(|s| {
+            s.segments
+                .iter()
+                .filter(|seg| seg.status == SegmentStatus::Recording)
+                .flat_map(|seg| &seg.files)
+                .any(|f| f.input == InputKey::Source(id) && f.waiting_for_frame)
+        })
+    }
+
+    fn rate_picker(
+        &self,
+        id: &'static str,
+        index: usize,
+        current: FrameRateMode,
+        source: Option<SourceId>,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        segmented(
+            FrameRateMode::ALL
+                .into_iter()
+                .map(|mode| {
+                    let label = match mode {
+                        FrameRateMode::Native => "Native",
+                        FrameRateMode::Cfr60 => "60",
+                        FrameRateMode::Cfr30 => "30",
+                    };
+                    let selected = mode == current;
+                    let click = (enabled && !selected).then(|| {
+                        self.send_on_click(EngineCommand::SetFrameRateMode { source, mode }, cx)
+                    });
+                    (
+                        div().id((id, index * 4 + mode as usize)).child(label),
+                        selected,
+                        click,
+                    )
+                })
+                .collect(),
+        )
     }
 
     // ----- sections -------------------------------------------------------------------------
@@ -314,6 +541,8 @@ impl StudioView {
             }
         } else if recording {
             "Selection is locked while recording".into()
+        } else if idle && snap.capacity.over {
+            "Over the measured encoder capacity: see Sources".into()
         } else {
             "".into()
         };
@@ -378,7 +607,11 @@ impl StudioView {
                     .child(
                         div()
                             .text_size(px(10.0))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(if idle && snap.capacity.over {
+                                AMBER
+                            } else {
+                                MUTED
+                            }))
                             .child(record_hint),
                     )
                     .child(new_session)
@@ -436,6 +669,83 @@ impl StudioView {
                     .text_size(px(10.0))
                     .text_color(rgb(MUTED))
                     .child("No devices found"),
+            );
+        }
+        if kind == DeviceKind::Camera
+            && let Some(cam) = selected.and_then(|id| devices.iter().find(|d| d.id == id))
+        {
+            list = list.child(self.camera_modes(cam, snap, cx));
+        }
+        list
+    }
+
+    /// Mode picker for the selected camera (P2-9): "Automatic" plus every advertised mode.
+    fn camera_modes(&self, cam: &DeviceInfo, snap: &Snapshot, cx: &mut Context<Self>) -> Div {
+        let locked = snap.phase.is_busy();
+        let current = snap.selected_camera_mode.as_deref();
+        let auto = cam.modes.iter().find(|m| m.auto);
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .mt_3()
+            .child(div().px_2().mb_2().child(caption("CAMERA MODE")));
+        if cam.modes.is_empty() {
+            return list.child(
+                div()
+                    .px_2()
+                    .text_size(px(10.0))
+                    .text_color(rgb(MUTED))
+                    .child("No modes advertised"),
+            );
+        }
+        list = list.child(radio_row(
+            ("cam-mode", usize::MAX),
+            "Automatic",
+            auto.map(|m| m.label.clone().into()),
+            None,
+            current.is_none(),
+            (!locked && current.is_some())
+                .then(|| self.send_on_click(EngineCommand::SelectCameraMode(None), cx)),
+        ));
+        for (i, mode) in cam.modes.iter().enumerate() {
+            let selected = current == Some(mode.label.as_str());
+            list = list.child(radio_row(
+                ("cam-mode", i),
+                format!(
+                    "{}×{} @{}",
+                    mode.width,
+                    mode.height,
+                    format_rate(mode.fps_n, mode.fps_d)
+                ),
+                Some(mode.format.clone().into()),
+                None,
+                selected,
+                (!locked && !selected).then(|| {
+                    self.send_on_click(
+                        EngineCommand::SelectCameraMode(Some(mode.label.clone())),
+                        cx,
+                    )
+                }),
+            ));
+        }
+        // 25/50 fps as the best rate usually means a PAL-region camera (Sony: NTSC/PAL switch).
+        let best = cam
+            .modes
+            .iter()
+            .filter(|m| m.fps_d > 0)
+            .map(|m| m.fps_n as f64 / m.fps_d as f64)
+            .fold(0.0, f64::max);
+        if [25.0, 50.0].iter().any(|r| (best - r).abs() < 0.01) {
+            list = list.child(
+                div()
+                    .px_2()
+                    .mt_1()
+                    .text_size(px(9.0))
+                    .text_color(rgb(MUTED))
+                    .child(
+                        "Only 25/50 fps advertised: the camera is probably in PAL mode. \
+                         Switch it to NTSC for 30/60 fps.",
+                    ),
             );
         }
         list
@@ -571,8 +881,25 @@ impl StudioView {
             for src in members {
                 let remove =
                     idle.then(|| self.send_on_click(EngineCommand::RemoveSource(src.id), cx));
-                let blocked = Self::source_blocked(snap, src);
-                group = group.child(source_row(src, blocked, remove));
+                let extras = SourceRowExtras {
+                    blocked: Self::source_blocked(snap, src),
+                    waiting: Self::waiting_for_frame(snap, src.id),
+                    plan: snap
+                        .capacity
+                        .inputs
+                        .iter()
+                        .find(|p| p.input == InputKey::Source(src.id))
+                        .map(Self::plan_text),
+                    rate_picker: Some(self.rate_picker(
+                        "rate",
+                        src.id.0 as usize,
+                        src.frame_rate,
+                        Some(src.id),
+                        idle,
+                        cx,
+                    )),
+                };
+                group = group.child(source_row(src, extras, remove));
             }
             list = list.child(group);
         }
@@ -646,12 +973,286 @@ impl StudioView {
             .child(list)
             .child(
                 div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(SECONDARY))
+                            .child("Frame rate for all windows/screens"),
+                    )
+                    .child(self.rate_picker(
+                        "rate-default",
+                        0,
+                        snap.frame_rate_default,
+                        None,
+                        idle,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(MUTED))
+                            .child(
+                                "Native: variable rate up to the monitor refresh, frames only on change. \
+                                 60/30: constant rate for editors that dislike VFR.",
+                            ),
+                    ),
+            )
+            .when_some(self.capacity_panel(snap), |d, p| d.child(p))
+            .child(
+                div()
                     .text_size(px(10.0))
                     .text_color(rgb(0x737b89))
                     .child(
                         "Windows picked in one dialog share a portal session: closing one ends all of them. \
                          Add windows one pick at a time to keep them independent.",
                     ),
+            )
+    }
+
+    /// The encoder plan for the current selection, with the over-capacity warning shown before
+    /// recording (P1-5).
+    fn capacity_panel(&self, snap: &Snapshot) -> Option<Div> {
+        let plan = &snap.capacity;
+        if plan.inputs.is_empty() && plan.warning.is_none() && plan.notes.is_empty() {
+            return None;
+        }
+        let rows = plan.inputs.iter().map(|p| {
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    div()
+                        .w(px(150.0))
+                        .flex_shrink_0()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(SECONDARY))
+                        .truncate()
+                        .child(Self::input_label(snap, p.input)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(10.0))
+                        .text_color(rgb(MUTED))
+                        .truncate()
+                        .child(format!(
+                            "{} · {}×{} · {}{} fps{}",
+                            p.encoder.element_name(),
+                            p.width,
+                            p.height,
+                            if p.native { "≤" } else { "" },
+                            format_fps(p.fps),
+                            if p.native { " VFR" } else { "" },
+                        )),
+                )
+                .child(
+                    div()
+                        .w(px(60.0))
+                        .flex_shrink_0()
+                        .text_size(px(10.0))
+                        .text_color(rgb(SECONDARY))
+                        .child(format!("{}%", p.load_pct)),
+                )
+        });
+        let load_color = if plan.over { AMBER } else { MUTED };
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(if plan.over { 0x5a3a1a } else { BORDER }))
+                .bg(rgb(if plan.over { 0x2a1a12 } else { PANEL }))
+                .px_3()
+                .py_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .mb_1()
+                        .child(caption("ENCODING PLAN"))
+                        .child(div().text_size(px(10.0)).text_color(rgb(load_color)).child(
+                            format!(
+                                "video engine {}% · software {}%",
+                                plan.gpu_load_pct, plan.cpu_load_pct
+                            ),
+                        )),
+                )
+                .children(rows)
+                .when_some(plan.warning.clone(), |d, w| {
+                    d.child(
+                        div()
+                            .mt_1()
+                            .flex()
+                            .items_start()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .mt(px(4.0))
+                                    .flex_shrink_0()
+                                    .size(px(6.0))
+                                    .rounded_full()
+                                    .bg(rgb(AMBER)),
+                            )
+                            .child(div().text_size(px(11.0)).text_color(rgb(0xffd9a0)).child(w)),
+                    )
+                })
+                .children(plan.notes.iter().map(|n| {
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(rgb(MUTED))
+                        .child(n.clone())
+                })),
+        )
+    }
+
+    /// Glossary terms (the Whisper prompt) and replacement rules (applied after transcription).
+    fn vocabulary_section(&self, snap: &Snapshot, window: &Window, cx: &mut Context<Self>) -> Div {
+        let v = &snap.vocabulary;
+        let muted = |text: String| div().text_size(px(10.0)).text_color(rgb(MUTED)).child(text);
+        let terms = div()
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .children(v.terms.iter().enumerate().map(|(i, t)| {
+                chip(
+                    ("remove-term", i),
+                    t.clone(),
+                    Some(self.send_on_click(EngineCommand::RemoveVocabularyTerm(t.clone()), cx)),
+                )
+            }))
+            .when(v.terms.is_empty(), |d| {
+                d.child(muted("No terms yet.".into()))
+            });
+        let rules = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(v.replacements.iter().enumerate().map(|(i, r)| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(px(11.0))
+                            .child(div().text_color(rgb(SECONDARY)).child(r.from.clone()))
+                            .child(div().text_color(rgb(MUTED)).child("→"))
+                            .child(div().text_color(rgb(TEXT)).child(r.to.clone())),
+                    )
+                    .child(icon_button(
+                        ("remove-rule", i),
+                        "✕",
+                        Some(self.send_on_click(
+                            EngineCommand::RemoveReplacement {
+                                from: r.from.clone(),
+                            },
+                            cx,
+                        )),
+                    ))
+            }))
+            .when(v.replacements.is_empty(), |d| {
+                d.child(muted("No rules yet.".into()))
+            });
+        let add_term: OnClick = Box::new(cx.listener(|this, _: &ClickEvent, window, cx| {
+            this.submit(Field::Term, window, cx);
+            cx.notify();
+        }));
+        let add_rule: OnClick = Box::new(cx.listener(|this, _: &ClickEvent, window, cx| {
+            this.submit(Field::RuleTo, window, cx);
+            cx.notify();
+        }));
+        let sub = |text: &'static str| {
+            div()
+                .text_size(px(11.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(TEXT))
+                .child(text)
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(caption("VOCABULARY"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(PANEL))
+                    .px_3()
+                    .py_2()
+                    .child(sub("Glossary terms"))
+                    .child(muted(
+                        "Names and jargon Whisper should spell this way (sent as its prompt)."
+                            .into(),
+                    ))
+                    .child(terms)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(self.field(Field::Term, "Add a term, e.g. Rawkode", window, cx))
+                            .child(button(
+                                "add-term",
+                                "Add",
+                                None,
+                                ButtonStyle::Secondary,
+                                Some(add_term),
+                            )),
+                    )
+                    .child(div().h(px(1.0)).my_1().bg(rgb(0x1d222b)))
+                    .child(sub("Replacement rules"))
+                    .child(muted(
+                        "Applied after transcription: whole words, any case. The original text stays in the JSON."
+                            .into(),
+                    ))
+                    .child(rules)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(self.field(Field::RuleFrom, "Heard, e.g. raw code", window, cx))
+                            .child(div().text_size(px(11.0)).text_color(rgb(MUTED)).child("→"))
+                            .child(self.field(Field::RuleTo, "Write, e.g. Rawkode", window, cx))
+                            .child(button(
+                                "add-rule",
+                                "Add",
+                                None,
+                                ButtonStyle::Secondary,
+                                Some(add_rule),
+                            )),
+                    )
+                    .children(v.warnings.iter().map(|w| {
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(AMBER))
+                            .child(w.clone())
+                    }))
+                    .child(muted(format!(
+                        "Saved to {} and {}. New transcripts use them; Re-transcribe updates finished segments.",
+                        v.glossary_path.display(),
+                        v.replacements_path.display()
+                    ))),
             )
     }
 
@@ -901,6 +1502,8 @@ impl StudioView {
                     open: Some(Box::new(
                         cx.listener(move |_, _: &ClickEvent, _, cx| cx.reveal_path(&srt)),
                     )),
+                    transcribe: can_transcribe
+                        .then(|| self.send_on_click(EngineCommand::Transcribe { segment }, cx)),
                     ..Default::default()
                 }
             }
@@ -1026,7 +1629,7 @@ impl Focusable for StudioView {
 }
 
 impl Render for StudioView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let root = div()
             .key_context("Studio")
             .track_focus(&self.focus_handle)
@@ -1069,7 +1672,8 @@ impl Render for StudioView {
             .child(self.sources_section(&snap, cx))
             .child(self.output_section(&snap))
             .child(self.transcription_section(&snap, cx))
-            .child(self.segments_section(&snap, cx));
+            .child(self.segments_section(&snap, cx))
+            .child(self.vocabulary_section(&snap, window, cx));
 
         root.when_some(self.banner(&snap), |d, b| d.child(b))
             .child(self.transport(&snap, cx))
