@@ -17,7 +17,7 @@ use whisper_rs::{
 
 use super::output::{self, RawSegment, RawToken, Span, Transcript, r3};
 use super::proto::{self, BackendReq, Job, WorkerLine};
-use super::{decode, prompt};
+use super::{decode, prompt, vocab};
 use crate::studio::session;
 use crate::studio::types::WhisperBackend;
 
@@ -438,7 +438,16 @@ fn run_job(job: &Job) -> Result<WorkerLine, String> {
         }
     }
     progress(proto::STAGE_WRITING, 98);
-    let segments = output::assemble(&raw, ctx.token_eot(), speech.as_deref(), audio_s);
+    let mut segments = output::assemble(&raw, ctx.token_eot(), speech.as_deref(), audio_s);
+    // Replacement rules (§12.6), read per job like the glossary.
+    let (rules, rule_warnings) = vocab::load_replacements(&vocab::replacements_path());
+    for w in &rule_warnings {
+        eprintln!("chinstrap: {w}");
+    }
+    let text_before = output::joined_text(&segments);
+    let replacements = vocab::apply(&mut segments, &rules);
+    let text = output::joined_text(&segments);
+    let text_original = (text != text_before).then_some(text_before);
     let media_name = job
         .media
         .file_name()
@@ -483,6 +492,7 @@ fn run_job(job: &Job) -> Result<WorkerLine, String> {
                 .map(|_| super::model::VAD.name.to_string()),
         },
         prompt: output::PromptInfo {
+            text: (!fitted.text.is_empty()).then(|| fitted.text.clone()),
             hint: fitted.hint.clone(),
             terms_used: fitted.terms_used,
             terms_dropped: fitted.terms_dropped,
@@ -498,7 +508,9 @@ fn run_job(job: &Job) -> Result<WorkerLine, String> {
             rtf: r3(rtf),
         },
         speech: speech.unwrap_or_default(),
-        text: output::joined_text(&segments),
+        text,
+        text_original,
+        replacements,
         segments,
     };
     let words = transcript.word_count();

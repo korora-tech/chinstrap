@@ -57,6 +57,9 @@ pub struct Segment {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    /// The text before replacement rules changed it (§12.6); absent when no rule matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_original: Option<String>,
     pub avg_p: f64,
     pub words: Vec<Word>,
 }
@@ -81,6 +84,9 @@ pub struct EngineInfo {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PromptInfo {
+    /// The prompt given to Whisper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
     pub hint: Option<String>,
     pub terms_used: usize,
     pub terms_dropped: usize,
@@ -115,6 +121,12 @@ pub struct Transcript {
     pub timing: Timing,
     pub speech: Vec<Span>,
     pub text: String,
+    /// The text before replacement rules changed it; absent when no rule matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_original: Option<String>,
+    /// Replacement rules that matched, with their counts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replacements: Vec<super::vocab::Applied>,
     pub segments: Vec<Segment>,
 }
 
@@ -588,6 +600,7 @@ pub fn assemble(
             start: r3(start),
             end: r3(end),
             text,
+            text_original: None,
             avg_p: r3(avg_p),
             words: built
                 .into_iter()
@@ -929,6 +942,7 @@ mod tests {
             start: 1.0,
             end: 6.2,
             text: "Hello. Again".into(),
+            text_original: None,
             avg_p: 0.5,
             words: vec![
                 Word {
@@ -1053,6 +1067,7 @@ mod tests {
             start: words[0].1,
             end: words.last().unwrap().2,
             text: words.iter().map(|w| w.0).collect::<Vec<_>>().join(" "),
+            text_original: None,
             avg_p: 1.0,
             words: words
                 .iter()

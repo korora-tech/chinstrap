@@ -11,6 +11,7 @@ pub mod model;
 mod output;
 pub mod prompt;
 pub mod proto;
+pub mod vocab;
 pub mod wer;
 mod whisper;
 pub mod worker;
