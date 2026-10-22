@@ -6,7 +6,8 @@
 //! is `throttle ! queue leaky=1 ! scale ! BGRx (fits 480×300) ! appsink`.
 //!
 //! A preview never fails an input: the branch's flow returns are swallowed by the throttle
-//! probe, its errors are dropped by a bus sync handler, and its appsink is not a sink as far as
+//! probe, its errors are dropped by a bus sync handler, its tee pad accepts any caps (so it
+//! never narrows what the recording path negotiates), and its appsink is not a sink as far as
 //! the pipeline's EOS and preroll are concerned. Pixels never go through the Snapshot.
 
 use std::collections::HashMap;
@@ -235,6 +236,9 @@ pub fn branch(
         .ok_or("preview queue has no sink pad")?;
     from.link(&peer)
         .map_err(|e| format!("cannot link the preview branch: {e:?}"))?;
+    if detached {
+        hide_caps(from, peer.clone(), tap.killed.clone());
+    }
     gate(from, peer, tap.killed.clone());
     for el in &chain {
         let _ = el.sync_state_with_parent();
@@ -281,6 +285,45 @@ fn gate(pad: &gst::Pad, peer: gst::Pad, killed: Arc<AtomicBool>) {
                 }
             }
         }
+        gst::PadProbeReturn::Handled
+    });
+}
+
+/// Keeps the branch out of the recording path's negotiation. A tee intersects the CAPS
+/// answers of all its src pads and fails its buffers when one pad refuses the caps event, so
+/// the scaler's formats could otherwise narrow (or empty) what the recording path picks. This
+/// pad accepts any caps, and the caps event is handed to `peer` here: a refusal only kills the
+/// branch.
+fn hide_caps(pad: &gst::Pad, peer: gst::Pad, killed: Arc<AtomicBool>) {
+    pad.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |_, info| {
+        let Some(gst::PadProbeData::Query(query)) = info.data.as_mut() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        match query.view_mut() {
+            gst::QueryViewMut::Caps(q) => {
+                let caps = q.filter_owned().unwrap_or_else(gst::Caps::new_any);
+                q.set_result(&caps);
+            }
+            gst::QueryViewMut::AcceptCaps(q) => q.set_result(true),
+            _ => return gst::PadProbeReturn::Ok,
+        }
+        gst::PadProbeReturn::Handled
+    });
+    pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        let caps = matches!(&info.data, Some(gst::PadProbeData::Event(e)) if e.type_() == gst::EventType::Caps);
+        if !caps {
+            return gst::PadProbeReturn::Ok;
+        }
+        let Some(gst::PadProbeData::Event(event)) = info.data.take() else {
+            return gst::PadProbeReturn::Ok;
+        };
+        if !killed.load(Ordering::Acquire)
+            && !peer.send_event(event)
+            && !killed.swap(true, Ordering::AcqRel)
+        {
+            eprintln!("chinstrap: preview branch refused its caps; recording is unaffected");
+        }
+        // Handled marks the sticky event as delivered, so the tee never retries it.
         gst::PadProbeReturn::Handled
     });
 }
@@ -462,5 +505,53 @@ mod tests {
                 assert!(f.bgra.as_chunks::<4>().0.iter().all(|p| p[3] == 255));
             }
         }
+    }
+
+    /// A format chosen at run time that the branch cannot take: the tee still lets the main
+    /// path negotiate it, and only the branch stops.
+    #[test]
+    fn tee_branch_never_narrows_the_main_path_caps() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let src = make("videotestsrc").unwrap();
+        set_prop(&src, "is-live", "true");
+        // No format upstream of the tee: it is fixed only once the pipeline negotiates.
+        let open = capsfilter("video/x-raw,width=640,height=360,framerate=30/1").unwrap();
+        let tee = make("tee").unwrap();
+        let main = capsfilter("video/x-raw,format=I420").unwrap();
+        let sink = make("fakesink").unwrap();
+        set_prop(&sink, "sync", "false");
+        let counted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let c = counted.clone();
+        sink.static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                c.fetch_add(1, Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            });
+        pipeline
+            .add_many([&src, &open, &tee, &main, &sink])
+            .unwrap();
+        gst::Element::link_many([&src, &open, &tee, &main, &sink]).unwrap();
+        let hub = Previews::default();
+        let tap = Tap::new(
+            &hub,
+            InputKey::Camera,
+            PreviewOrigin::Recording { segment: 1 },
+        );
+        // Stands in for a scaler that does not take the format the main path picks.
+        let narrow = capsfilter("video/x-raw,format=GRAY8").unwrap();
+        let pad = tee.request_pad_simple("src_%u").unwrap();
+        branch(&pipeline, &pad, &tap, vec![narrow], Scaler::Cpu, true).unwrap();
+        isolate_errors(&pipeline.bus().unwrap(), tap.killed.clone());
+        pipeline.set_state(gst::State::Playing).unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+        let bus = pipeline.bus().unwrap();
+        let error = bus.pop_filtered(&[gst::MessageType::Error]);
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(error.is_none(), "{error:?}");
+        assert!(counted.load(Ordering::Relaxed) >= 10, "main path stalled");
+        assert!(tap.killed.load(Ordering::Acquire));
+        assert_eq!(hub.generation(InputKey::Camera), 0);
     }
 }
