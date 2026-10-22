@@ -603,8 +603,9 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         if seg.status != SegmentStatus::Complete {
             h.fail(format!("segment {} status {:?}", seg.index, seg.status));
         }
-        if seg.index == 2 && seg.files.iter().any(|f| f.input == silent_key) {
-            h.fail("segment 2 recorded the silent source again after it failed");
+        // A source that sent no frame stays selected on Cut (a static window may redraw later).
+        if seg.index == 2 && !seg.files.iter().any(|f| f.input == silent_key) {
+            h.fail("segment 2 dropped the silent source after Cut");
         }
         for f in &seg.files {
             let critical = f.input == test_key

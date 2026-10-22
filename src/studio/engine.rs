@@ -2881,6 +2881,9 @@ impl Engine {
     fn complete_segment(&mut self, segment: u32) {
         let stop_now = self.clock.time().nseconds();
         let mut survivors = Vec::new();
+        // Inputs that only sent no frame (a static window: niri renders on damage, and each
+        // segment opens a new stream) stay selected for the next Cut segment.
+        let mut keep = Vec::new();
         let mut stop_ns = None;
         if let Some(g) = self.seg_mut(segment) {
             if g.stop_ns.is_none() && g.base_ns.is_some() {
@@ -2889,7 +2892,13 @@ impl Engine {
             stop_ns = g.stop_ns;
             for f in &mut g.files {
                 match f.file.status {
-                    InputStatus::Complete => survivors.push(f.file.input),
+                    InputStatus::Complete => {
+                        survivors.push(f.file.input);
+                        keep.push(f.file.input);
+                    }
+                    InputStatus::Failed { ref reason } if reason == NO_FRAMES => {
+                        keep.push(f.file.input)
+                    }
                     InputStatus::Failed { .. } => {}
                     _ => {
                         f.file.status = InputStatus::Failed {
@@ -2927,8 +2936,9 @@ impl Engine {
         self.dirty = true;
         self.finalize_deadline = None;
         let cut = std::mem::take(&mut self.cut_pending);
-        // Frozen input set minus Failed or Lost (§6 Cut step 1).
-        let next: Vec<InputKey> = survivors
+        // Frozen input set minus Failed or Lost (§6 Cut step 1); "no frames received" is not
+        // a failure of the source itself, so it is kept (in the original order).
+        let next: Vec<InputKey> = keep
             .into_iter()
             .filter(|k| match k {
                 InputKey::Source(id) => self
