@@ -104,6 +104,9 @@ struct Entry {
     manifest: Option<ManifestTranscript>,
     /// Re-queued after a Vulkan fault: this job runs on CPU.
     force_cpu: bool,
+    /// A re-transcription's earlier Done status and manifest entry: its files stay on disk
+    /// until the new job writes over them, so a cancel or failure goes back to them.
+    previous: Option<(TranscriptStatus, Option<ManifestTranscript>)>,
 }
 
 struct Run {
@@ -302,9 +305,12 @@ impl Transcription {
             status: TranscriptStatus::None,
             manifest: None,
             force_cpu: false,
+            previous: None,
         });
         e.media = media;
         e.force_cpu = false;
+        e.previous = matches!(e.status, TranscriptStatus::Done { .. })
+            .then(|| (e.status.clone(), e.manifest.clone()));
         e.status = TranscriptStatus::Queued { deferred: false };
         self.queue.push_back(key.clone());
         self.set_manifest(&key, manifest("queued"));
@@ -354,6 +360,21 @@ impl Transcription {
         }
     }
 
+    /// Puts a re-transcription's segment back to its earlier transcript. False: there was none.
+    fn restore_previous(&mut self, key: &JobKey) -> bool {
+        let Some((status, mt)) = self.entries.get_mut(key).and_then(|e| e.previous.take()) else {
+            return false;
+        };
+        if let Some(e) = self.entries.get_mut(key) {
+            e.status = status;
+        }
+        if let Some(mt) = mt {
+            self.set_manifest(key, mt);
+        }
+        self.dirty = true;
+        true
+    }
+
     fn cancel_key(&mut self, key: &JobKey) -> bool {
         if let Some(pos) = self.queue.iter().position(|k| k == key) {
             self.queue.remove(pos);
@@ -364,10 +385,12 @@ impl Transcription {
         } else {
             return false;
         }
-        if let Some(e) = self.entries.get_mut(key) {
-            e.status = TranscriptStatus::None;
+        if !self.restore_previous(key) {
+            if let Some(e) = self.entries.get_mut(key) {
+                e.status = TranscriptStatus::None;
+            }
+            self.set_manifest(key, manifest("cancelled"));
         }
-        self.set_manifest(key, manifest("cancelled"));
         self.dirty = true;
         true
     }
@@ -726,6 +749,7 @@ impl Transcription {
                         backend,
                     };
                     retried_after_fault = std::mem::take(&mut e.force_cpu);
+                    e.previous = None;
                 }
                 if retried_after_fault {
                     // The same job worked on CPU, so the crash really was Vulkan's.
@@ -768,11 +792,24 @@ impl Transcription {
                             // A CPU retry that fails too: the earlier crash is not counted.
                             e.force_cpu = false;
                         }
-                        self.notices.push((
-                            Severity::Error,
-                            format!("Transcription of segment {} failed: {reason}", key.segment),
-                        ));
-                        self.fail(&key, reason);
+                        if self.restore_previous(&key) {
+                            self.notices.push((
+                                Severity::Error,
+                                format!(
+                                    "Re-transcription of segment {} failed: {reason}; the earlier transcript is kept",
+                                    key.segment
+                                ),
+                            ));
+                        } else {
+                            self.notices.push((
+                                Severity::Error,
+                                format!(
+                                    "Transcription of segment {} failed: {reason}",
+                                    key.segment
+                                ),
+                            ));
+                            self.fail(&key, reason);
+                        }
                     }
                 }
                 self.dirty = true;
@@ -857,6 +894,9 @@ impl Transcription {
             .chain(self.queue.drain(..))
             .collect();
         for k in keys {
+            if self.restore_previous(&k) {
+                continue;
+            }
             if let Some(e) = self.entries.get_mut(&k) {
                 e.status = TranscriptStatus::None;
             }
@@ -1105,6 +1145,33 @@ mod tests {
     }
 
     const DONE_VK: &str = r#"echo '{"type":"backend","backend":"vulkan","device":"GPU"}'; echo '{"type":"progress","stage":"transcribing","percent":50}'; echo '{"type":"done","json":"/s/transcript.json","srt":"/s/mic.srt","vtt":"/s/mic.vtt","language":"en","words":7,"audio_s":3.0,"rtf":0.03}'"#;
+
+    #[test]
+    fn cancelled_retranscription_keeps_the_earlier_transcript() {
+        let mut r = rig("redo", DONE_VK, false);
+        r.session();
+        let key = r.key(1);
+        r.t.command(&EngineCommand::Transcribe { segment: 1 }, &r.segs(1))
+            .unwrap();
+        r.pump_until(false, Duration::from_secs(5), |t| {
+            matches!(t.status(&key), TranscriptStatus::Done { .. })
+        });
+        let done = r.t.status(&key);
+        // Re-transcribe, then cancel before it runs: back to the earlier Done (files kept).
+        r.t.command(&EngineCommand::Transcribe { segment: 1 }, &r.segs(1))
+            .unwrap();
+        assert_eq!(
+            r.t.status(&key),
+            TranscriptStatus::Queued { deferred: false }
+        );
+        r.t.command(
+            &EngineCommand::CancelTranscription { segment: 1 },
+            &r.segs(1),
+        )
+        .unwrap();
+        assert_eq!(r.t.status(&key), done);
+        assert_eq!(r.t.manifest_entry(&key).unwrap().status, "done");
+    }
 
     #[test]
     fn auto_enqueue_runs_to_done() {
