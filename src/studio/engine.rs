@@ -1793,8 +1793,18 @@ impl Engine {
         let demand = self.demands(&[key]).into_iter().next();
         let rate = if a.native {
             let lowered = demand.is_some_and(|d| a.fps < d.fps - 0.5);
+            // Unknown refresh: the plan assumed DEFAULT_NATIVE_FPS, so ask the source for no
+            // more than that (it could otherwise send up to its real refresh, beyond the plan).
+            let unknown = match key {
+                InputKey::Source(id) => self
+                    .sources
+                    .iter()
+                    .find(|s| s.info.id == id)
+                    .is_some_and(|s| s.info.refresh.is_none()),
+                _ => false,
+            };
             Rate::Native {
-                cap: lowered.then(|| a.fps.round() as i32),
+                cap: (lowered || unknown).then(|| a.fps.round() as i32),
                 gop_fps: a.fps.ceil() as i32,
             }
         } else {

@@ -14,8 +14,9 @@
 //! 3. lowers the cap of Native (variable rate) inputs step by step down to 30 fps;
 //!
 //! and reports `over` when that is still not enough (a CFR selection beyond capacity).
-//! H.264 is never planned above 60 fps at more than 1080p (level 5.2, the highest editors and
-//! hardware decoders reliably take).
+//! Native inputs are never planned on H.264 above 60 fps at more than 1080p (level 5.2, the
+//! highest editors and hardware decoders reliably take); a CFR selection beyond it is warned
+//! about. Every lowered Native rate is a pre-record warning (`Plan::warnings`).
 
 use super::encoders::EncoderCap;
 use super::types::{InputKey, VideoCodec, VideoEncoder};
@@ -68,6 +69,9 @@ pub struct Plan {
     pub cpu_load: f64,
     pub over: bool,
     pub notes: Vec<String>,
+    /// Shown before recording even when `over` is false: a Native rate the plan had to lower,
+    /// or an H.264 rate beyond level 5.2.
+    pub warnings: Vec<String>,
 }
 
 impl Plan {
@@ -76,7 +80,7 @@ impl Plan {
     }
 
     pub fn warning(&self) -> Option<String> {
-        self.over.then(|| {
+        let over = self.over.then(|| {
             format!(
                 "The selected inputs need about {:.0}% of the measured video encoder capacity{}: \
                  expect dropped or repeated frames. Use 30 fps for windows/screens, fewer \
@@ -91,7 +95,9 @@ impl Plan {
                     String::new()
                 }
             )
-        })
+        });
+        let all: Vec<String> = over.into_iter().chain(self.warnings.clone()).collect();
+        (!all.is_empty()).then(|| all.join(" "))
     }
 }
 
@@ -159,7 +165,13 @@ pub fn plan(demands: &[Demand], table: &[EncoderCap], gpu_ok: &[VideoEncoder]) -
     let mut initial: Vec<VideoEncoder> = Vec::new();
     for d in demands {
         if let Some(c) = allowed(d, d.fps, table, gpu_ok).first() {
-            rows.push((d.clone(), c, d.fps));
+            // Only H.264 can take it (no HEVC encoder): a Native rate stays within level 5.2.
+            let fps = if d.native && !level_ok(c.enc, d.size, d.fps) {
+                d.fps.min(60.0)
+            } else {
+                d.fps
+            };
+            rows.push((d.clone(), c, fps));
             initial.push(c.enc);
         }
     }
@@ -240,9 +252,21 @@ pub fn plan(demands: &[Demand], table: &[EncoderCap], gpu_ok: &[VideoEncoder]) -
             ));
         }
         if d.native && *f < d.fps - 0.5 {
-            out.notes.push(format!(
-                "{}: native frame rate limited to {:.0} fps (source refresh {:.0}) to fit the encoder",
+            let why = if !level_ok(c.enc, d.size, d.fps) && *f >= 59.5 {
+                "H.264 level 5.2; no HEVC encoder is available"
+            } else {
+                "fit the measured encoder capacity"
+            };
+            out.warnings.push(format!(
+                "{}: Native frame rate limited to {:.0} fps (source refresh {:.0}) to {why}.",
                 d.label, f, d.fps
+            ));
+        }
+        if !level_ok(c.enc, d.size, *f) {
+            out.warnings.push(format!(
+                "{}: {:.0} fps at {}×{} on H.264 needs level 6, which many editors and decoders \
+                 reject; choose 60 fps or less.",
+                d.label, f, d.size.0, d.size.1
             ));
         }
     }
@@ -358,10 +382,12 @@ mod tests {
         assert!(w1.fps <= 60.0 && w1.fps >= 30.0, "{w1:?}");
         assert!(p.gpu_load <= GPU_BUDGET);
         assert!(
-            p.notes.iter().any(|n| n.contains("limited")),
+            p.warnings.iter().any(|n| n.contains("limited")),
             "{:?}",
-            p.notes
+            p.warnings
         );
+        // Shown before recording although the plan fits.
+        assert!(p.warning().unwrap().contains("limited"));
     }
 
     #[test]
@@ -401,5 +427,19 @@ mod tests {
         };
         let p = plan(&[camera()], &[small], &GPU_OK);
         assert_eq!(p.inputs[0].max, (1920, 1080));
+    }
+
+    #[test]
+    fn h264_only_keeps_level_5_2() {
+        let t = [cap(VideoEncoder::Va, 98.0)];
+        let p = plan(&[window(1, 144.0, true)], &t, &GPU_OK);
+        assert_eq!((p.inputs[0].enc, p.inputs[0].fps), (VideoEncoder::Va, 60.0));
+        assert!(p.warning().unwrap().contains("level 5.2"), "{p:?}");
+        // CFR beyond level 5.2 is warned about, not silently planned.
+        let p = plan(&[window(1, 120.0, false)], &t, &GPU_OK);
+        assert!(p.warning().unwrap().contains("level 6"), "{p:?}");
+        // A plan that fits without lowering anything warns about nothing.
+        let p = plan(&[window(1, 30.0, false)], &host(), &GPU_OK);
+        assert_eq!(p.warning(), None);
     }
 }
