@@ -23,7 +23,7 @@ use super::widgets::{
 use super::{Cut, ToggleRecord};
 use crate::studio::{
     CaptureId, DeviceId, DeviceInfo, DeviceKind, EngineCommand, EngineEvent, EngineHandle,
-    FrameRateMode, InputKey, InputStatus, ModelState, Notice, Phase, PlannedInput,
+    Fraction, FrameRateMode, InputKey, InputStatus, ModelState, Notice, Phase, PlannedInput,
     PortalAvailability, PreviewFrame, Previews, SegmentStatus, SegmentSummary, Snapshot, SourceId,
     SourceInfo, SourceKind, SourceState, TranscriptStatus, WhisperBackend,
 };
@@ -773,7 +773,10 @@ impl StudioView {
                     "{}×{} @{}",
                     mode.width,
                     mode.height,
-                    format_rate(mode.fps_n, mode.fps_d)
+                    format_rate(Fraction {
+                        num: mode.fps_n,
+                        den: mode.fps_d
+                    })
                 ),
                 Some(mode.format.clone().into()),
                 None,

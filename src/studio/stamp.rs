@@ -11,8 +11,10 @@ use std::sync::{Arc, Mutex};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
+use super::types::Size;
+
 /// The size locked from the first CAPS event, shared with the engine.
-pub type SizeSlot = Arc<Mutex<Option<(i32, i32)>>>;
+pub type SizeSlot = Arc<Mutex<Option<Size>>>;
 
 /// Frame accounting for one input (P0-1), written by pad probes, read by the engine.
 #[derive(Debug)]
@@ -111,18 +113,24 @@ fn even_up(v: f64) -> i32 {
 
 /// Size lock (§5.2): round down to even, fit within 3840×2160 keeping the aspect ratio, then
 /// scale up (keeping the aspect ratio) so that both sides are at least 128. Always even.
-pub fn lock_size(width: i32, height: i32) -> (i32, i32) {
-    lock_size_within(width, height, MAX_W, MAX_H)
+pub fn lock_size(size: Size) -> Size {
+    lock_size_within(
+        size,
+        Size {
+            width: MAX_W,
+            height: MAX_H,
+        },
+    )
 }
 
 /// As [`lock_size`], fitting within `max_w`×`max_h` instead of 3840×2160 (cameras allow DCI
 /// 4096×2160; an encoder that cannot do 4K lowers it).
-pub fn lock_size_within(width: i32, height: i32, max_w: i32, max_h: i32) -> (i32, i32) {
+pub fn lock_size_within(size: Size, max: Size) -> Size {
     let (max_w, max_h) = (
-        even_down(max_w.max(MIN_SIDE)),
-        even_down(max_h.max(MIN_SIDE)),
+        even_down(max.width.max(MIN_SIDE)),
+        even_down(max.height.max(MIN_SIDE)),
     );
-    let (mut w, mut h) = (even_down(width) as f64, even_down(height) as f64);
+    let (mut w, mut h) = (even_down(size.width) as f64, even_down(size.height) as f64);
     let aspect = w / h;
     if w > max_w as f64 || h > max_h as f64 {
         let scale = (max_w as f64 / w).min(max_h as f64 / h);
@@ -143,7 +151,10 @@ pub fn lock_size_within(width: i32, height: i32, max_w: i32, max_h: i32) -> (i32
         w = w.min(max_w);
         h = h.min(max_h);
     }
-    (w, h)
+    Size {
+        width: w,
+        height: h,
+    }
 }
 
 /// Video stamping state: arrival running time with a monotonic clamp.
@@ -409,8 +420,8 @@ pub fn install_audio(pad: &gst::Pad, clock: gst::Clock, base: Arc<AtomicU64>) {
 pub fn install_size_lock(
     pad: &gst::Pad,
     outcaps: gst::Element,
-    max: (i32, i32),
-    make_caps: impl Fn(i32, i32) -> gst::Caps + Send + Sync + 'static,
+    max: Size,
+    make_caps: impl Fn(Size) -> gst::Caps + Send + Sync + 'static,
     locked: SizeSlot,
 ) {
     pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
@@ -422,9 +433,15 @@ pub fn install_size_lock(
                 && let Some(s) = c.caps().structure(0)
                 && let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height"))
             {
-                let (lw, lh) = lock_size_within(w, h, max.0, max.1);
-                outcaps.set_property("caps", make_caps(lw, lh));
-                *slot = Some((lw, lh));
+                let locked_size = lock_size_within(
+                    Size {
+                        width: w,
+                        height: h,
+                    },
+                    max,
+                );
+                outcaps.set_property("caps", make_caps(locked_size));
+                *slot = Some(locked_size);
             }
         }
         gst::PadProbeReturn::Ok
@@ -478,37 +495,53 @@ pub fn install_mux_probe(
 mod tests {
     use super::*;
 
+    fn size(width: i32, height: i32) -> Size {
+        Size { width, height }
+    }
+
     #[test]
     fn size_lock_even_rounding() {
-        assert_eq!(lock_size(1921, 1081), (1920, 1080));
-        assert_eq!(lock_size(1280, 720), (1280, 720));
+        assert_eq!(lock_size(size(1921, 1081)), size(1920, 1080));
+        assert_eq!(lock_size(size(1280, 720)), size(1280, 720));
     }
 
     #[test]
     fn size_lock_caps_4k() {
-        assert_eq!(lock_size(7680, 4320), (3840, 2160));
-        let (w, h) = lock_size(5000, 1000);
-        assert!(w <= MAX_W && h <= MAX_H && w % 2 == 0 && h % 2 == 0);
-        assert_eq!(w, 3840);
+        assert_eq!(lock_size(size(7680, 4320)), size(3840, 2160));
+        let locked = lock_size(size(5000, 1000));
+        assert!(locked.width <= MAX_W && locked.height <= MAX_H);
+        assert!(locked.width % 2 == 0 && locked.height % 2 == 0);
+        assert_eq!(locked.width, 3840);
     }
 
     #[test]
     fn size_lock_within_custom_max() {
-        assert_eq!(lock_size_within(4096, 2160, 4096, 2160), (4096, 2160));
-        assert_eq!(lock_size_within(4096, 2160, 3840, 2160), (3840, 2024));
-        assert_eq!(lock_size_within(3840, 2160, 1920, 1080), (1920, 1080));
-        assert_eq!(lock_size_within(6144, 3456, 4096, 2160), (3840, 2160));
+        assert_eq!(
+            lock_size_within(size(4096, 2160), size(4096, 2160)),
+            size(4096, 2160)
+        );
+        assert_eq!(
+            lock_size_within(size(4096, 2160), size(3840, 2160)),
+            size(3840, 2024)
+        );
+        assert_eq!(
+            lock_size_within(size(3840, 2160), size(1920, 1080)),
+            size(1920, 1080)
+        );
+        assert_eq!(
+            lock_size_within(size(6144, 3456), size(4096, 2160)),
+            size(3840, 2160)
+        );
     }
 
     #[test]
     fn size_lock_floor_keeps_aspect() {
-        let (w, h) = lock_size(100, 60);
-        assert_eq!(h, 128);
-        assert!(w >= 128 && w % 2 == 0);
+        let locked = lock_size(size(100, 60));
+        assert_eq!(locked.height, 128);
+        assert!(locked.width >= 128 && locked.width % 2 == 0);
         // 100/60 = 1.667 → 128 * 1.667 = 213.3 → 214
-        assert_eq!(w, 214);
-        let (w, h) = lock_size(60, 100);
-        assert_eq!((w, h), (128, 214));
+        assert_eq!(locked.width, 214);
+        assert_eq!(lock_size(size(60, 100)), size(128, 214));
     }
 
     #[test]

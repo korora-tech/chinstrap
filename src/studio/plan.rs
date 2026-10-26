@@ -19,7 +19,7 @@
 //! about. Every lowered Native rate is a pre-record warning (`Plan::warnings`).
 
 use super::encoders::EncoderCap;
-use super::types::{InputKey, VideoCodec, VideoEncoder};
+use super::types::{InputKey, Size, VideoCodec, VideoEncoder};
 
 /// Share of one second of encode time per second the GPU encodes may use (worst case: one
 /// instance). The single-stream measure is ~12% below an instance's real capacity.
@@ -39,7 +39,7 @@ pub struct Demand {
     pub key: InputKey,
     pub label: String,
     /// Size it records at (locked).
-    pub size: (i32, i32),
+    pub size: Size,
     /// CFR: the rate. Native: the source's maximum (its refresh).
     pub fps: f64,
     pub native: bool,
@@ -54,7 +54,7 @@ pub struct Assigned {
     pub key: InputKey,
     pub enc: VideoEncoder,
     /// Largest size that encoder was verified at (the input is downscaled beyond it).
-    pub max: (i32, i32),
+    pub max: Size,
     /// Planned rate (Native: the cap; equal to the demand when not lowered).
     pub fps: f64,
     pub native: bool,
@@ -101,14 +101,16 @@ impl Plan {
     }
 }
 
-fn cost(cap: &EncoderCap, size: (i32, i32)) -> f64 {
-    let fps = cap.fps_at(size.0, size.1);
+fn cost(cap: &EncoderCap, size: Size) -> f64 {
+    let fps = cap.fps_at(size);
     if fps > 0.0 { 1.0 / fps } else { 1.0 }
 }
 
 /// H.264 above 60 fps at more than 1080p needs level 6+.
-fn level_ok(enc: VideoEncoder, size: (i32, i32), fps: f64) -> bool {
-    enc.codec() != VideoCodec::H264 || fps <= 60.5 || size.0 as i64 * size.1 as i64 <= 1920 * 1088
+fn level_ok(enc: VideoEncoder, size: Size, fps: f64) -> bool {
+    enc.codec() != VideoCodec::H264
+        || fps <= 60.5
+        || size.width as i64 * size.height as i64 <= 1920 * 1088
 }
 
 /// Encoders an input may use, in table (preference) order.
@@ -122,19 +124,19 @@ fn allowed<'a>(
     let fitting: Vec<&EncoderCap> = table
         .iter()
         .filter(usable)
-        .filter(|c| c.fits(d.size.0, d.size.1))
+        .filter(|c| c.fits(d.size))
         .collect();
     let pool = if fitting.is_empty() {
         // Nothing does this size: the largest one (the input is downscaled).
         let max = table
             .iter()
             .filter(usable)
-            .map(|c| c.max.0 as i64 * c.max.1 as i64)
+            .map(|c| c.max.width as i64 * c.max.height as i64)
             .max();
         table
             .iter()
             .filter(usable)
-            .filter(|c| Some(c.max.0 as i64 * c.max.1 as i64) == max)
+            .filter(|c| Some(c.max.width as i64 * c.max.height as i64) == max)
             .collect()
     } else {
         fitting
@@ -156,12 +158,18 @@ fn step_down(fps: f64) -> Option<f64> {
         .filter(|s| *s >= MIN_NATIVE_FPS)
 }
 
+struct Row<'a> {
+    demand: Demand,
+    encoder: &'a EncoderCap,
+    fps: f64,
+}
+
 /// Plans every input; see the module docs.
 pub fn plan(demands: &[Demand], table: &[EncoderCap], gpu_ok: &[VideoEncoder]) -> Plan {
     let mut out = Plan::default();
     let find = |e: VideoEncoder| table.iter().find(|c| c.enc == e);
     // Initial: the preferred (first) allowed encoder at the demanded rate.
-    let mut rows: Vec<(Demand, &EncoderCap, f64)> = Vec::new();
+    let mut rows: Vec<Row<'_>> = Vec::new();
     let mut initial: Vec<VideoEncoder> = Vec::new();
     for d in demands {
         if let Some(c) = allowed(d, d.fps, table, gpu_ok).first() {
@@ -171,14 +179,18 @@ pub fn plan(demands: &[Demand], table: &[EncoderCap], gpu_ok: &[VideoEncoder]) -
             } else {
                 d.fps
             };
-            rows.push((d.clone(), c, fps));
+            rows.push(Row {
+                demand: d.clone(),
+                encoder: c,
+                fps,
+            });
             initial.push(c.enc);
         }
     }
-    let load = |rows: &[(Demand, &EncoderCap, f64)], gpu: bool| -> f64 {
+    let load = |rows: &[Row<'_>], gpu: bool| -> f64 {
         rows.iter()
-            .filter(|(_, c, _)| c.enc.is_gpu() == gpu)
-            .map(|(d, c, f)| f * cost(c, d.size))
+            .filter(|row| row.encoder.enc.is_gpu() == gpu)
+            .map(|row| row.fps * cost(row.encoder, row.demand.size))
             .sum()
     };
     for _ in 0..64 {
@@ -193,56 +205,64 @@ pub fn plan(demands: &[Demand], table: &[EncoderCap], gpu_ok: &[VideoEncoder]) -
             let pick = rows
                 .iter()
                 .enumerate()
-                .filter(|(_, (d, c, f))| {
-                    c.enc == VideoEncoder::Va
+                .filter(|(_, row)| {
+                    row.encoder.enc == VideoEncoder::Va
                         && hevc.is_some_and(|h| {
-                            allowed(d, *f, table, gpu_ok).iter().any(|a| a.enc == h.enc)
+                            allowed(&row.demand, row.fps, table, gpu_ok)
+                                .iter()
+                                .any(|a| a.enc == h.enc)
                         })
                 })
-                .max_by(|a, b| {
-                    let la = a.1.2 * cost(a.1.1, a.1.0.size);
-                    let lb = b.1.2 * cost(b.1.1, b.1.0.size);
+                .max_by(|(_, a), (_, b)| {
+                    let la = a.fps * cost(a.encoder, a.demand.size);
+                    let lb = b.fps * cost(b.encoder, b.demand.size);
                     la.total_cmp(&lb)
                 })
                 .map(|(i, _)| i);
             if let (Some(i), Some(h)) = (pick, hevc) {
-                rows[i].1 = h;
+                rows[i].encoder = h;
                 continue;
             }
             // 2. The camera to a software encoder with room.
-            let moved = rows.iter().position(|(d, c, f)| {
-                d.camera
-                    && c.enc.is_gpu()
-                    && allowed(d, *f, table, gpu_ok)
+            let moved = rows.iter().position(|row| {
+                row.demand.camera
+                    && row.encoder.enc.is_gpu()
+                    && allowed(&row.demand, row.fps, table, gpu_ok)
                         .iter()
-                        .any(|a| !a.enc.is_gpu() && cpu + f * cost(a, d.size) <= CPU_BUDGET)
+                        .any(|a| {
+                            !a.enc.is_gpu()
+                                && cpu + row.fps * cost(a, row.demand.size) <= CPU_BUDGET
+                        })
             });
             if let Some(i) = moved {
-                let (d, _, f) = &rows[i];
-                let sw = allowed(d, *f, table, gpu_ok)
+                let row = &rows[i];
+                let sw = allowed(&row.demand, row.fps, table, gpu_ok)
                     .into_iter()
                     .find(|a| !a.enc.is_gpu())
                     .expect("checked above");
-                rows[i].1 = sw;
+                rows[i].encoder = sw;
                 continue;
             }
             // 3. Lower the highest native cap one step.
             let native = rows
                 .iter()
                 .enumerate()
-                .filter(|(_, (d, _, f))| d.native && step_down(*f).is_some())
-                .max_by(|a, b| a.1.2.total_cmp(&b.1.2))
+                .filter(|(_, row)| row.demand.native && step_down(row.fps).is_some())
+                .max_by(|(_, a), (_, b)| a.fps.total_cmp(&b.fps))
                 .map(|(i, _)| i);
             if let Some(i) = native {
-                let next = step_down(rows[i].2).expect("filtered");
-                rows[i].2 = next;
+                let next = step_down(rows[i].fps).expect("filtered");
+                rows[i].fps = next;
                 // A lower rate may make H.264 legal again; keep the codec (it was moved for load).
                 continue;
             }
         }
         break;
     }
-    for ((d, c, f), first) in rows.iter().zip(&initial) {
+    for (row, first) in rows.iter().zip(&initial) {
+        let d = &row.demand;
+        let c = row.encoder;
+        let f = row.fps;
         if c.enc != *first {
             out.notes.push(format!(
                 "{}: {} instead of {} to fit the measured encoder capacity",
@@ -251,8 +271,8 @@ pub fn plan(demands: &[Demand], table: &[EncoderCap], gpu_ok: &[VideoEncoder]) -
                 first.element_name()
             ));
         }
-        if d.native && *f < d.fps - 0.5 {
-            let why = if !level_ok(c.enc, d.size, d.fps) && *f >= 59.5 {
+        if d.native && f < d.fps - 0.5 {
+            let why = if !level_ok(c.enc, d.size, d.fps) && f >= 59.5 {
                 "H.264 level 5.2; no HEVC encoder is available"
             } else {
                 "fit the measured encoder capacity"
@@ -262,11 +282,11 @@ pub fn plan(demands: &[Demand], table: &[EncoderCap], gpu_ok: &[VideoEncoder]) -
                 d.label, f, d.fps
             ));
         }
-        if !level_ok(c.enc, d.size, *f) {
+        if !level_ok(c.enc, d.size, f) {
             out.warnings.push(format!(
                 "{}: {:.0} fps at {}×{} on H.264 needs level 6, which many editors and decoders \
                  reject; choose 60 fps or less.",
-                d.label, f, d.size.0, d.size.1
+                d.label, f, d.size.width, d.size.height
             ));
         }
     }
@@ -275,13 +295,13 @@ pub fn plan(demands: &[Demand], table: &[EncoderCap], gpu_ok: &[VideoEncoder]) -
     out.over = out.gpu_load > GPU_BUDGET + 1e-9 || out.cpu_load > CPU_BUDGET + 1e-9;
     out.inputs = rows
         .into_iter()
-        .map(|(d, c, f)| Assigned {
-            key: d.key,
-            enc: c.enc,
-            max: c.max,
-            fps: f,
-            native: d.native,
-            load: f * cost(c, d.size),
+        .map(|row| Assigned {
+            key: row.demand.key,
+            enc: row.encoder.enc,
+            max: row.encoder.max,
+            fps: row.fps,
+            native: row.demand.native,
+            load: row.fps * cost(row.encoder, row.demand.size),
         })
         .collect();
     out
@@ -292,12 +312,18 @@ mod tests {
     use super::*;
     use crate::studio::types::SourceId;
 
-    const UHD: (i32, i32) = (3840, 2160);
+    const UHD: Size = Size {
+        width: 3840,
+        height: 2160,
+    };
 
     fn cap(enc: VideoEncoder, fps: f64) -> EncoderCap {
         EncoderCap {
             enc,
-            max: (4096, 2160),
+            max: Size {
+                width: 4096,
+                height: 2160,
+            },
             fps_at_max: fps,
         }
     }
@@ -412,7 +438,10 @@ mod tests {
     #[test]
     fn small_inputs_and_missing_encoders() {
         let mut w = window(1, 30.0, false);
-        w.size = (1920, 1080);
+        w.size = Size {
+            width: 1920,
+            height: 1080,
+        };
         let p = plan(&[w], &[cap(VideoEncoder::Va, 98.0)], &GPU_OK);
         assert!(
             (p.inputs[0].load - 30.0 / (98.0 * 4.0)).abs() < 1e-3,
@@ -422,11 +451,20 @@ mod tests {
         // Only a 1080p encoder: the 4K input is planned on it (downscaled).
         let small = EncoderCap {
             enc: VideoEncoder::Va,
-            max: (1920, 1080),
+            max: Size {
+                width: 1920,
+                height: 1080,
+            },
             fps_at_max: 200.0,
         };
         let p = plan(&[camera()], &[small], &GPU_OK);
-        assert_eq!(p.inputs[0].max, (1920, 1080));
+        assert_eq!(
+            p.inputs[0].max,
+            Size {
+                width: 1920,
+                height: 1080
+            }
+        );
     }
 
     #[test]

@@ -17,24 +17,30 @@ use super::devices::{CameraMode, CameraPath, Entry};
 use super::encoders::{self, Role, set_prop};
 use super::preview::{self, Scaler, Tap};
 use super::stamp::{self, Counters, SizeSlot, UNSET};
-use super::types::{GpuConvert, VideoEncoder};
+use super::types::{Fraction, GpuConvert, Size, VideoEncoder};
 
 /// Caps accepted right after a pipewiresrc (D7): DMA-BUF with modifiers, or plain raw.
 pub const SOURCE_CAPS: &str = "video/x-raw(memory:DMABuf),format=DMA_DRM; video/x-raw";
 /// Default test pattern size; `CHINSTRAP_TEST_SIZE=WxH` overrides it.
-pub const TEST_SIZE: (i32, i32) = (1280, 720);
+pub const TEST_SIZE: Size = Size {
+    width: 1280,
+    height: 720,
+};
 pub const TEST_RESIZE_CAPS: &str = "video/x-raw,width=1000,height=700,framerate=30/1";
 pub const MIC_CAPS: &str = "audio/x-raw,rate=48000,channels=[1,2]";
 
 /// Parses a `WxH` size (both sides 16..=8192).
-pub fn parse_size(v: &str) -> Option<(i32, i32)> {
+pub fn parse_size(v: &str) -> Option<Size> {
     let (w, h) = v.trim().split_once(['x', 'X', '×'])?;
     let (w, h) = (w.trim().parse::<i32>().ok()?, h.trim().parse::<i32>().ok()?);
-    ((16..=8192).contains(&w) && (16..=8192).contains(&h)).then_some((w, h))
+    ((16..=8192).contains(&w) && (16..=8192).contains(&h)).then_some(Size {
+        width: w,
+        height: h,
+    })
 }
 
 /// The test pattern's size: `CHINSTRAP_TEST_SIZE=WxH` (e.g. 3840x2160), else 1280×720.
-pub fn test_size() -> (i32, i32) {
+pub fn test_size() -> Size {
     std::env::var("CHINSTRAP_TEST_SIZE")
         .ok()
         .and_then(|v| parse_size(&v))
@@ -42,12 +48,14 @@ pub fn test_size() -> (i32, i32) {
 }
 
 /// Test pattern caps at `fps` (`size` overrides `CHINSTRAP_TEST_SIZE`).
-pub fn test_caps_at(fps: (i32, i32), size: Option<(i32, i32)>) -> String {
-    let (w, h) = size.unwrap_or_else(test_size);
+pub fn test_caps_at(fps: Fraction, size: Option<Size>) -> String {
+    let size = size.unwrap_or_else(test_size);
     format!(
-        "video/x-raw,width={w},height={h},framerate={}/{}",
-        fps.0,
-        fps.1.max(1)
+        "video/x-raw,width={},height={},framerate={}/{}",
+        size.width,
+        size.height,
+        fps.num,
+        fps.den.max(1)
     )
 }
 
@@ -55,7 +63,7 @@ pub fn test_caps_at(fps: (i32, i32), size: Option<(i32, i32)>) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rate {
     /// Constant rate: videorate (camera, test) or the repeater (portal) fills gaps.
-    Cfr((i32, i32)),
+    Cfr(Fraction),
     /// Variable rate: frames as the source sends them, stamped on arrival. `cap` is the
     /// maximum rate requested from the source (None: the source's own maximum, e.g. the
     /// output refresh); `gop_fps` sizes the encoder's frame-counted GOP limit.
@@ -63,7 +71,7 @@ pub enum Rate {
 }
 
 impl Rate {
-    pub fn cfr(self) -> Option<(i32, i32)> {
+    pub fn cfr(self) -> Option<Fraction> {
         match self {
             Rate::Cfr(f) => Some(f),
             Rate::Native { .. } => None,
@@ -75,7 +83,7 @@ impl Rate {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VideoTarget {
     pub rate: Rate,
-    pub max: (i32, i32),
+    pub max: Size,
 }
 
 /// Native test pattern: rendered at this rate with about half the frames dropped in an
@@ -94,32 +102,41 @@ pub const KEYFRAME_EVERY_NS: u64 = 2_000_000_000;
 /// minimum (1 fps); an enum intersected with the producer's range keeps the first value in it.
 /// 60000/1001, 5994/100 and 30000/1001 keep ~59.94 Hz outputs negotiable (niri reports the
 /// refresh in mHz, e.g. 59940/1000, just below 60000/1001).
-const MAX_RATE_STEPS: [(i32, i32); 17] = [
-    (240, 1),
-    (165, 1),
-    (144, 1),
-    (120, 1),
-    (100, 1),
-    (90, 1),
-    (75, 1),
-    (60, 1),
-    (60000, 1001),
-    (5994, 100),
-    (50, 1),
-    (48, 1),
-    (30, 1),
-    (30000, 1001),
-    (25, 1),
-    (24, 1),
-    (15, 1),
+const MAX_RATE_STEPS: [Fraction; 17] = [
+    Fraction { num: 240, den: 1 },
+    Fraction { num: 165, den: 1 },
+    Fraction { num: 144, den: 1 },
+    Fraction { num: 120, den: 1 },
+    Fraction { num: 100, den: 1 },
+    Fraction { num: 90, den: 1 },
+    Fraction { num: 75, den: 1 },
+    Fraction { num: 60, den: 1 },
+    Fraction {
+        num: 60_000,
+        den: 1_001,
+    },
+    Fraction {
+        num: 5_994,
+        den: 100,
+    },
+    Fraction { num: 50, den: 1 },
+    Fraction { num: 48, den: 1 },
+    Fraction { num: 30, den: 1 },
+    Fraction {
+        num: 30_000,
+        den: 1_001,
+    },
+    Fraction { num: 25, den: 1 },
+    Fraction { num: 24, den: 1 },
+    Fraction { num: 15, den: 1 },
 ];
 
 /// `max-framerate` field asking a portal source for at most `cap` fps.
 pub fn max_rate_field(cap: i32) -> String {
     let mut steps: Vec<String> = vec![format!("{cap}/1")];
-    for (n, d) in MAX_RATE_STEPS {
-        if (n as f64 / d as f64) < cap as f64 - 0.01 {
-            steps.push(format!("{n}/{d}"));
+    for fraction in MAX_RATE_STEPS {
+        if fraction.as_f64() < cap as f64 - 0.01 {
+            steps.push(format!("{}/{}", fraction.num, fraction.den));
         }
     }
     format!("max-framerate=(fraction){{ {} }}", steps.join(", "))
@@ -140,7 +157,7 @@ pub fn portal_source_caps(cap: Option<i32>) -> String {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TestBehaviour {
     /// Size instead of `CHINSTRAP_TEST_SIZE`.
-    pub size: Option<(i32, i32)>,
+    pub size: Option<Size>,
     /// No frame before this much running time (a source that starts late).
     pub late: Option<Duration>,
     /// No frame at all (a window that is never redrawn).
@@ -276,7 +293,7 @@ fn leaky_queue() -> Result<gst::Element, String> {
 /// `fps` period from the first input frame until EOS, repeating the last input frame.
 /// Compositors only send frames on damage, so a static window would otherwise stop recording
 /// after its first frame, and videorate only duplicates once a newer frame arrives.
-fn repeater(va: bool, fps: (i32, i32)) -> Result<gst::Element, String> {
+fn repeater(va: bool, fps: Fraction) -> Result<gst::Element, String> {
     let factory = if va { "vacompositor" } else { "compositor" };
     let agg = gst::ElementFactory::make(factory)
         .property("force-live", true)
@@ -288,7 +305,7 @@ fn repeater(va: bool, fps: (i32, i32)) -> Result<gst::Element, String> {
     // the input's real start (`first_pts_ns`), as for the camera.
     set_prop(&agg, "start-time-selection", "first");
     // One frame of slack for the convert step before an output frame is due.
-    let frame_ns = 1_000_000_000u64 * fps.1.max(1) as u64 / fps.0.max(1) as u64;
+    let frame_ns = 1_000_000_000u64 * fps.den.max(1) as u64 / fps.num.max(1) as u64;
     set_prop(&agg, "latency", &frame_ns.to_string());
     Ok(agg)
 }
@@ -463,7 +480,7 @@ fn mux_probe(
 }
 
 /// Rewrites the framerate of every caps event leaving `pad` to `fps`.
-fn rewrite_framerate(pad: &gst::Pad, fps: (i32, i32)) {
+fn rewrite_framerate(pad: &gst::Pad, fps: Fraction) {
     pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
         let Some(gst::PadProbeData::Event(ev)) = info.data.as_ref() else {
             return gst::PadProbeReturn::Ok;
@@ -472,7 +489,7 @@ fn rewrite_framerate(pad: &gst::Pad, fps: (i32, i32)) {
             return gst::PadProbeReturn::Ok;
         };
         let mut caps = c.caps_owned();
-        let want = gst::Fraction::new(fps.0, fps.1);
+        let want = gst::Fraction::from(fps);
         if caps
             .structure(0)
             .and_then(|s| s.get::<gst::Fraction>("framerate").ok())
@@ -558,10 +575,10 @@ pub fn build_video(
             let rate = match target.rate {
                 Rate::Cfr(f) => f,
                 // Like a compositor: the refresh, or the requested maximum when lower.
-                Rate::Native { cap, .. } => (
-                    cap.map_or(behaviour.refresh_fps(), |c| c.min(behaviour.refresh_fps())),
-                    1,
-                ),
+                Rate::Native { cap, .. } => Fraction {
+                    num: cap.map_or(behaviour.refresh_fps(), |c| c.min(behaviour.refresh_fps())),
+                    den: 1,
+                },
             };
             let caps = capsfilter(&test_caps_at(rate, behaviour.size))?;
             if behaviour.silent || behaviour.late.is_some() {
@@ -642,8 +659,8 @@ pub fn build_video(
             let caps = match (&camera_mode, portal, target.rate) {
                 (Some(mode), _, _) => mode.source_caps(),
                 // Ask the compositor for no more frames than are recorded.
-                (None, true, Rate::Cfr((n, d))) => {
-                    portal_source_caps(Some(((n as f64 / d.max(1) as f64).ceil()) as i32))
+                (None, true, Rate::Cfr(fps)) => {
+                    portal_source_caps(Some(fps.as_f64().ceil() as i32))
                 }
                 (None, true, Rate::Native { cap, .. }) => portal_source_caps(cap),
                 (None, false, _) => SOURCE_CAPS.to_string(),
@@ -697,7 +714,10 @@ pub fn build_video(
     mid.push(enc_queue.clone());
     let gop_rate = match target.rate {
         Rate::Cfr(f) => f,
-        Rate::Native { gop_fps, .. } => (gop_fps.max(1), 1),
+        Rate::Native { gop_fps, .. } => Fraction {
+            num: gop_fps.max(1),
+            den: 1,
+        },
     };
     let encoder = encoders::make_encoder(enc, role, gop_rate)?;
     mid.push(encoder.clone());
@@ -808,9 +828,15 @@ pub fn build_video(
         // (what the bitrate was computed for), not the source's maximum (e.g. 144/1, which left
         // native inputs a quarter of their bitrate) nor 0/1 (a portal cast; the encoder then
         // assumes its own default). It also picks the codec level from it.
-        rewrite_framerate(&src_pad(&enc_queue)?, (gop_fps.max(1), 1));
+        rewrite_framerate(
+            &src_pad(&enc_queue)?,
+            Fraction {
+                num: gop_fps.max(1),
+                den: 1,
+            },
+        );
         // The file is variable-rate: no Matroska DefaultDuration claiming the maximum rate.
-        rewrite_framerate(&src_pad(&coded)?, (0, 1));
+        rewrite_framerate(&src_pad(&coded)?, Fraction { num: 0, den: 1 });
     }
     let size = Arc::new(Mutex::new(None));
     let out_rate = target.rate.cfr();
@@ -818,18 +844,17 @@ pub fn build_video(
         &src_out,
         outcaps,
         target.max,
-        move |w, h| {
+        move |size| {
             // The bitrate follows the locked size; the encoder has not seen caps yet.
             encoders::set_bitrate(
                 &encoder,
                 enc,
-                encoders::bitrate_kbps(role, enc.codec(), w, h, gop_rate),
+                encoders::bitrate_kbps(role, enc.codec(), size, gop_rate),
             );
             let caps = gst::Caps::from_str(&encoders::outcaps_string(
                 enc,
                 effective_convert,
-                w,
-                h,
+                size,
                 out_rate,
             ))
             .unwrap_or_else(|_| gst::Caps::new_any());
@@ -971,9 +996,11 @@ pub fn build_preview(
             set_prop(&src, "is-live", "true");
             set_prop(&src, "pattern", "smpte");
             set_prop(&src, "horizontal-speed", "4");
-            let (w, h) = b.size.unwrap_or_else(test_size);
-            let (w, h) = preview::fit(w, h);
-            let caps = capsfilter(&format!("video/x-raw,width={w},height={h},framerate=15/1"))?;
+            let size = preview::fit(b.size.unwrap_or_else(test_size));
+            let caps = capsfilter(&format!(
+                "video/x-raw,width={},height={},framerate=15/1",
+                size.width, size.height
+            ))?;
             if b.silent {
                 // Selftest: a window that never draws previews nothing either.
                 src_pad(&src)?
@@ -1069,9 +1096,9 @@ pub fn build_probe(
 /// What negotiated portal source caps say about the source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct SourceFacts {
-    pub size: Option<(i32, i32)>,
+    pub size: Option<Size>,
     /// `max-framerate` (niri: the output refresh).
-    pub max_rate: Option<(i32, i32)>,
+    pub max_rate: Option<Fraction>,
 }
 
 pub fn source_facts(caps: &gst::CapsRef) -> SourceFacts {
@@ -1079,14 +1106,17 @@ pub fn source_facts(caps: &gst::CapsRef) -> SourceFacts {
         return SourceFacts::default();
     };
     let size = match (s.get::<i32>("width"), s.get::<i32>("height")) {
-        (Ok(w), Ok(h)) if w > 0 && h > 0 => Some((w, h)),
+        (Ok(w), Ok(h)) if w > 0 && h > 0 => Some(Size {
+            width: w,
+            height: h,
+        }),
         _ => None,
     };
     let rate = s
         .get::<gst::Fraction>("max-framerate")
         .ok()
         .filter(|f| f.numer() > 0 && f.denom() > 0)
-        .map(|f| (f.numer(), f.denom()));
+        .map(Fraction::from);
     SourceFacts {
         size,
         max_rate: rate,
@@ -1338,22 +1368,48 @@ mod tests {
             gst::Caps::from_str("video/x-raw,max-framerate=(fraction)[1/1, 143999/1000]").unwrap();
         let mut fixed = caps.intersect(&producer);
         fixed.fixate();
-        assert_eq!(source_facts(&fixed).max_rate, Some((60, 1)));
+        assert_eq!(
+            source_facts(&fixed).max_rate,
+            Some(Fraction { num: 60, den: 1 })
+        );
         // A 59.94 Hz output still negotiates.
         let ntsc =
             gst::Caps::from_str("video/x-raw,max-framerate=(fraction)[1/1, 59940/1000]").unwrap();
         let mut fixed = caps.intersect(&ntsc);
         fixed.fixate();
-        let (n, d) = source_facts(&fixed).max_rate.unwrap();
-        assert!((n as f64 / d as f64 - 59.94).abs() < 1e-9, "{n}/{d}");
+        let rate = source_facts(&fixed).max_rate.unwrap();
+        assert!(
+            (rate.as_f64() - 59.94).abs() < 1e-9,
+            "{}/{}",
+            rate.num,
+            rate.den
+        );
         assert_eq!(portal_source_caps(None), SOURCE_CAPS);
     }
 
     #[test]
     fn test_size_parsing() {
-        assert_eq!(parse_size("3840x2160"), Some((3840, 2160)));
-        assert_eq!(parse_size(" 1920X1080 "), Some((1920, 1080)));
-        assert_eq!(parse_size("1280×720"), Some((1280, 720)));
+        assert_eq!(
+            parse_size("3840x2160"),
+            Some(Size {
+                width: 3840,
+                height: 2160
+            })
+        );
+        assert_eq!(
+            parse_size(" 1920X1080 "),
+            Some(Size {
+                width: 1920,
+                height: 1080
+            })
+        );
+        assert_eq!(
+            parse_size("1280×720"),
+            Some(Size {
+                width: 1280,
+                height: 720
+            })
+        );
         assert_eq!(parse_size("0x720"), None);
         assert_eq!(parse_size("4k"), None);
         assert_eq!(parse_size("99999x10"), None);

@@ -8,7 +8,7 @@ use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::*;
 
-use super::types::{CameraModeInfo, DeviceId, DeviceInfo, DeviceKind};
+use super::types::{CameraModeInfo, DeviceId, DeviceInfo, DeviceKind, Fraction, Size};
 
 /// Largest camera mode recorded without downscaling (DCI 4K width, UHD height).
 pub const CAMERA_MAX_W: i32 = 4096;
@@ -77,31 +77,46 @@ impl CameraMode {
     }
 
     /// Recorded frame rate: native, capped at 60 fps (30 fps when the device gives no rate).
-    pub fn output_fps(&self) -> (i32, i32) {
+    pub fn output_fps(&self) -> Fraction {
         if self.fps_n <= 0 {
-            (30, 1)
+            Fraction { num: 30, den: 1 }
         } else if self.fps_milli() > CAMERA_MAX_FPS as i64 * 1000 {
-            (CAMERA_MAX_FPS, 1)
+            Fraction {
+                num: CAMERA_MAX_FPS,
+                den: 1,
+            }
         } else {
-            (self.fps_n, self.fps_d.max(1))
+            Fraction {
+                num: self.fps_n,
+                den: self.fps_d.max(1),
+            }
         }
     }
 
     /// Recorded size: native, fitted within 4096×2160 only when larger.
-    pub fn output_size(&self) -> (i32, i32) {
-        super::stamp::lock_size_within(self.width, self.height, CAMERA_MAX_W, CAMERA_MAX_H)
+    pub fn output_size(&self) -> Size {
+        super::stamp::lock_size_within(
+            Size {
+                width: self.width,
+                height: self.height,
+            },
+            Size {
+                width: CAMERA_MAX_W,
+                height: CAMERA_MAX_H,
+            },
+        )
     }
 
     /// Contract view of this mode (`auto`: the automatic choice).
     pub fn info(&self, auto: bool) -> CameraModeInfo {
-        let (w, h) = self.output_size();
-        let (n, d) = self.output_fps();
+        let size = self.output_size();
+        let fps = self.output_fps();
         CameraModeInfo {
             label: self.label(),
-            width: w,
-            height: h,
-            fps_n: n,
-            fps_d: d,
+            width: size.width,
+            height: size.height,
+            fps_n: fps.num,
+            fps_d: fps.den,
             format: self.format_label(),
             auto,
         }
@@ -119,14 +134,19 @@ impl CameraMode {
 
     /// UI label, e.g. "3840×2160 @25 · NV12" or "1920×1080 @30 · MJPEG".
     pub fn label(&self) -> String {
-        let (w, h) = self.output_size();
-        let (n, d) = self.output_fps();
-        let fps = if d == 1 {
-            format!("{n}")
+        let size = self.output_size();
+        let rate = self.output_fps();
+        let fps = if rate.den == 1 {
+            format!("{}", rate.num)
         } else {
-            format!("{:.2}", n as f64 / d as f64)
+            format!("{:.2}", rate.as_f64())
         };
-        format!("{w}×{h} @{fps} · {}", self.format_label())
+        format!(
+            "{}×{} @{fps} · {}",
+            size.width,
+            size.height,
+            self.format_label()
+        )
     }
 }
 
@@ -171,10 +191,9 @@ fn int_candidates(v: &glib::SendValue, target: i32) -> Vec<i32> {
 
 /// Candidate frame rates: fixed values and list entries as-is; a range (no native rate)
 /// contributes its largest rate not above 30 fps (or its minimum when the whole range is faster).
-fn fps_candidates(v: &glib::SendValue) -> Vec<(i32, i32)> {
-    let as_pair = |f: gst::Fraction| (f.numer(), f.denom());
+fn fps_candidates(v: &glib::SendValue) -> Vec<Fraction> {
     if let Ok(f) = v.get::<gst::Fraction>() {
-        return vec![as_pair(f)];
+        return vec![f.into()];
     }
     if let Ok(r) = v.get::<gst::FractionRange>() {
         let cap = gst::Fraction::new(RANGE_MAX_FPS, 1);
@@ -185,7 +204,7 @@ fn fps_candidates(v: &glib::SendValue) -> Vec<(i32, i32)> {
         } else {
             r.min()
         };
-        return vec![as_pair(pick)];
+        return vec![pick.into()];
     }
     if let Ok(l) = v.get::<gst::List>() {
         return l.iter().flat_map(fps_candidates).collect();
@@ -237,12 +256,12 @@ pub fn camera_modes(caps: &gst::CapsRef) -> Vec<CameraMode> {
         // No framerate field (some virtual sources): an unknown rate, recorded at 30 fps.
         let rates = match s.value("framerate") {
             Ok(v) => fps_candidates(v),
-            Err(_) => vec![(0, 1)],
+            Err(_) => vec![Fraction { num: 0, den: 1 }],
         };
         for &w in &widths {
             for &h in &heights {
-                for &(n, d) in &rates {
-                    if w <= 0 || h <= 0 || n < 0 || d <= 0 {
+                for &rate in &rates {
+                    if w <= 0 || h <= 0 || rate.num < 0 || rate.den <= 0 {
                         continue;
                     }
                     let m = CameraMode {
@@ -250,8 +269,8 @@ pub fn camera_modes(caps: &gst::CapsRef) -> Vec<CameraMode> {
                         format: format.clone(),
                         width: w,
                         height: h,
-                        fps_n: n,
-                        fps_d: d,
+                        fps_n: rate.num,
+                        fps_d: rate.den,
                     };
                     if !out.contains(&m) {
                         out.push(m);
@@ -618,8 +637,18 @@ mod tests {
         assert_eq!(m.format.as_deref(), Some("NV12"));
         assert_eq!((m.width, m.height), (3840, 2160));
         assert_eq!((m.fps_n, m.fps_d), (25, 1));
-        assert_eq!(m.output_fps(), (25, 1), "25 fps must not be rated to 30");
-        assert_eq!(m.output_size(), (3840, 2160));
+        assert_eq!(
+            m.output_fps(),
+            Fraction { num: 25, den: 1 },
+            "25 fps must not be rated to 30"
+        );
+        assert_eq!(
+            m.output_size(),
+            Size {
+                width: 3840,
+                height: 2160
+            }
+        );
         assert_eq!(
             m.source_caps(),
             "video/x-raw,format=NV12,width=3840,height=2160,framerate=25/1"
@@ -708,21 +737,37 @@ mod tests {
         );
         let m = usable(classify_camera(&c, true));
         assert_eq!((m.width, m.height, m.fps_n), (4096, 2160, 30));
-        assert_eq!(m.output_size(), (4096, 2160), "DCI 4K is recorded unscaled");
+        assert_eq!(
+            m.output_size(),
+            Size {
+                width: 4096,
+                height: 2160
+            },
+            "DCI 4K is recorded unscaled"
+        );
         // A faster mode at the same size wins.
         let c =
             caps("image/jpeg,width=3840,height=2160,framerate={ (fraction)30/1, (fraction)60/1 }");
         assert_eq!(usable(classify_camera(&c, true)).fps_n, 60);
         // 120 fps is capped to 60, and a native 60 fps mode is preferred over it.
         let c = caps("image/jpeg,width=1920,height=1080,framerate={ (fraction)120/1 }");
-        assert_eq!(usable(classify_camera(&c, true)).output_fps(), (60, 1));
+        assert_eq!(
+            usable(classify_camera(&c, true)).output_fps(),
+            Fraction { num: 60, den: 1 }
+        );
         let c =
             caps("image/jpeg,width=1920,height=1080,framerate={ (fraction)120/1, (fraction)60/1 }");
         assert_eq!(usable(classify_camera(&c, true)).fps_n, 60);
         // NTSC rates are kept exactly.
         let c = caps("video/x-raw,format=NV12,width=1920,height=1080,framerate=30000/1001");
         let m = usable(classify_camera(&c, false));
-        assert_eq!(m.output_fps(), (30000, 1001));
+        assert_eq!(
+            m.output_fps(),
+            Fraction {
+                num: 30_000,
+                den: 1_001
+            }
+        );
         assert_eq!(m.label(), "1920×1080 @29.97 · NV12");
     }
 
@@ -731,9 +776,18 @@ mod tests {
         let c = caps("video/x-raw,format=NV12,width=6144,height=3456,framerate=30/1");
         let m = usable(classify_camera(&c, false));
         assert_eq!((m.width, m.height), (6144, 3456));
-        let (w, h) = m.output_size();
-        assert!(w <= CAMERA_MAX_W && h <= CAMERA_MAX_H, "{w}×{h}");
-        assert_eq!((w, h), (3840, 2160));
+        let size = m.output_size();
+        assert!(
+            size.width <= CAMERA_MAX_W && size.height <= CAMERA_MAX_H,
+            "{size:?}"
+        );
+        assert_eq!(
+            size,
+            Size {
+                width: 3840,
+                height: 2160
+            }
+        );
         let c = caps(
             "video/x-raw,format=NV12,width=6144,height=3456,framerate=30/1; \
              video/x-raw,format=NV12,width=3840,height=2160,framerate=30/1",
@@ -787,7 +841,7 @@ mod tests {
         let m = usable(classify_camera(&c, true));
         assert_eq!(m.path, CameraPath::DmaBuf);
         assert_eq!((m.width, m.height), (1920, 1080));
-        assert_eq!(m.output_fps(), (30, 1));
+        assert_eq!(m.output_fps(), Fraction { num: 30, den: 1 });
         assert!(
             !m.source_caps().contains("framerate"),
             "{}",

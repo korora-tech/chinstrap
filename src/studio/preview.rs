@@ -23,10 +23,13 @@ use gstreamer_video::prelude::*;
 
 use super::encoders::set_prop;
 use super::recorder::{capsfilter, make};
-use super::types::{InputKey, PreviewFrame, PreviewOrigin};
+use super::types::{InputKey, PreviewFrame, PreviewOrigin, Size};
 
 /// Every preview frame fits in this box (aspect ratio kept).
-pub const PREVIEW_MAX: (i32, i32) = (480, 300);
+pub const PREVIEW_MAX: Size = Size {
+    width: 480,
+    height: 300,
+};
 /// At most one preview frame per input this often (~15 fps).
 pub const PREVIEW_EVERY: Duration = Duration::from_millis(66);
 /// A frame this early for its slot still takes it.
@@ -39,14 +42,17 @@ pub fn enabled_from_env() -> bool {
     std::env::var("CHINSTRAP_PREVIEW").map_or(true, |v| v.trim() != "0")
 }
 
-/// `w×h` scaled to fit [`PREVIEW_MAX`], aspect ratio kept, both sides even and at least 2.
-pub fn fit(w: i32, h: i32) -> (i32, i32) {
-    let (w, h) = (w.max(1) as f64, h.max(1) as f64);
-    let s = (PREVIEW_MAX.0 as f64 / w)
-        .min(PREVIEW_MAX.1 as f64 / h)
+/// `size` scaled to fit [`PREVIEW_MAX`], aspect ratio kept, both sides even and at least 2.
+pub fn fit(size: Size) -> Size {
+    let (w, h) = (size.width.max(1) as f64, size.height.max(1) as f64);
+    let s = (PREVIEW_MAX.width as f64 / w)
+        .min(PREVIEW_MAX.height as f64 / h)
         .min(1.0);
     let even = |v: f64| ((v * s / 2.0).round() as i32 * 2).max(2);
-    (even(w), even(h))
+    Size {
+        width: even(w),
+        height: even(h),
+    }
 }
 
 /// Caps the preview scaler fixates into: BGRx within the box, square pixels (both
@@ -54,7 +60,7 @@ pub fn fit(w: i32, h: i32) -> (i32, i32) {
 fn box_caps() -> String {
     format!(
         "video/x-raw,format=BGRx,width=[2,{}],height=[2,{}],pixel-aspect-ratio=1/1",
-        PREVIEW_MAX.0, PREVIEW_MAX.1
+        PREVIEW_MAX.width, PREVIEW_MAX.height
     )
 }
 
@@ -392,14 +398,77 @@ mod tests {
 
     #[test]
     fn fit_keeps_aspect_within_the_box() {
-        assert_eq!(fit(3840, 2160), (480, 270));
-        assert_eq!(fit(1280, 720), (480, 270));
-        assert_eq!(fit(3840, 2082), (480, 260));
-        assert_eq!(fit(1080, 1920), (168, 300));
-        assert_eq!(fit(1600, 1000), (480, 300));
-        // Never upscaled.
-        assert_eq!(fit(320, 240), (320, 240));
-        assert_eq!(fit(0, 0), (2, 2));
+        assert_eq!(
+            fit(Size {
+                width: 3840,
+                height: 2160
+            }),
+            Size {
+                width: 480,
+                height: 270
+            }
+        );
+        assert_eq!(
+            fit(Size {
+                width: 1280,
+                height: 720
+            }),
+            Size {
+                width: 480,
+                height: 270
+            }
+        );
+        assert_eq!(
+            fit(Size {
+                width: 3840,
+                height: 2082
+            }),
+            Size {
+                width: 480,
+                height: 260
+            }
+        );
+        assert_eq!(
+            fit(Size {
+                width: 1080,
+                height: 1920
+            }),
+            Size {
+                width: 168,
+                height: 300
+            }
+        );
+        assert_eq!(
+            fit(Size {
+                width: 1600,
+                height: 1000
+            }),
+            Size {
+                width: 480,
+                height: 300
+            }
+        );
+        // No upscaling.
+        assert_eq!(
+            fit(Size {
+                width: 320,
+                height: 240
+            }),
+            Size {
+                width: 320,
+                height: 240
+            }
+        );
+        assert_eq!(
+            fit(Size {
+                width: 0,
+                height: 0
+            }),
+            Size {
+                width: 2,
+                height: 2
+            }
+        );
     }
 
     #[test]
