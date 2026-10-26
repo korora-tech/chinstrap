@@ -248,7 +248,10 @@ impl FakeEngine {
             .iter()
             .map(|&(enc, fps)| EncoderCap {
                 enc,
-                max: (4096, 2160),
+                max: Size {
+                    width: 4096,
+                    height: 2160,
+                },
                 fps_at_max: fps,
             })
             .collect();
@@ -261,7 +264,10 @@ impl FakeEngine {
                         demands.push(Demand {
                             key,
                             label: "Camera".into(),
-                            size: (m.width, m.height),
+                            size: Size {
+                                width: m.width,
+                                height: m.height,
+                            },
                             fps: m.fps_n as f64 / m.fps_d.max(1) as f64,
                             native: false,
                             gpu_path: false,
@@ -273,12 +279,15 @@ impl FakeEngine {
                     if let Some(s) = self.sources.iter().find(|s| s.id == id) {
                         let (fps, native) = match s.frame_rate.cfr_fps() {
                             Some(f) => (f as f64, false),
-                            None => (s.refresh.map_or(60.0, |(n, d)| n as f64 / d as f64), true),
+                            None => (s.refresh.map_or(60.0, |rate| rate.as_f64()), true),
                         };
                         demands.push(Demand {
                             key,
                             label: s.label.clone(),
-                            size: s.size.unwrap_or((3840, 2160)),
+                            size: s.size.unwrap_or(Size {
+                                width: 3840,
+                                height: 2160,
+                            }),
                             fps,
                             native,
                             gpu_path: true,
@@ -295,15 +304,18 @@ impl FakeEngine {
                 .inputs
                 .iter()
                 .map(|a| {
-                    let size = demands
-                        .iter()
-                        .find(|d| d.key == a.key)
-                        .map_or((3840, 2160), |d| d.size);
+                    let size = demands.iter().find(|d| d.key == a.key).map_or(
+                        Size {
+                            width: 3840,
+                            height: 2160,
+                        },
+                        |d| d.size,
+                    );
                     PlannedInput {
                         input: a.key,
                         encoder: a.enc,
-                        width: size.0,
-                        height: size.1,
+                        width: size.width,
+                        height: size.height,
                         fps: a.fps,
                         native: a.native,
                         load_pct: (a.load * 100.0).round() as u32,
@@ -677,11 +689,17 @@ impl FakeEngine {
                     capture: None,
                     kind: SourceKind::TestPattern,
                     label: format!("Test pattern {}", id.0),
-                    logical_size: Some((1280, 720)),
+                    logical_size: Some(Size {
+                        width: 1280,
+                        height: 720,
+                    }),
                     state: SourceState::Checking,
                     frame_rate: FrameRateMode::Cfr30,
-                    refresh: Some((60, 1)),
-                    size: Some((1280, 720)),
+                    refresh: Some(Fraction { num: 60, den: 1 }),
+                    size: Some(Size {
+                        width: 1280,
+                        height: 720,
+                    }),
                 });
                 self.after(CHECK_DELAY, Timer::SourceReady(id));
                 self.snapshot();
@@ -1146,11 +1164,20 @@ impl FakeEngine {
                         capture: Some(capture),
                         kind: SourceKind::Window,
                         label: format!("Window {}", id.0),
-                        logical_size: Some((1600, 1000)),
+                        logical_size: Some(Size {
+                            width: 1600,
+                            height: 1000,
+                        }),
                         state: SourceState::Checking,
                         frame_rate: self.frame_rate_default,
-                        refresh: Some((143_999, 1000)),
-                        size: Some((3840, 2082)),
+                        refresh: Some(Fraction {
+                            num: 143_999,
+                            den: 1000,
+                        }),
+                        size: Some(Size {
+                            width: 3840,
+                            height: 2082,
+                        }),
                     });
                     self.after(CHECK_DELAY, Timer::SourceReady(id));
                 }
@@ -1299,7 +1326,11 @@ impl FakeEngine {
 /// A synthetic 480×270 preview frame: a gradient in the input's own hue, a bar sweeping
 /// across every 2 s, and a red frame while recording.
 fn fake_frame(key: InputKey, origin: PreviewOrigin, t: f64) -> PreviewFrame {
-    let (w, h) = preview::fit(1920, 1080);
+    let size = preview::fit(Size {
+        width: 1920,
+        height: 1080,
+    });
+    let (w, h) = (size.width as u32, size.height as u32);
     let (w, h) = (w as usize, h as usize);
     let hue = match key {
         InputKey::Camera => 200.0,

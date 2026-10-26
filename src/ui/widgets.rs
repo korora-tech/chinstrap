@@ -10,9 +10,9 @@ use gpui::{
 
 use super::theme::*;
 use crate::studio::{
-    InputFile, InputQuality, InputStatus, Notice, PreviewState, SegmentStatus, SegmentSummary,
-    Severity, SourceInfo, SourceKind, SourceState, TranscribeStage, TranscriptStatus,
-    WhisperBackend,
+    Fraction, InputFile, InputQuality, InputStatus, Notice, PreviewState, SegmentStatus,
+    SegmentSummary, Severity, SourceInfo, SourceKind, SourceState, TranscribeStage,
+    TranscriptStatus, WhisperBackend,
 };
 
 pub type OnClick = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
@@ -426,11 +426,11 @@ fn source_kind_tag(kind: SourceKind) -> &'static str {
 }
 
 /// Formats a rational rate: "144", "29.97".
-pub fn format_rate(n: i32, d: i32) -> String {
-    if d <= 0 {
+pub fn format_rate(rate: Fraction) -> String {
+    if rate.den <= 0 {
         return "?".into();
     }
-    format_fps(n as f64 / d as f64)
+    format_fps(rate.as_f64())
 }
 
 /// "60", "29.97", "143.86" without trailing zeros.
@@ -576,14 +576,14 @@ pub fn source_row(info: &SourceInfo, extras: SourceRowExtras, on_remove: Option<
         SourceState::Lost { reason } => ("Lost", RED, Some(reason.clone())),
     };
     let mut detail = match info.size.or(info.logical_size) {
-        Some((w, h)) => format!("{w}×{h}"),
+        Some(size) => format!("{}×{}", size.width, size.height),
         None => match info.kind {
             SourceKind::TestPattern => "videotestsrc · 1280×720".to_string(),
             _ => "size unknown".to_string(),
         },
     };
-    if let Some((n, d)) = info.refresh {
-        detail = format!("{detail} · {} Hz", format_rate(n, d));
+    if let Some(rate) = info.refresh {
+        detail = format!("{detail} · {} Hz", format_rate(rate));
     }
     if let Some(plan) = extras.plan {
         detail = format!("{detail} · {plan}");
@@ -1052,8 +1052,14 @@ mod tests {
         assert_eq!(db_to_fraction(-60.0), 0.0);
         assert_eq!(db_to_fraction(0.0), 1.0);
         assert_eq!(db_to_fraction(f32::NEG_INFINITY), 0.0);
-        assert_eq!(format_rate(144, 1), "144");
-        assert_eq!(format_rate(30000, 1001), "29.97");
+        assert_eq!(format_rate(Fraction { num: 144, den: 1 }), "144");
+        assert_eq!(
+            format_rate(Fraction {
+                num: 30_000,
+                den: 1_001
+            }),
+            "29.97"
+        );
         assert_eq!(format_fps(25.0), "25");
     }
 

@@ -26,9 +26,9 @@ use gstreamer_pbutils as pbutils;
 use gstreamer_pbutils::prelude::*;
 
 use crate::studio::{
-    self, EngineCommand, EngineEvent, FrameRateMode, InputKey, InputStatus, ModelState, Phase,
-    PreviewOrigin, Previews, SegmentStatus, Severity, Snapshot, SourceId, SourceKind, SourceState,
-    TestBehaviour, TranscriptStatus,
+    self, EngineCommand, EngineEvent, Fraction, FrameRateMode, InputKey, InputStatus, ModelState,
+    Phase, PreviewOrigin, Previews, SegmentStatus, Severity, Snapshot, SourceId, SourceKind,
+    SourceState, TestBehaviour, TranscriptStatus,
 };
 
 const DURATION_TOLERANCE: Duration = Duration::from_millis(600);
@@ -129,7 +129,7 @@ struct FileCheck {
     height: Option<u32>,
     duration: Option<Duration>,
     /// Frame rate (num, den) and H.264 profile/level, video only.
-    fps: Option<(i32, i32)>,
+    fps: Option<Fraction>,
     profile: Option<String>,
     level: Option<String>,
 }
@@ -199,7 +199,7 @@ fn check_video(disc: &pbutils::Discoverer, path: &Path) -> Result<FileCheck, Str
         width: Some(w),
         height: Some(h),
         duration: info.duration().map(|d| Duration::from_nanos(d.nseconds())),
-        fps: (rate.numer() > 0).then(|| (rate.numer(), rate.denom())),
+        fps: (rate.numer() > 0).then(|| Fraction::from(rate)),
         profile: field("profile"),
         level: field("level"),
     })
@@ -648,11 +648,8 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     }
 
     // 6. Validate files. The test file keeps the first caps size (CHINSTRAP_TEST_SIZE).
-    let (test_w, test_h) = {
-        let (w, h) = studio::test_size();
-        let (w, h) = studio::lock_size(w, h);
-        (w as u32, h as u32)
-    };
+    let test_size = studio::lock_size(studio::test_size());
+    let (test_w, test_h) = (test_size.width as u32, test_size.height as u32);
     let disc = pbutils::Discoverer::new(gst::ClockTime::from_seconds(5))
         .map_err(|e| format!("Discoverer: {e}"))?;
     let mut seg_json = Vec::new();
@@ -725,7 +722,7 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
                             if f.input == InputKey::Camera
                                 && let Some((ew, eh, efps)) = camera_expect
                             {
-                                let fps = fc.fps.map(|(n, d)| n as f64 / d.max(1) as f64);
+                                let fps = fc.fps.map(|rate| rate.as_f64());
                                 if (fc.width, fc.height) != (Some(ew), Some(eh)) {
                                     problem = Some(format!(
                                         "camera file is {:?}×{:?}, expected the native {ew}×{eh}",
@@ -763,7 +760,7 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
                             files_json.push(serde_json::json!({
                                 "file": f.path.file_name().map(|n| n.to_string_lossy().to_string()),
                                 "width": fc.width, "height": fc.height,
-                                "framerate": fc.fps.map(|(n, d)| format!("{n}/{d}")),
+                                "framerate": fc.fps.map(|rate| format!("{}/{}", rate.num, rate.den)),
                                 "profile": fc.profile, "level": fc.level,
                                 "duration_s": fc.duration.map(|d| d.as_secs_f64()),
                                 "quality": f.quality.as_ref().map(|q| serde_json::json!({
@@ -1412,13 +1409,19 @@ fn check_load(
     let standin = want.eq_ignore_ascii_case("standin");
     let mode = load_mode();
     let window = TestBehaviour {
-        size: Some((3840, 2160)),
+        size: Some(studio::Size {
+            width: 3840,
+            height: 2160,
+        }),
         refresh: Some(144),
         keep_size: true,
         ..Default::default()
     };
     let uhd = TestBehaviour {
-        size: Some((3840, 2160)),
+        size: Some(studio::Size {
+            width: 3840,
+            height: 2160,
+        }),
         keep_size: true,
         ..Default::default()
     };
@@ -1748,7 +1751,11 @@ fn summary(
         "ok": ok,
         "encoder": caps.h264_encoder.map(|e| e.element_name()),
         "convert": caps.gpu_convert.map(|c| format!("{c:?}").to_lowercase()),
-        "test_size": format!("{}×{}", studio::test_size().0, studio::test_size().1),
+        "test_size": format!(
+            "{}×{}",
+            studio::test_size().width,
+            studio::test_size().height
+        ),
         "targeting": targeting,
         "transcription": transcription,
         "segments": segments,

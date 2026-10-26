@@ -1,6 +1,44 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use gstreamer as gst;
+
+/// Pixel dimensions, in width × height order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Size {
+    pub width: i32,
+    pub height: i32,
+}
+
+/// A rational value, such as a frame rate in frames per second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Fraction {
+    pub num: i32,
+    pub den: i32,
+}
+
+impl Fraction {
+    /// Returns the mathematical value `num / den`.
+    pub fn as_f64(self) -> f64 {
+        self.num as f64 / self.den as f64
+    }
+}
+
+impl From<gst::Fraction> for Fraction {
+    fn from(value: gst::Fraction) -> Self {
+        Self {
+            num: value.numer(),
+            den: value.denom(),
+        }
+    }
+}
+
+impl From<Fraction> for gst::Fraction {
+    fn from(value: Fraction) -> Self {
+        gst::Fraction::new(value.num, value.den)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DeviceId(pub u32);   // engine-assigned, stable for process lifetime (keyed by object.serial / node.name)
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -52,13 +90,13 @@ pub struct SourceInfo {
     pub capture: Option<CaptureId>,       // None for TestPattern
     pub kind: SourceKind,
     pub label: String,                    // "Screen 1" / "Window 2" / "Test pattern 3" (number = SourceId)
-    pub logical_size: Option<(i32, i32)>, // portal Stream::size(), informational
+    pub logical_size: Option<Size>,      // portal Stream::size(), informational
     pub state: SourceState,
     pub frame_rate: FrameRateMode,
     /// The source's own maximum output rate (portal: the output refresh, from negotiation).
-    pub refresh: Option<(i32, i32)>,
+    pub refresh: Option<Fraction>,
     /// Physical size from negotiation, when known.
-    pub size: Option<(i32, i32)>,
+    pub size: Option<Size>,
 }
 
 /// A video encoder. (Historically H.264 only, hence `Capabilities::h264_encoder`.)
@@ -396,4 +434,20 @@ pub enum EngineEvent {
     Snapshot(Box<Snapshot>),             // after EVERY state change; first event is always a Snapshot
     Notice(Notice),
     Level { rms_db: f32, peak_db: f32 }, // mic only, ≤10 Hz, max over channels, while recording
+}
+
+#[cfg(test)]
+mod size_fraction_tests {
+    use super::{Fraction, Size};
+
+    #[test]
+    fn size_and_fraction_types_use_named_components_and_round_trip() {
+        let size = Size { width: 3840, height: 2160 };
+        assert_eq!((size.width, size.height), (3840, 2160));
+
+        let rate = Fraction { num: 60_000, den: 1_001 };
+        let gst_rate: gstreamer::Fraction = rate.into();
+        assert_eq!(Fraction::from(gst_rate), rate);
+        assert!((rate.as_f64() - 60_000.0 / 1_001.0).abs() < 0.0001);
+    }
 }

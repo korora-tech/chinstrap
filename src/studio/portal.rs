@@ -18,7 +18,7 @@ use futures::StreamExt;
 use smol::{LocalExecutor, Timer};
 
 use super::engine::Msg;
-use super::types::{CaptureId, PortalAvailability};
+use super::types::{CaptureId, PortalAvailability, Size};
 
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -28,8 +28,12 @@ pub(super) enum PortalCmd {
     Shutdown,
 }
 
-/// One stream of a capture: (PipeWire node id, source type, logical size).
-pub(super) type StreamDesc = (u32, Option<SourceType>, Option<(i32, i32)>);
+/// One stream returned by a capture portal session.
+pub(super) struct StreamDesc {
+    pub node: u32,
+    pub source_type: Option<SourceType>,
+    pub logical_size: Option<Size>,
+}
 
 pub(super) enum PortalOutcome {
     Availability(PortalAvailability),
@@ -235,7 +239,11 @@ async fn pick_flow(
     let descs: Vec<StreamDesc> = streams
         .streams()
         .iter()
-        .map(|s| (s.pipe_wire_node_id(), s.source_type(), s.size()))
+        .map(|s| StreamDesc {
+            node: s.pipe_wire_node_id(),
+            source_type: s.source_type(),
+            logical_size: s.size().map(|(width, height)| Size { width, height }),
+        })
         .collect();
     if descs.is_empty() {
         close_session(&session).await;
