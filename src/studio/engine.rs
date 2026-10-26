@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -142,7 +142,7 @@ pub(super) enum Msg {
 struct Inner {
     tx: mpsc::Sender<Msg>,
     previews: Previews,
-    done: Mutex<Option<bool>>,
+    done: OnceLock<bool>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -179,28 +179,25 @@ impl EngineHandle {
     /// Idempotent and bounded by `timeout` on every path; returns false on timeout (files may lack
     /// Cues/Duration; manifest may still say "recording"; thread left detached).
     pub fn shutdown_blocking(&self, timeout: Duration) -> bool {
-        let mut done = self.inner.done.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(result) = *done {
-            return result;
-        }
-        let (ack, ack_rx) = mpsc::sync_channel(1);
-        let deadline = Instant::now() + timeout.saturating_sub(Duration::from_millis(250));
-        // Ok(false): the engine acked but ran out of time, so some file may lack its index.
-        let acked = match self.inner.tx.send(Msg::Shutdown { deadline, ack }) {
-            Ok(()) => ack_rx.recv_timeout(timeout).ok(),
-            // The thread exited without acknowledging a shutdown (e.g. it panicked).
-            Err(_) => None,
-        };
-        let result = acked == Some(true);
-        let mut join = self.inner.join.lock().unwrap_or_else(|e| e.into_inner());
-        // Join only after an ack, or when the thread has already finished (join cannot block).
-        if (acked.is_some() || join.as_ref().is_some_and(|h| h.is_finished()))
-            && let Some(handle) = join.take()
-        {
-            let _ = handle.join();
-        }
-        *done = Some(result);
-        result
+        *self.inner.done.get_or_init(|| {
+            let (ack, ack_rx) = mpsc::sync_channel(1);
+            let deadline = Instant::now() + timeout.saturating_sub(Duration::from_millis(250));
+            // Ok(false): the engine acked but ran out of time, so some file may lack its index.
+            let acked = match self.inner.tx.send(Msg::Shutdown { deadline, ack }) {
+                Ok(()) => ack_rx.recv_timeout(timeout).ok(),
+                // The thread exited without acknowledging a shutdown (e.g. it panicked).
+                Err(_) => None,
+            };
+            let result = acked == Some(true);
+            let mut join = self.inner.join.lock().expect("engine join lock poisoned");
+            // Join only after an ack, or when the thread has already finished (join cannot block).
+            if (acked.is_some() || join.as_ref().is_some_and(|h| h.is_finished()))
+                && let Some(handle) = join.take()
+            {
+                let _ = handle.join();
+            }
+            result
+        })
     }
 }
 
@@ -267,7 +264,7 @@ pub fn start(
     let inner = Arc::new(Inner {
         tx,
         previews,
-        done: Mutex::new(None),
+        done: OnceLock::new(),
         join: Mutex::new(Some(join)),
     });
     Ok((EngineHandle { inner }, events_rx))
@@ -729,19 +726,14 @@ impl Engine {
             }
         };
         let now = Instant::now();
-        let (wtx, mtx) = (Mutex::new(tx.clone()), Mutex::new(tx.clone()));
+        let worker_tx = tx.clone();
+        let model_tx = tx.clone();
         let transcription = Transcription::new(TxConfig::from_env(
             Arc::new(move |e| {
-                let _ = wtx
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .send(Msg::Transcribe(e));
+                let _ = worker_tx.send(Msg::Transcribe(e));
             }),
             Arc::new(move |e| {
-                let _ = mtx
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .send(Msg::Model(e));
+                let _ = model_tx.send(Msg::Model(e));
             }),
         ));
         Self {
