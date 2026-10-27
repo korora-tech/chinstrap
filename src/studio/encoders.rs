@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
+use super::PipelineError;
 use super::types::{GpuConvert, InputClass, REQUIRED_ELEMENTS, VideoCodec, VideoEncoder};
 
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -265,49 +266,54 @@ pub fn make_encoder(
     enc: VideoEncoder,
     role: Role,
     fps: (i32, i32),
-) -> Result<gst::Element, String> {
+) -> Result<gst::Element, PipelineError> {
     let el = gst::ElementFactory::make(enc.element_name())
         .build()
-        .map_err(|e| format!("{}: {e}", enc.element_name()))?;
+        .map_err(|e| PipelineError::MissingElement {
+            factory: enc.element_name().to_owned(),
+            message: e.to_string(),
+        })?;
     configure_encoder(&el, enc, role, fps);
     Ok(el)
 }
 
 /// Runs a launch-line pipeline to EOS, bounded by `timeout`. Blocking.
-pub fn run_probe(desc: &str, timeout: Duration) -> Result<(), String> {
-    let element = gst::parse::launch(desc).map_err(|e| e.to_string())?;
+pub fn run_probe(desc: &str, timeout: Duration) -> Result<(), PipelineError> {
+    let element = gst::parse::launch(desc).map_err(|e| PipelineError::from_gst_error(&e, None))?;
     let pipeline = element
         .downcast::<gst::Pipeline>()
-        .map_err(|_| "not a pipeline".to_string())?;
+        .map_err(|_| PipelineError::NotPipeline)?;
     run_pipeline(&pipeline, timeout)
 }
 
 /// Runs `pipeline` to EOS, bounded by `timeout`, then sets it to Null. Blocking.
-fn run_pipeline(pipeline: &gst::Pipeline, timeout: Duration) -> Result<(), String> {
-    let bus = pipeline.bus().ok_or("pipeline has no bus")?;
+fn run_pipeline(pipeline: &gst::Pipeline, timeout: Duration) -> Result<(), PipelineError> {
+    let bus = pipeline.bus().ok_or(PipelineError::NoBus)?;
     let deadline = Instant::now() + timeout;
     let result = (|| {
         pipeline
             .set_state(gst::State::Playing)
-            .map_err(|e| format!("failed to start: {e}"))?;
+            .map_err(|e| PipelineError::StateChange {
+                element: pipeline.name().to_string(),
+                message: format!("failed to start: {e}"),
+            })?;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err("timed out".to_string());
+                return Err(PipelineError::TimedOut);
             }
             let Some(msg) = bus.timed_pop_filtered(
                 gst::ClockTime::from_nseconds(remaining.as_nanos() as u64),
                 &[gst::MessageType::Eos, gst::MessageType::Error],
             ) else {
-                return Err("timed out".to_string());
+                return Err(PipelineError::TimedOut);
             };
             match msg.view() {
                 gst::MessageView::Eos(_) => return Ok(()),
                 gst::MessageView::Error(e) => {
-                    return Err(format!(
-                        "{}{}",
-                        e.error(),
-                        e.debug().map(|d| format!(" ({d})")).unwrap_or_default()
+                    return Err(PipelineError::from_gst_error(
+                        &e.error(),
+                        e.debug().map(|d| d.to_string()),
                     ));
                 }
                 _ => {}
@@ -381,9 +387,9 @@ pub fn measure_encoder(
     w: i32,
     h: i32,
     timeout: Duration,
-) -> Result<f64, String> {
+) -> Result<f64, PipelineError> {
     if timeout < Duration::from_millis(200) {
-        return Err("no time left to measure".into());
+        return Err(PipelineError::NoTimeToMeasure);
     }
     const FRAMES: u32 = 40;
     let desc = format!(
@@ -396,9 +402,9 @@ pub fn measure_encoder(
         parser_name(enc)
     );
     let pipeline = gst::parse::launch(&desc)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| PipelineError::from_gst_error(&e, None))?
         .downcast::<gst::Pipeline>()
-        .map_err(|_| "not a pipeline".to_string())?;
+        .map_err(|_| PipelineError::NotPipeline)?;
     let el = pipeline.by_name("enc").ok_or("no encoder")?;
     configure_encoder(&el, enc, Role::Screen, (60, 1));
     set_bitrate(
@@ -431,8 +437,8 @@ pub fn measure_encoder(
     };
     match (run, measured) {
         (Ok(()), Some(fps)) => Ok(fps),
-        (Err(e), Some(fps)) if e == "timed out" => Ok(fps),
-        (Ok(()), None) => Err(format!("only {n} frames encoded")),
+        (Err(e), Some(fps)) if matches!(&e, PipelineError::TimedOut) => Ok(fps),
+        (Ok(()), None) => Err(PipelineError::TooFewFrames(n)),
         (Err(e), _) => Err(e),
     }
 }
@@ -551,6 +557,17 @@ pub fn convert_name(convert: Option<GpuConvert>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measurement_with_no_time_returns_a_typed_error() {
+        let error = measure_encoder(VideoEncoder::X264, FHD.0, FHD.1, Duration::from_millis(199))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::studio::PipelineError::NoTimeToMeasure
+        ));
+        assert_eq!(error.to_string(), "no time left to measure");
+    }
 
     #[test]
     fn from_element_name_round_trip() {

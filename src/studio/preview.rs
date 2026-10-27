@@ -21,6 +21,7 @@ use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
 
+use super::PipelineError;
 use super::encoders::set_prop;
 use super::recorder::{capsfilter, make};
 use super::types::{InputKey, PreviewFrame, PreviewOrigin};
@@ -173,8 +174,8 @@ pub fn branch(
     pre: Vec<gst::Element>,
     scaler: Scaler,
     detached: bool,
-) -> Result<(), String> {
-    let named = |factory: &str, name: &str| -> Result<gst::Element, String> {
+) -> Result<(), PipelineError> {
+    let named = |factory: &str, name: &str| -> Result<gst::Element, PipelineError> {
         let el = make(factory)?;
         el.set_property("name", format!("{BRANCH_PREFIX}{name}"));
         Ok(el)
@@ -227,15 +228,21 @@ pub fn branch(
             .build(),
     );
     chain.push(sink.upcast());
-    pipeline
-        .add_many(&chain)
-        .map_err(|e| format!("cannot add preview elements: {e}"))?;
-    gst::Element::link_many(&chain).map_err(|e| format!("cannot link the preview: {e}"))?;
+    pipeline.add_many(&chain).map_err(|e| PipelineError::Link {
+        message: format!("cannot add preview elements: {e}"),
+    })?;
+    gst::Element::link_many(&chain).map_err(|e| PipelineError::Link {
+        message: format!("cannot link the preview: {e}"),
+    })?;
     let peer = queue
         .static_pad("sink")
-        .ok_or("preview queue has no sink pad")?;
-    from.link(&peer)
-        .map_err(|e| format!("cannot link the preview branch: {e:?}"))?;
+        .ok_or_else(|| PipelineError::MissingPad {
+            element: "preview queue".to_owned(),
+            pad: "sink".to_owned(),
+        })?;
+    from.link(&peer).map_err(|e| PipelineError::Link {
+        message: format!("cannot link the preview branch: {e:?}"),
+    })?;
     if detached {
         hide_caps(from, peer.clone(), tap.killed.clone());
     }

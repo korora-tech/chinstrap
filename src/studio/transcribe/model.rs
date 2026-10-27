@@ -386,6 +386,8 @@ impl std::fmt::Display for DlError {
     }
 }
 
+impl std::error::Error for DlError {}
+
 fn part_path(dest: &Path) -> PathBuf {
     let mut s = dest.as_os_str().to_owned();
     s.push(".part");
@@ -721,6 +723,12 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn dl_error_implements_std_error() {
+        fn assert_error<T: std::error::Error>() {}
+        assert_error::<DlError>();
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(

@@ -39,8 +39,29 @@ pub struct FileResult {
     pub rtf: f64,
 }
 
-/// Exit code and message.
-pub type CliError = (i32, String);
+/// A headless CLI failure, kept separate from the process-level exit status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CliError {
+    pub exit_code: i32,
+    pub message: String,
+}
+
+impl CliError {
+    fn new(exit_code: i32, message: impl Into<String>) -> Self {
+        Self {
+            exit_code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliError {}
 
 fn mib(b: u64) -> f64 {
     b as f64 / (1u64 << 20) as f64
@@ -55,9 +76,12 @@ pub fn transcribe_file(
     cpu: bool,
     quiet: bool,
 ) -> Result<FileResult, CliError> {
-    let media = std::path::absolute(media).map_err(|e| (2, e.to_string()))?;
+    let media = std::path::absolute(media).map_err(|e| CliError::new(2, e.to_string()))?;
     if !media.is_file() {
-        return Err((1, format!("{}: no such file", media.display())));
+        return Err(CliError::new(
+            1,
+            format!("{}: no such file", media.display()),
+        ));
     }
     let dir = model::models_dir();
     let (model_path, model_id, sha) = match resolved {
@@ -68,7 +92,7 @@ pub fn transcribe_file(
                 Some(spec.sha256.to_string()),
             ),
             Ok(FileCheck::Missing) => {
-                return Err((
+                return Err(CliError::new(
                     3,
                     format!(
                         "model {} is not downloaded: run `chinstrap --download-model`",
@@ -77,7 +101,7 @@ pub fn transcribe_file(
                 ));
             }
             Ok(bad @ FileCheck::Quarantined(_)) => {
-                return Err((
+                return Err(CliError::new(
                     3,
                     format!(
                         "model {}: {}; run `chinstrap --download-model`",
@@ -87,7 +111,7 @@ pub fn transcribe_file(
                 ));
             }
             Err(e) => {
-                return Err((
+                return Err(CliError::new(
                     3,
                     format!("model {}: cannot check {}: {e}", spec.name, spec.file),
                 ));
@@ -95,7 +119,10 @@ pub fn transcribe_file(
         },
         Resolved::External { id, path } => {
             if !path.is_file() {
-                return Err((3, format!("model {} not found", path.display())));
+                return Err(CliError::new(
+                    3,
+                    format!("model {} not found", path.display()),
+                ));
             }
             (path.clone(), id.clone(), None)
         }
@@ -128,9 +155,9 @@ pub fn transcribe_file(
             .unwrap_or(0),
     };
     for attempt in 0..2 {
-        let cmd = driver::worker_command().map_err(|e| (1, e.to_string()))?;
+        let cmd = driver::worker_command().map_err(|e| CliError::new(1, e.to_string()))?;
         let run = Running::spawn(cmd, &job, Some("whisper: "))
-            .map_err(|e| (1, format!("cannot start the worker: {e}")))?;
+            .map_err(|e| CliError::new(1, format!("cannot start the worker: {e}")))?;
         let mut backend = String::new();
         let mut last_stage = String::new();
         let exit = run.wait(|ev| match ev {
@@ -179,10 +206,10 @@ pub fn transcribe_file(
                 );
                 job.backend = BackendReq::Cpu;
             }
-            (_, _) => return Err((1, exit.reason)),
+            (_, _) => return Err(CliError::new(1, exit.reason)),
         }
     }
-    Err((1, "transcription failed".into()))
+    Err(CliError::new(1, "transcription failed"))
 }
 
 const USAGE: &str =
@@ -245,10 +272,11 @@ pub fn run_cli(args: &[String]) -> i32 {
             );
             0
         }
-        Err((code, msg)) => {
-            eprintln!("chinstrap: {msg}");
-            println!("{}", serde_json::json!({"ok": false, "error": msg}));
-            code
+        Err(error) => {
+            let CliError { exit_code, message } = error;
+            eprintln!("chinstrap: {message}");
+            println!("{}", serde_json::json!({"ok": false, "error": message}));
+            exit_code
         }
     }
 }
@@ -323,5 +351,23 @@ pub fn download_cli(name: Option<&str>) -> i32 {
             eprintln!("chinstrap: download failed: {reason} (run again to resume)");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_error_has_named_exit_code_and_is_an_error() {
+        let error = CliError {
+            exit_code: 2,
+            message: "bad input".into(),
+        };
+        assert_eq!(error.exit_code, 2);
+        assert_eq!(error.to_string(), "bad input");
+
+        fn assert_error<T: std::error::Error>() {}
+        assert_error::<CliError>();
     }
 }
