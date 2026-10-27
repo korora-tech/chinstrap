@@ -1,4 +1,5 @@
-use gpui::{Context, FontWeight, Render, ScrollHandle, Window, div, point, prelude::*, px, rgb};
+use gpui::prelude::*;
+use gpui::{Context, FontWeight, Render, ScrollHandle, Window, div, point, px, rgb};
 
 const BG: u32 = 0x0d0f14;
 const PANEL: u32 = 0x12151c;

@@ -1,7 +1,6 @@
 pub mod engine;
 mod fake;
-// Frozen contract, kept verbatim from SPEC §3.1; rustfmt must not reflow it.
-#[rustfmt::skip]
+// Shared public data contracts for the studio engine and UI.
 pub mod types;
 
 mod devices;

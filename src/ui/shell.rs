@@ -2,13 +2,17 @@
 
 use std::time::Duration;
 
+use gpui::prelude::*;
 use gpui::{
-    ClickEvent, Context, Entity, FocusHandle, Focusable, FontWeight, Subscription, Window, div,
-    prelude::*, px, rgb,
+    ClickEvent, Context, Entity, FocusHandle, Focusable, FontWeight, Subscription, Window, div, px,
+    rgb,
 };
 
 use super::studio_view::{CloseIntent, CloseWindowNow, StudioView};
-use super::theme::*;
+use super::theme::{
+    ACCENT, ACCENT_TEXT, BG, BORDER, GREEN, HEADER, HOVER, MUTED, PANEL, SECONDARY, SELECTED,
+    SELECTED_BORDER, TEXT,
+};
 use super::{Quit, ShowExplorer, ShowStudio};
 use crate::explorer::FeatureExplorer;
 use crate::studio::{EngineEvent, EngineHandle};

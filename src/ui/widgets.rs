@@ -3,12 +3,16 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui::prelude::*;
 use gpui::{
     App, ClickEvent, Div, ElementId, FocusHandle, FontWeight, ObjectFit, RenderImage, SharedString,
-    Stateful, Window, div, img, prelude::*, px, relative, rgb,
+    Stateful, Window, div, img, px, relative, rgb,
 };
 
-use super::theme::*;
+use super::theme::{
+    ACCENT, ACCENT_TEXT, AMBER, BORDER, CAPTION, DISABLED, GREEN, HOVER, MUTED, PANEL,
+    PANEL_RAISED, RED, SECONDARY, SELECTED, SELECTED_BORDER, SIDEBAR, TEXT,
+};
 use crate::studio::{
     InputFile, InputQuality, InputStatus, Notice, PreviewState, SegmentStatus, SegmentSummary,
     Severity, SourceInfo, SourceKind, SourceState, TranscribeStage, TranscriptStatus,
