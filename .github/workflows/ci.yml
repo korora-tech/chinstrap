@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'refactor/**']
   pull_request:
-    branches: [main, refactor/issue-4-typed-errors]
+    branches: [main, 'refactor/**']
 
 jobs:
   quality:
