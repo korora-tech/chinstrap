@@ -22,6 +22,15 @@ struct Category {
     features: &'static [Feature],
 }
 
+struct NavigationItem {
+    title: &'static str,
+    subtitle: &'static str,
+    initials: &'static str,
+    category: Option<usize>,
+    active: bool,
+    count: String,
+}
+
 const CATEGORIES: &[Category] = &[
     Category {
         title: "Multi-Source Capture",
@@ -661,12 +670,14 @@ impl FeatureExplorer {
                     .flex_1()
                     .overflow_y_scroll()
                     .child(self.navigation_item(
-                        "All features",
-                        "Explore every capability",
-                        "ALL",
-                        None,
-                        self.active_category.is_none(),
-                        format!("{total}"),
+                        NavigationItem {
+                            title: "All features",
+                            subtitle: "Explore every capability",
+                            initials: "ALL",
+                            category: None,
+                            active: self.active_category.is_none(),
+                            count: format!("{total}"),
+                        },
                         cx,
                     ))
                     .child(
@@ -681,12 +692,14 @@ impl FeatureExplorer {
                     )
                     .children(CATEGORIES.iter().enumerate().map(|(index, category)| {
                         self.navigation_item(
-                            category.title,
-                            category.subtitle,
-                            category.initials,
-                            Some(index),
-                            self.active_category == Some(index),
-                            format!("{}", category.features.len()),
+                            NavigationItem {
+                                title: category.title,
+                                subtitle: category.subtitle,
+                                initials: category.initials,
+                                category: Some(index),
+                                active: self.active_category == Some(index),
+                                count: format!("{}", category.features.len()),
+                            },
                             cx,
                         )
                     })),
@@ -725,14 +738,17 @@ impl FeatureExplorer {
 
     fn navigation_item(
         &self,
-        title: &'static str,
-        subtitle: &'static str,
-        initials: &'static str,
-        category: Option<usize>,
-        active: bool,
-        count: String,
+        item: NavigationItem,
         cx: &mut Context<Self>,
     ) -> impl gpui::IntoElement + use<> {
+        let NavigationItem {
+            title,
+            subtitle,
+            initials,
+            category,
+            active,
+            count,
+        } = item;
         let category_index = category;
         let target = category_index.map(Self::first_feature_index).unwrap_or(0);
         let accent = category_index

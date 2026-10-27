@@ -18,7 +18,7 @@ use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::*;
 
-use super::devices::{self, CameraClass, CameraPath, Devices};
+use super::devices::{self, CameraClass, CameraPath, CameraSupport, Devices, JpegDecodeSupport};
 use super::encoders::{self, Role};
 use super::fake;
 use super::plan::{self, Demand, Plan};
@@ -320,6 +320,20 @@ enum Stage {
     },
     /// Worker → Null in flight.
     Nulling,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalizeMode {
+    /// Send EOS through the whole pipeline before source-pad injection is considered.
+    Graceful,
+    /// Inject EOS directly after the source, without waiting for the pipeline's EOS grace period.
+    Immediate,
+}
+
+impl FinalizeMode {
+    fn sends_pipeline_eos(self) -> bool {
+        matches!(self, Self::Graceful)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -717,9 +731,16 @@ impl Engine {
             );
         }
 
-        let mut devices = Devices::start();
-        devices.set_jpeg_ok(jpeg_ok);
-        devices.enumerate(gpu.is_some());
+        let camera_support = CameraSupport {
+            gpu_convert: gpu,
+            jpeg_decode: if jpeg_ok {
+                JpegDecodeSupport::Available
+            } else {
+                JpegDecodeSupport::Unavailable
+            },
+        };
+        let mut devices = Devices::start(camera_support);
+        devices.enumerate();
         let selected_microphone = devices.microphones.first().map(|m| m.info.id);
         let portal_state = if portal.is_some() {
             PortalAvailability::Unknown
@@ -1402,8 +1423,7 @@ impl Engine {
     }
 
     fn refresh_devices(&mut self) {
-        let gpu = self.caps.gpu_convert.is_some();
-        self.devices.enumerate(gpu);
+        self.devices.enumerate();
         self.validate_selection();
     }
 
@@ -1964,17 +1984,17 @@ impl Engine {
                     mode.output_fps(),
                     (devices::CAMERA_MAX_W, devices::CAMERA_MAX_H),
                 )?;
-                recorder::build_video(
-                    &name,
-                    VideoSource::Camera { entry: e, mode },
-                    self.caps.gpu_convert,
-                    enc,
-                    Role::Camera,
+                recorder::build_video(recorder::VideoInputSpec {
+                    name: &name,
+                    source: VideoSource::Camera { entry: e, mode },
+                    convert: self.caps.gpu_convert,
+                    encoder: enc,
+                    role: Role::Camera,
                     target,
-                    &self.clock,
+                    clock: &self.clock,
                     path,
-                    tap,
-                )
+                    preview: tap,
+                })
             }
             InputKey::Source(id) => {
                 let s = self
@@ -2002,17 +2022,17 @@ impl Engine {
                 let cfr = (s.info.frame_rate.cfr_fps().unwrap_or(self.screen_fps), 1);
                 let (enc, target) =
                     self.video_target(plan, key, cfr, (stamp::MAX_W, stamp::MAX_H))?;
-                recorder::build_video(
-                    &name,
+                recorder::build_video(recorder::VideoInputSpec {
+                    name: &name,
                     source,
                     convert,
-                    enc,
-                    Role::Screen,
+                    encoder: enc,
+                    role: Role::Screen,
                     target,
-                    &self.clock,
+                    clock: &self.clock,
                     path,
-                    tap,
-                )
+                    preview: tap,
+                })
             }
         }
     }
@@ -2035,7 +2055,7 @@ impl Engine {
             .collect();
         for (id, stage) in ids {
             match stage {
-                Stage::Running { .. } => self.finalize_input(id, true),
+                Stage::Running { .. } => self.finalize_input(id, FinalizeMode::Graceful),
                 Stage::Pausing | Stage::Paused | Stage::Starting => self.request_null(
                     id,
                     Some(Outcome::Discard("stopped before recording started".into())),
@@ -2047,9 +2067,9 @@ impl Engine {
         self.dirty = true;
     }
 
-    /// Finalizes one input (§6): healthy → pipeline EOS then inject after 1 s; broken → inject
-    /// EOS at the first element after the source right away.
-    fn finalize_input(&mut self, id: u64, healthy: bool) {
+    /// Finalizes one input (§6): graceful mode sends pipeline EOS; immediate mode injects EOS
+    /// directly after the source.
+    fn finalize_input(&mut self, id: u64, mode: FinalizeMode) {
         let deadline = self.deadline_cap(
             self.finalize_deadline
                 .unwrap_or_else(|| Instant::now() + FINALIZE_TIMEOUT),
@@ -2079,7 +2099,7 @@ impl Engine {
             Stage::Draining {
                 inject_at: Some(_),
                 deadline: d,
-            } if !healthy => {
+            } if mode == FinalizeMode::Immediate => {
                 // Already draining via the pipeline; escalate to injection now.
                 inject_eos(rec.eos_target.clone(), id);
                 p.stage = Stage::Draining {
@@ -2090,7 +2110,7 @@ impl Engine {
             }
             _ => return,
         }
-        if healthy {
+        if mode.sends_pipeline_eos() {
             let pipeline = p.pipeline.clone();
             // Variable rate: the last frame again at the stop time, so the file lasts the whole
             // segment even when the source sent nothing since (a static window).
@@ -2197,7 +2217,7 @@ impl Engine {
                 if let Some(p) = self.pipes.iter_mut().find(|p| p.id == id) {
                     p.outcome = Some(Outcome::Failed(reason));
                 }
-                self.finalize_input(id, false);
+                self.finalize_input(id, FinalizeMode::Immediate);
             }
             _ => self.request_null(id, Some(Outcome::Failed(reason))),
         }
@@ -2453,7 +2473,7 @@ impl Engine {
                             if p.outcome.is_none() {
                                 p.outcome = Some(Outcome::Failed(text.clone()));
                             }
-                            self.finalize_input(id, false);
+                            self.finalize_input(id, FinalizeMode::Immediate);
                         }
                         _ => self.fail_input(id, text),
                     }
@@ -3091,7 +3111,7 @@ impl Engine {
 
     fn tick(&mut self) {
         // Device hotplug.
-        if self.devices.poll(self.caps.gpu_convert.is_some()) {
+        if self.devices.poll() {
             self.validate_selection();
         }
         // Buses.
@@ -3695,4 +3715,19 @@ fn inject_eos(pad: gst::Pad, id: u64) {
     spawn_named(format!("chinstrap-gst-inject-{id}"), move || {
         pad.send_event(gst::event::Eos::new());
     });
+}
+
+#[cfg(test)]
+mod finalization_tests {
+    use super::FinalizeMode;
+
+    #[test]
+    fn graceful_finalization_sends_pipeline_eos() {
+        assert!(FinalizeMode::Graceful.sends_pipeline_eos());
+    }
+
+    #[test]
+    fn immediate_finalization_skips_pipeline_eos() {
+        assert!(!FinalizeMode::Immediate.sends_pipeline_eos());
+    }
 }

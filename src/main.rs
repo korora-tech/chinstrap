@@ -1,5 +1,3 @@
-// Moved verbatim from the old main.rs; the lint predates the move (SPEC §2: explorer unchanged).
-#[allow(clippy::too_many_arguments)]
 mod explorer;
 mod selftest;
 mod studio;

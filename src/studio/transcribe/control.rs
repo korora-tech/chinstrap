@@ -395,7 +395,7 @@ impl Transcription {
         true
     }
 
-    fn job_for(&self, key: &JobKey, force_cpu: bool) -> Option<Job> {
+    fn job_for(&self, key: &JobKey, backend: BackendReq) -> Option<Job> {
         let media = self.entries.get(key)?.media.clone();
         let (path, id) = match &self.model {
             ModelState::Ready { id, path, .. } | ModelState::External { id, path } => {
@@ -415,7 +415,7 @@ impl Transcription {
             model_sha256: sha,
             vad_model: model::vad_path(&self.cfg.models_dir),
             language: self.cfg.language.clone(),
-            backend: if force_cpu || self.effective_cpu() {
+            backend: if backend == BackendReq::Cpu || self.effective_cpu() {
                 BackendReq::Cpu
             } else {
                 BackendReq::Auto
@@ -438,7 +438,12 @@ impl Transcription {
             return;
         }
         self.queue.pop_front();
-        let Some(job) = self.job_for(&key, force_cpu) else {
+        let requested_backend = if force_cpu {
+            BackendReq::Cpu
+        } else {
+            BackendReq::Auto
+        };
+        let Some(job) = self.job_for(&key, requested_backend) else {
             return;
         };
         if self.worker.is_none() {
@@ -1171,6 +1176,22 @@ mod tests {
         .unwrap();
         assert_eq!(r.t.status(&key), done);
         assert_eq!(r.t.manifest_entry(&key).unwrap().status, "done");
+    }
+
+    #[test]
+    fn job_for_uses_named_backend_request() {
+        let mut r = rig("backend_request", "exit 0", false);
+        r.pump_until(false, Duration::from_secs(5), |t| {
+            matches!(t.model, ModelState::External { .. })
+        });
+        let key = r.key(1);
+        r.t.enqueue(key.clone(), r.dir.join("sess/segment-001/mic.mkv"));
+
+        let automatic = r.t.job_for(&key, BackendReq::Auto).unwrap();
+        let cpu = r.t.job_for(&key, BackendReq::Cpu).unwrap();
+        assert_eq!(automatic.backend, BackendReq::Auto);
+        assert_eq!(cpu.backend, BackendReq::Cpu);
+        r.t.shutdown();
     }
 
     #[test]

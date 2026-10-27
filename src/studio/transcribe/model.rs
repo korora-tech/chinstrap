@@ -446,6 +446,13 @@ impl Progress<'_> {
     }
 }
 
+struct DownloadState<'state, 'callback> {
+    file: &'state mut File,
+    hasher: &'state mut Sha256,
+    len: &'state mut u64,
+    progress: &'state mut Progress<'callback>,
+}
+
 /// Downloads `files` into `dir` (only call it with files that do not verify), resuming any
 /// `.part`. See §12.5 for the state machine.
 pub fn download(
@@ -549,20 +556,19 @@ fn download_one(
         if cancel.load(Ordering::Relaxed) {
             return Err(DlError::Cancelled);
         }
-        let end = (len + opts.chunk).min(spec.bytes) - 1;
-        let before = len;
-        match fetch_range(
-            agent,
-            &f.url,
-            spec,
-            len,
-            end,
-            &mut file,
-            &mut hasher,
-            &mut len,
-            cancel,
-            progress,
-        )? {
+        let start = len;
+        let end = (start + opts.chunk).min(spec.bytes) - 1;
+        let before = start;
+        let attempt = {
+            let mut state = DownloadState {
+                file: &mut file,
+                hasher: &mut hasher,
+                len: &mut len,
+                progress: &mut *progress,
+            };
+            fetch_range(agent, &f.url, spec, start, end, cancel, &mut state)?
+        };
+        match attempt {
             Attempt::Done => {
                 zero_fails = 0;
                 fails_200 = 0;
@@ -621,18 +627,14 @@ fn download_one(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn fetch_range(
     agent: &ureq::Agent,
     url: &str,
     spec: ModelSpec,
     start: u64,
     end: u64,
-    file: &mut File,
-    hasher: &mut Sha256,
-    len: &mut u64,
     cancel: &AtomicBool,
-    progress: &mut Progress,
+    state: &mut DownloadState<'_, '_>,
 ) -> Result<Attempt, DlError> {
     let retry = |advanced: u64, reason: String| Attempt::Retry {
         advanced,
@@ -682,7 +684,9 @@ fn fetch_range(
             ));
         }
     }
-    file.seek(SeekFrom::Start(start))
+    state
+        .file
+        .seek(SeekFrom::Start(start))
         .map_err(|e| io_fail(e, spec.bytes - start))?;
     let want = end + 1 - start;
     let mut got = 0u64;
@@ -690,7 +694,7 @@ fn fetch_range(
     let mut reader = resp.body_mut().as_reader();
     while got < want {
         if cancel.load(Ordering::Relaxed) {
-            let _ = file.flush();
+            let _ = state.file.flush();
             return Err(DlError::Cancelled);
         }
         let cap = (want - got).min(buf.len() as u64) as usize;
@@ -704,12 +708,14 @@ fn fetch_range(
             Ok(n) => n,
             Err(e) => return Ok(retry(got, format!("read failed: {e}"))),
         };
-        file.write_all(&buf[..n])
-            .map_err(|e| io_fail(e, spec.bytes - *len))?;
-        hasher.update(&buf[..n]);
+        state
+            .file
+            .write_all(&buf[..n])
+            .map_err(|e| io_fail(e, spec.bytes - *state.len))?;
+        state.hasher.update(&buf[..n]);
         got += n as u64;
-        *len += n as u64;
-        progress.report(*len, false);
+        *state.len += n as u64;
+        state.progress.report(*state.len, false);
     }
     Ok(Attempt::Done)
 }
@@ -888,6 +894,40 @@ mod tests {
     }
 
     #[test]
+    fn download_state_groups_per_file_mutation() {
+        let dir = scratch("state");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("model.part"))
+            .unwrap();
+        let mut hasher = Sha256::new();
+        let mut len = 0;
+        let mut events = Vec::new();
+        let mut on = |event| events.push(event);
+        let mut progress = Progress {
+            base: 0,
+            total: 42,
+            last: Instant::now(),
+            every: Duration::ZERO,
+            on: &mut on,
+        };
+        {
+            let state = DownloadState {
+                file: &mut file,
+                hasher: &mut hasher,
+                len: &mut len,
+                progress: &mut progress,
+            };
+            assert_eq!(*state.len, 0);
+            assert_eq!(state.progress.total, 42);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn range_download_verifies_and_writes_sidecar() {
         let data = payload(300_000);
         let spec = spec_for(&data, "a.bin");
@@ -934,7 +974,10 @@ mod tests {
         assert!(matches!(r, Err(DlError::Failed(m)) if m.contains("416")));
         let (url, _) = serve(data.clone(), Mode::WrongTotal);
         let (r, _) = run(&dir, spec, &url, &fast_opts(4096), &no);
-        assert!(matches!(r, Err(DlError::Failed(m)) if m.contains("Content-Range")));
+        assert!(
+            matches!(r, Err(DlError::Failed(ref m)) if m.contains("Content-Range")),
+            "unexpected wrong-total response: {r:?}"
+        );
         assert!(!dir.join("b.bin").exists());
         fs::remove_dir_all(dir).unwrap();
     }
