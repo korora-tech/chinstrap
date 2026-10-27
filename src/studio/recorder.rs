@@ -15,9 +15,12 @@ use gstreamer::prelude::*;
 
 use super::devices::{CameraMode, CameraPath, Entry};
 use super::encoders::{self, Role, set_prop};
+use super::pipeline_error::PipelineError;
 use super::preview::{self, Scaler, Tap};
 use super::stamp::{self, Counters, SizeSlot, UNSET};
 use super::types::{GpuConvert, VideoEncoder};
+
+pub type RecorderError = PipelineError;
 
 /// Caps accepted right after a pipewiresrc (D7): DMA-BUF with modifiers, or plain raw.
 pub const SOURCE_CAPS: &str = "video/x-raw(memory:DMABuf),format=DMA_DRM; video/x-raw";
@@ -233,22 +236,31 @@ pub struct InputPipeline {
     pub preview: Option<Arc<AtomicBool>>,
 }
 
-pub(super) fn make(factory: &str) -> Result<gst::Element, String> {
+pub(super) fn make(factory: &str) -> Result<gst::Element, RecorderError> {
     gst::ElementFactory::make(factory)
         .build()
-        .map_err(|e| format!("cannot create {factory}: {e}"))
+        .map_err(|e| RecorderError::MissingElement {
+            factory: factory.to_owned(),
+            message: e.to_string(),
+        })
 }
-pub(super) fn capsfilter(caps: &str) -> Result<gst::Element, String> {
-    let caps = gst::Caps::from_str(caps).map_err(|e| format!("bad caps {caps}: {e}"))?;
+pub(super) fn capsfilter(caps: &str) -> Result<gst::Element, RecorderError> {
+    let caps = gst::Caps::from_str(caps).map_err(|e| RecorderError::InvalidCaps {
+        caps: caps.to_owned(),
+        message: e.to_string(),
+    })?;
     gst::ElementFactory::make("capsfilter")
         .property("caps", caps)
         .build()
-        .map_err(|e| format!("cannot create capsfilter: {e}"))
+        .map_err(|e| RecorderError::MissingElement {
+            factory: "capsfilter".to_owned(),
+            message: e.to_string(),
+        })
 }
 
 /// A plain (blocking) queue. Bounded by buffer count only: the default 10 MB byte limit holds
 /// less than one 4K raw frame (3840×2160 NV12 is 12.4 MB).
-fn queue() -> Result<gst::Element, String> {
+fn queue() -> Result<gst::Element, RecorderError> {
     let q = make("queue")?;
     set_prop(&q, "max-size-buffers", "8");
     set_prop(&q, "max-size-bytes", "0");
@@ -257,13 +269,13 @@ fn queue() -> Result<gst::Element, String> {
 }
 
 /// videoconvert/videoscale on every core (4K conversion on one thread costs ~10 ms a frame).
-fn threaded(factory: &str) -> Result<gst::Element, String> {
+fn threaded(factory: &str) -> Result<gst::Element, RecorderError> {
     let el = make(factory)?;
     set_prop(&el, "n-threads", "0");
     Ok(el)
 }
 
-fn leaky_queue() -> Result<gst::Element, String> {
+fn leaky_queue() -> Result<gst::Element, RecorderError> {
     let q = make("queue")?;
     set_prop(&q, "max-size-buffers", "4");
     set_prop(&q, "max-size-bytes", "0");
@@ -276,12 +288,15 @@ fn leaky_queue() -> Result<gst::Element, String> {
 /// `fps` period from the first input frame until EOS, repeating the last input frame.
 /// Compositors only send frames on damage, so a static window would otherwise stop recording
 /// after its first frame, and videorate only duplicates once a newer frame arrives.
-fn repeater(va: bool, fps: (i32, i32)) -> Result<gst::Element, String> {
+fn repeater(va: bool, fps: (i32, i32)) -> Result<gst::Element, RecorderError> {
     let factory = if va { "vacompositor" } else { "compositor" };
     let agg = gst::ElementFactory::make(factory)
         .property("force-live", true)
         .build()
-        .map_err(|e| format!("cannot create {factory}: {e}"))?;
+        .map_err(|e| RecorderError::MissingElement {
+            factory: factory.to_owned(),
+            message: e.to_string(),
+        })?;
     set_prop(&agg, "background", "black");
     // Output starts at the first input frame: an aggregate with no input yet fails on radeonsi
     // (vacompositor: "vaEndPicture: operation failed"), and the first frame's running time is
@@ -301,7 +316,7 @@ fn repeater(va: bool, fps: (i32, i32)) -> Result<gst::Element, String> {
 fn convert_block(
     convert: Option<GpuConvert>,
     format: &str,
-) -> Result<(Vec<gst::Element>, bool), String> {
+) -> Result<(Vec<gst::Element>, bool), RecorderError> {
     match convert {
         Some(GpuConvert::Va) => {
             let pp = make("vapostproc")?;
@@ -390,11 +405,18 @@ fn set_stream_properties(src: &gst::Element, props: &[(&str, String)]) {
 
 /// A pipewiresrc for a portal stream (§5.2). `on-disconnect` stays at its default (D9).
 /// `fd` is the portal remote; `None` connects to the normal daemon (regression test).
-pub fn portal_source(name: &str, fd: Option<RawFd>, node: u32) -> Result<gst::Element, String> {
+pub fn portal_source(
+    name: &str,
+    fd: Option<RawFd>,
+    node: u32,
+) -> Result<gst::Element, RecorderError> {
     let src = gst::ElementFactory::make("pipewiresrc")
         .name(name)
         .build()
-        .map_err(|e| format!("cannot create pipewiresrc: {e}"))?;
+        .map_err(|e| RecorderError::MissingElement {
+            factory: "pipewiresrc".to_owned(),
+            message: e.to_string(),
+        })?;
     if let Some(fd) = fd {
         src.set_property_from_str("fd", &fd.to_string());
     }
@@ -424,40 +446,53 @@ fn new_pipeline(name: &str, clock: &gst::Clock) -> gst::Pipeline {
     p
 }
 
-fn file_tail(path: &Path) -> Result<(gst::Element, gst::Element), String> {
+fn file_tail(path: &Path) -> Result<(gst::Element, gst::Element), RecorderError> {
     let mux = make("matroskamux")?;
     set_prop(&mux, "writing-app", "Chinstrap");
     let sink = gst::ElementFactory::make("filesink")
         .property("location", path.to_string_lossy().to_string())
         .build()
-        .map_err(|e| format!("cannot create filesink: {e}"))?;
+        .map_err(|e| RecorderError::MissingElement {
+            factory: "filesink".to_owned(),
+            message: e.to_string(),
+        })?;
     Ok((mux, sink))
 }
 
-fn link_chain(pipeline: &gst::Pipeline, chain: &[gst::Element]) -> Result<(), String> {
-    pipeline
-        .add_many(chain)
-        .map_err(|e| format!("cannot add elements: {e}"))?;
-    gst::Element::link_many(chain).map_err(|e| format!("cannot link: {e}"))
+fn link_chain(pipeline: &gst::Pipeline, chain: &[gst::Element]) -> Result<(), RecorderError> {
+    pipeline.add_many(chain).map_err(|e| RecorderError::Link {
+        message: format!("cannot add elements: {e}"),
+    })?;
+    gst::Element::link_many(chain).map_err(|e| RecorderError::Link {
+        message: format!("cannot link: {e}"),
+    })
 }
 
-fn sink_pad(el: &gst::Element) -> Result<gst::Pad, String> {
+fn sink_pad(el: &gst::Element) -> Result<gst::Pad, RecorderError> {
     el.static_pad("sink")
-        .ok_or_else(|| format!("{} has no sink pad", el.name()))
+        .ok_or_else(|| RecorderError::MissingPad {
+            element: el.name().to_string(),
+            pad: "sink".to_owned(),
+        })
 }
 
-fn src_pad(el: &gst::Element) -> Result<gst::Pad, String> {
+fn src_pad(el: &gst::Element) -> Result<gst::Pad, RecorderError> {
     el.static_pad("src")
-        .ok_or_else(|| format!("{} has no src pad", el.name()))
+        .ok_or_else(|| RecorderError::MissingPad {
+            element: el.name().to_string(),
+            pad: "src".to_owned(),
+        })
 }
 
 fn mux_probe(
     before_mux: &gst::Element,
     counters: Arc<Counters>,
-) -> Result<(Arc<AtomicU64>, Arc<AtomicU64>), String> {
+) -> Result<(Arc<AtomicU64>, Arc<AtomicU64>), RecorderError> {
     let first = Arc::new(AtomicU64::new(UNSET));
     let last = Arc::new(AtomicU64::new(UNSET));
-    let pad = src_pad(before_mux)?.peer().ok_or("muxer pad not linked")?;
+    let pad = src_pad(before_mux)?
+        .peer()
+        .ok_or(RecorderError::Other("muxer pad not linked".to_owned()))?;
     stamp::install_mux_probe(&pad, first.clone(), last.clone(), counters);
     Ok((first, last))
 }
@@ -533,7 +568,7 @@ pub fn build_video(
     clock: &gst::Clock,
     path: &Path,
     preview: Option<Tap>,
-) -> Result<InputPipeline, String> {
+) -> Result<InputPipeline, RecorderError> {
     let pipeline = new_pipeline(name, clock);
     let base = Arc::new(AtomicU64::new(UNSET));
     let counters = Arc::new(Counters::default());
@@ -600,7 +635,7 @@ pub fn build_video(
     let mut leaky = None;
     // The preview tee and how its branch scales.
     let mut tee = None;
-    let tee_el = || -> Result<gst::Element, String> {
+    let tee_el = || -> Result<gst::Element, RecorderError> {
         let t = make("tee")?;
         set_prop(&t, "allow-not-linked", "true");
         Ok(t)
@@ -691,7 +726,10 @@ pub fn build_video(
     let outcaps = gst::ElementFactory::make("capsfilter")
         .name("outcaps")
         .build()
-        .map_err(|e| format!("cannot create capsfilter: {e}"))?;
+        .map_err(|e| RecorderError::MissingElement {
+            factory: "capsfilter".to_owned(),
+            message: e.to_string(),
+        })?;
     mid.push(outcaps.clone());
     let enc_queue = queue()?;
     mid.push(enc_queue.clone());
@@ -845,13 +883,13 @@ pub fn build_video(
         size.clone(),
     );
     let (first_pts, last_pts) = mux_probe(&coded, counters.clone())?;
-    let bus = pipeline.bus().ok_or("pipeline has no bus")?;
+    let bus = pipeline.bus().ok_or(RecorderError::NoBus)?;
     let mut preview_killed = None;
     if let (Some((t, scaler)), Some(tap)) = (&tee, &preview) {
         preview::isolate_errors(&bus, tap.killed.clone());
         let attached = t
             .request_pad_simple("src_%u")
-            .ok_or_else(|| "tee has no request pad".to_string())
+            .ok_or_else(|| RecorderError::Other("tee has no request pad".to_owned()))
             .and_then(|pad| preview::branch(&pipeline, &pad, tap, Vec::new(), *scaler, true));
         if let Err(e) = attached {
             // Recording goes on without a preview.
@@ -888,7 +926,7 @@ pub fn build_mic(
     entry: &Entry,
     clock: &gst::Clock,
     path: &Path,
-) -> Result<InputPipeline, String> {
+) -> Result<InputPipeline, RecorderError> {
     let pipeline = new_pipeline(name, clock);
     let base = Arc::new(AtomicU64::new(UNSET));
     let src = entry.create_source("mic-src")?;
@@ -915,7 +953,7 @@ pub fn build_mic(
     stamp::install_audio(&src_pad(&src)?, clock.clone(), base.clone());
     let counters = Arc::new(Counters::default());
     let (first_pts, last_pts) = mux_probe(&opus, counters.clone())?;
-    let bus = pipeline.bus().ok_or("pipeline has no bus")?;
+    let bus = pipeline.bus().ok_or(RecorderError::NoBus)?;
     Ok(InputPipeline {
         pipeline,
         bus,
@@ -945,25 +983,26 @@ pub fn build_preview(
     source: VideoSource<'_>,
     convert: Option<GpuConvert>,
     tap: &Tap,
-) -> Result<(gst::Pipeline, gst::Bus), String> {
+) -> Result<(gst::Pipeline, gst::Bus), RecorderError> {
     let pipeline = gst::Pipeline::with_name(name);
     // DMA-BUF in: VA scales it directly; GL brings it to system memory as NV12 first (never
     // RGBA: gldownload of RGBA crashes in Mesa here, see `convert_block`).
-    let dmabuf = |convert: Option<GpuConvert>| -> Result<(Vec<gst::Element>, Scaler), String> {
-        match convert {
-            Some(GpuConvert::Va) => Ok((Vec::new(), Scaler::Va)),
-            Some(GpuConvert::Gl) => Ok((
-                vec![
-                    make("glupload")?,
-                    make("glcolorconvert")?,
-                    capsfilter("video/x-raw(memory:GLMemory),format=NV12")?,
-                    make("gldownload")?,
-                ],
-                Scaler::Cpu,
-            )),
-            None => Err("no GPU conversion path".into()),
-        }
-    };
+    let dmabuf =
+        |convert: Option<GpuConvert>| -> Result<(Vec<gst::Element>, Scaler), RecorderError> {
+            match convert {
+                Some(GpuConvert::Va) => Ok((Vec::new(), Scaler::Va)),
+                Some(GpuConvert::Gl) => Ok((
+                    vec![
+                        make("glupload")?,
+                        make("glcolorconvert")?,
+                        capsfilter("video/x-raw(memory:GLMemory),format=NV12")?,
+                        make("gldownload")?,
+                    ],
+                    Scaler::Cpu,
+                )),
+                None => Err("no GPU conversion path".into()),
+            }
+        };
     let (chain, pre, scaler) = match source {
         VideoSource::Test(b) => {
             // Rendered at preview size and rate: nothing to scale.
@@ -1020,7 +1059,7 @@ pub fn build_preview(
     link_chain(&pipeline, &chain)?;
     let from = src_pad(chain.last().expect("source chain"))?;
     preview::branch(&pipeline, &from, tap, pre, scaler, false)?;
-    let bus = pipeline.bus().ok_or("pipeline has no bus")?;
+    let bus = pipeline.bus().ok_or(RecorderError::NoBus)?;
     Ok((pipeline, bus))
 }
 
@@ -1034,7 +1073,7 @@ pub fn build_probe(
     node: u32,
     convert: GpuConvert,
     enc: Option<VideoEncoder>,
-) -> Result<(gst::Pipeline, gst::Bus, CapsSlot), String> {
+) -> Result<(gst::Pipeline, gst::Bus, CapsSlot), RecorderError> {
     let pipeline = gst::Pipeline::with_name(name);
     let filter = capsfilter(SOURCE_CAPS)?;
     let mut chain = vec![portal_source("src", Some(fd), node)?, filter.clone()];
@@ -1062,7 +1101,7 @@ pub fn build_probe(
         }
         gst::PadProbeReturn::Ok
     });
-    let bus = pipeline.bus().ok_or("pipeline has no bus")?;
+    let bus = pipeline.bus().ok_or(RecorderError::NoBus)?;
     Ok((pipeline, bus, caps))
 }
 
@@ -1175,7 +1214,7 @@ impl Drop for TestNode {
 }
 
 /// Creates a [`TestNode`] and waits (up to `timeout`) until `pw-dump` lists it.
-pub fn provide_test_node(timeout: Duration) -> Result<TestNode, String> {
+pub fn provide_test_node(timeout: Duration) -> Result<TestNode, RecorderError> {
     let name = format!("chinstrap-target-node-{}", std::process::id());
     let pipeline = gst::Pipeline::with_name("target-node");
     let src = make("videotestsrc")?;
@@ -1200,7 +1239,10 @@ pub fn provide_test_node(timeout: Duration) -> Result<TestNode, String> {
     };
     pipeline
         .set_state(gst::State::Playing)
-        .map_err(|e| format!("cannot start the test node: {e}"))?;
+        .map_err(|e| RecorderError::StateChange {
+            element: "target-node".to_owned(),
+            message: format!("cannot start the test node: {e}"),
+        })?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
         let objects = pw_dump().ok_or("pw-dump unavailable")?;
@@ -1209,7 +1251,9 @@ pub fn provide_test_node(timeout: Duration) -> Result<TestNode, String> {
             return Ok(node);
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("test node {name} did not appear in pw-dump"));
+            return Err(RecorderError::Other(format!(
+                "test node {name} did not appear in pw-dump"
+            )));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -1219,7 +1263,7 @@ pub fn provide_test_node(timeout: Duration) -> Result<TestNode, String> {
 /// portal source chain to the *normal* PipeWire daemon (no portal fd) targeting object id
 /// `node`, waits for the first frame and reports what was negotiated and which node is linked.
 /// An error means the stream could not be linked to `node`; it never falls back to another one.
-pub fn check_targeting(node: u32, timeout: Duration) -> Result<TargetCheck, String> {
+pub fn check_targeting(node: u32, timeout: Duration) -> Result<TargetCheck, RecorderError> {
     let stream_name = format!("chinstrap-target-check-{}-{node}", std::process::id());
     let pipeline = gst::Pipeline::with_name("target-check");
     let src = portal_source("src", None, node)?;
@@ -1239,7 +1283,7 @@ pub fn check_targeting(node: u32, timeout: Duration) -> Result<TargetCheck, Stri
         let _ = tx.try_send(caps);
         gst::PadProbeReturn::Ok
     });
-    let bus = pipeline.bus().ok_or("pipeline has no bus")?;
+    let bus = pipeline.bus().ok_or(RecorderError::NoBus)?;
     let deadline = std::time::Instant::now() + timeout;
     // State changes run on their own thread: on a missing target pipewiresrc (1.6.9) posts the
     // error at once but keeps the Playing transition blocked for its 30 s connect timeout.
@@ -1260,15 +1304,24 @@ pub fn check_targeting(node: u32, timeout: Duration) -> Result<TargetCheck, Stri
             });
         }
         if std::time::Instant::now() >= deadline {
-            break Err("timed out waiting for a frame".to_string());
+            break Err(RecorderError::Other(
+                "timed out waiting for a frame".to_owned(),
+            ));
         }
         if let Some(msg) = bus.timed_pop_filtered(
             gst::ClockTime::from_mseconds(20),
             &[gst::MessageType::Error, gst::MessageType::Eos],
         ) {
             match msg.view() {
-                gst::MessageView::Error(e) => break Err(e.error().to_string()),
-                gst::MessageView::Eos(_) => break Err("EOS before a frame".to_string()),
+                gst::MessageView::Error(e) => {
+                    break Err(RecorderError::from_gst_error(
+                        &e.error(),
+                        e.debug().map(|d| d.to_string()),
+                    ));
+                }
+                gst::MessageView::Eos(_) => {
+                    break Err(RecorderError::Other("EOS before a frame".to_owned()));
+                }
                 _ => {}
             }
         }
@@ -1284,6 +1337,44 @@ pub fn check_targeting(node: u32, timeout: Duration) -> Result<TargetCheck, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorder_error_identifies_disk_full_from_io_and_gstreamer() {
+        fn assert_error<T: std::error::Error>() {}
+        assert_error::<RecorderError>();
+
+        let io_error = RecorderError::from(std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            "disk full",
+        ));
+        assert!(io_error.is_disk_full());
+        let enospc = RecorderError::from(std::io::Error::from_raw_os_error(libc::ENOSPC));
+        assert!(enospc.is_disk_full());
+
+        let gst_error = gst::glib::Error::new(gst::ResourceError::NoSpaceLeft, "disk full");
+        let recorder_error = RecorderError::from_gst_error(&gst_error, None);
+        assert!(recorder_error.is_disk_full());
+        assert_eq!(recorder_error.to_string(), "disk full");
+    }
+
+    #[test]
+    fn missing_element_error_keeps_its_factory_and_message() {
+        gst::init().unwrap();
+        let error = match make("chinstrap-no-such-element") {
+            Err(error) => error,
+            Ok(_) => panic!("unexpectedly created a missing element"),
+        };
+        assert!(matches!(
+            error,
+            RecorderError::MissingElement { ref factory, .. }
+                if factory == "chinstrap-no-such-element"
+        ));
+        assert!(
+            error
+                .to_string()
+                .starts_with("cannot create chinstrap-no-such-element:")
+        );
+    }
 
     #[test]
     fn portal_target_uses_object_id_path_and_never_falls_back() {
@@ -1413,7 +1504,7 @@ mod tests {
         gst::init().unwrap();
         match check_targeting(999_999_999, Duration::from_secs(10)) {
             Ok(c) => panic!("a missing node must not fall back, got {c:?}"),
-            Err(e) => assert!(e.contains("target not found"), "{e}"),
+            Err(e) => assert!(e.to_string().contains("target not found"), "{e}"),
         }
     }
 }

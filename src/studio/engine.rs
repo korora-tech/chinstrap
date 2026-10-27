@@ -18,6 +18,7 @@ use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::*;
 
+use super::PipelineError;
 use super::devices::{self, CameraClass, CameraPath, Devices};
 use super::encoders::{self, Role};
 use super::fake;
@@ -590,13 +591,6 @@ fn quality_of(rec: &InputPipeline, bytes: u64) -> Option<InputQuality> {
 fn spawn_named(name: String, f: impl FnOnce() + Send + 'static) {
     if let Err(e) = std::thread::Builder::new().name(name).spawn(f) {
         eprintln!("chinstrap: cannot spawn worker thread: {e}");
-    }
-}
-
-fn error_text(err: &gst::message::Error) -> String {
-    match err.debug() {
-        Some(d) => format!("{} ({d})", err.error()),
-        None => err.error().to_string(),
     }
 }
 
@@ -1943,7 +1937,7 @@ impl Engine {
                     .selected_microphone
                     .and_then(|id| self.devices.microphone(id))
                     .ok_or("the microphone is gone")?;
-                recorder::build_mic(&name, e, &self.clock, path)
+                recorder::build_mic(&name, e, &self.clock, path).map_err(|error| error.to_string())
             }
             InputKey::Camera => {
                 let e = self
@@ -1975,6 +1969,7 @@ impl Engine {
                     path,
                     tap,
                 )
+                .map_err(|error| error.to_string())
             }
             InputKey::Source(id) => {
                 let s = self
@@ -2013,6 +2008,7 @@ impl Engine {
                     path,
                     tap,
                 )
+                .map_err(|error| error.to_string())
             }
         }
     }
@@ -2431,13 +2427,19 @@ impl Engine {
                 }
             }
             gst::MessageView::Error(e) => {
-                let text = error_text(e);
+                let error = PipelineError::from_gst_error(
+                    &e.error(),
+                    e.debug().map(|debug| debug.to_string()),
+                );
+                let disk_full = error.is_disk_full();
+                let text = error.to_string();
                 eprintln!(
-                    "chinstrap: gst error in {} from {}: {text}",
+                    "chinstrap: gst error in {} from {}{}: {text}",
                     p.pipeline.name(),
                     e.src()
                         .map(|s| s.path_string().to_string())
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    if disk_full { " (disk full)" } else { "" }
                 );
                 if p.last_error.is_none() {
                     p.last_error = Some(text.clone());
@@ -2688,7 +2690,7 @@ impl Engine {
                 });
                 self.spawn_state(id, pipeline, gst::State::Playing);
             }
-            Err(e) => self.apply_probe(source, convert, Some(Err(e)), None),
+            Err(e) => self.apply_probe(source, convert, Some(Err(e.to_string())), None),
         }
     }
 
@@ -2903,6 +2905,7 @@ impl Engine {
                 }
             }
         };
+        let built = built.map_err(|error| error.to_string());
         match built {
             Ok((pipeline, bus)) => {
                 let id = self.next_pipe;

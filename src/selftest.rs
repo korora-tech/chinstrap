@@ -1129,11 +1129,11 @@ fn check_transcription(
                     serde_json::json!({"wer": rate, "errors": e, "words": n, "backend": r.backend, "rtf": r.rtf, "text": text, "style": style}),
                 );
             }
-            Err((_, msg)) => {
+            Err(error) => {
                 if require || usable {
-                    h.fail(format!("speech transcription failed: {msg}"));
+                    h.fail(format!("speech transcription failed: {}", error.message));
                 } else {
-                    warnings.push(format!("speech check skipped: {msg}"));
+                    warnings.push(format!("speech check skipped: {}", error.message));
                 }
             }
         }
@@ -1220,7 +1220,9 @@ fn check_targeting(
     camera: Option<&str>,
 ) -> serde_json::Value {
     let mut out = serde_json::Map::new();
-    match studio::check_targeting(999_999_999, Duration::from_secs(10)) {
+    let missing_target = studio::check_targeting(999_999_999, Duration::from_secs(10))
+        .map_err(|error| error.to_string());
+    match missing_target {
         Ok(c) => h.fail(format!(
             "targeting a missing node fell back to another node (linked {:?}, caps {})",
             c.linked_from, c.caps
