@@ -54,7 +54,15 @@ Use the panel to pick a camera and a microphone. **Add windows/screens…** open
     segment-002/ …
 ```
 
-Every file in a segment is timestamped against the same base time, and every video file starts at the segment's time zero: a source whose first frame arrives late is padded with that first frame repeated, so all video files line up when dropped into an editor at the same position. `mic.mkv` is not padded: it starts at its first sample (usually a few tens of milliseconds after time zero), recorded as `first_pts_ns` in the manifest. Editors that honour a Matroska file's start time line it up; one that starts every file at zero puts the audio that much early, so shift it by `first_pts_ns`. The manifest records the real first timestamp (`first_pts_ns`) and last timestamp of each file, so drift and start latency can still be measured. Each manifest write is atomic, and quitting during a recording finalizes the files first.
+Every file in a segment is timestamped against the same base time, and every video file starts at the segment's time zero: a source whose first frame arrives late is padded with that first frame repeated, so all video files line up when dropped into an editor at the same position. `mic.mkv` is not padded: it starts at its first sample (usually a few tens of milliseconds after time zero), recorded as `first_pts_ns` in the manifest. Editors that honour a Matroska file's start time line it up; one that starts every file at zero puts the audio that much early, so shift it by `first_pts_ns`. The manifest records the real first timestamp (`first_pts_ns`) and last timestamp of each file, so drift and start latency can still be measured. Each manifest write is atomically replaced and synced with its parent directory; quitting during a recording finalizes the files first.
+
+### Crash recovery and low disk space
+
+Chinstrap writes each recording to its final `.mkv` path while recording. A graceful **Stop**, **Cut**, application quit, or handled `SIGINT`/`SIGTERM`/`SIGHUP` sends EOS to every input together, waits for Matroska finalization, and writes terminal input/segment states to `session.json`. An uncatchable kill (`SIGKILL`) or power failure cannot run that path. The muxer writes keyframes/clusters about every 2 seconds and the file sink requests synchronous writes, but the last cluster can still be lost if the filesystem or device does not honor its cache flushes; Chinstrap does not claim power-loss-proof capture.
+
+At the next start, Chinstrap finds sessions left with a stale lock and offers recovery. It remuxes interrupted Matroska inputs to temporary sibling files, verifies the container's Cues and nonzero Duration, syncs the verified replacement and containing directory, then replaces the original. The source is retained until that verification and durability barrier succeed. If recovery fails, the source remains available for another attempt; the session stays discoverable rather than being silently dismissed. Recovery repairs `session.json` only after processing its media. During recording, a successful manifest checkpoint is targeted at no more than five seconds from the previous successful checkpoint; a failed write stays dirty and is retried. That is a bound on the application checkpoint cadence only when writes succeed, not a maximum media-loss guarantee. For an uncatchable kill, the self-test asserts the latest persisted test-video frame is within two seconds of the kill, but that result is software-path evidence, not a guarantee for real devices or storage.
+
+Before recording, Chinstrap requires free space for the larger of the configured minimum and one minute at the planned output rate, plus a physically allocated 64 MiB emergency reserve (`.chinstrap-reserve` in the session directory). During recording, it samples actual file growth and uses the measured rate for remaining-time warnings when available; the UI labels planned and measured values separately in decimal GB/min. When free space reaches the stop reserve, or a file sink reports ENOSPC, the engine releases the emergency reserve and attempts shared-deadline EOS finalization for every opened input, including inputs still starting or paused. If EOS is unavailable or cannot produce Matroska Cues and Duration, the retained file is marked recoverable and offered on the next start; it is not silently hidden by a terminal manifest state. The reserve is removed and its directory synced after normal Stop, Cut, quit, or storage stop. This protects against avoidable file deletion, but filesystem/device cache failures can still lose more than the tested interval; Chinstrap does not claim a hard power-loss limit.
 
 Each video input in `session.json` also carries its frame accounting: frames in, dropped by the queue (encoder too slow), dropped as corrupt, duplicated (repeated to fill gaps), padded (repeated to start at zero), encoded, effective fps, repeat %, bitrate and start offset. The UI shows the same numbers live and per segment.
 
@@ -153,6 +161,7 @@ This writes `recording.transcript.json`, `recording.srt` and `recording.vtt` nex
 | Variable | Meaning |
 |---|---|
 | `CHINSTRAP_OUTPUT_DIR` | Output root |
+| `CHINSTRAP_MIN_FREE_MB` | Minimum free-space stop reserve in MiB (default 1024); the effective reserve is at least one minute at the planned/measured output rate |
 | `CHINSTRAP_H264_ENCODER` | Preferred default encoder: `vah264enc`, `vah265enc`, `x264enc` or `openh264enc` |
 | `CHINSTRAP_FRAME_RATE` | Default frame-rate mode for windows and screens: `native` (default), `60` or `30` |
 | `CHINSTRAP_GPU_CONVERT` | Preferred GPU conversion path for DMA-BUF video: `va` or `gl` |
@@ -183,6 +192,9 @@ The self-test runs the real engine without the portal: a test pattern, the first
 - The gap between segments is under 1.5 s.
 - The manifest matches the files on disk.
 - Files are finalized on quit.
+- Storage safety checks include injected ENOSPC during startup and after media has been written. The latter verifies each preserved peer with Discoverer, Matroska Cues/Duration checks and video decoding; microphone audio is checked for Opus discovery, decoding, and indexing when a usable microphone is present. Startup files that cannot be finalized must remain listed as recovery candidates.
+- The SIGKILL/recovery check measures last persisted video frame to kill (must be no more than 2 s in this test), remuxes the file, and verifies playback/indexing. If a microphone is selected, it also checks the recovered audio stream. Handled `SIGINT`, `SIGTERM` and `SIGHUP` checks require terminal manifest states and playable/indexed files for every input.
+- The injected ENOSPC scenarios exercise the engine event seam only: they do not fill a filesystem, mount a constrained volume, or verify behavior of real storage hardware.
 - Previews: test patterns 1-3 deliver at least 5 opaque, non-blank frames within 480×300 in 3 s while idle, and from the recording pipelines (at least 8 fps) while recording; the pattern that never draws delivers none; idle previews come back after Stop. Skipped with `CHINSTRAP_PREVIEW=0`, which also lets you compare the dropped and repeated frame counts with and without previews.
 
 When the Whisper model is already downloaded, the self-test also transcribes segment 1's microphone file through the worker process and checks `transcript.json`, the SRT and VTT files, and the manifest status. A quiet room should give 0 words; anything else is reported as a warning. Without the model this check is skipped with a warning, unless `CHINSTRAP_SELFTEST_REQUIRE_MODEL=1`. `CHINSTRAP_SELFTEST_SPEECH=<file.mkv>:<reference.txt>` also transcribes a known recording and fails if the word error rate is above 10%.
@@ -208,7 +220,7 @@ Checks that cannot run are reported as `skipped: …` in the JSON `targeting` ob
 These have been checked on one machine: NixOS, niri, PipeWire 1.6.9 and WirePlumber 0.5.18, AMD GPUs using `vah264enc`.
 
 - The unit tests.
-- All three self-tests above.
+- The original three self-tests above passed in an earlier run. The new/updated safety self-test checks have not been executed in this follow-up; a prior full self-test attempt aborted after an AMDGPU context loss.
 - The PipeWire targeting checks, against a Sony ILCE-7CM2 recording 3840×2160 at 25 fps, H.264 High at level 5.1.
 
 These have not been checked:
@@ -219,6 +231,7 @@ These have not been checked:
 - NVIDIA and Intel hardware.
 - MJPEG and DMA-BUF cameras at 4K, and camera frame rates above 30 fps.
 - Long recordings.
+- A hard upper bound on actual frame loss during SIGKILL, power loss, filesystem failure or device-cache failure; the 2 s assertion is limited to the test source and successful recovery path.
 
 The ILCE-7CM2 delivers truncated frames for a short time after it is reopened. Chinstrap drops frames that PipeWire marks as corrupted and fills the gap by repeating frames, so the first second or two of a camera file can contain a few repeats; they are counted in the quality numbers (`dropped_corrupt`, `duplicated`).
 

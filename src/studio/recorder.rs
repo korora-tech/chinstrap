@@ -427,10 +427,13 @@ fn new_pipeline(name: &str, clock: &gst::Clock) -> gst::Pipeline {
 fn file_tail(path: &Path) -> Result<(gst::Element, gst::Element), String> {
     let mux = make("matroskamux")?;
     set_prop(&mux, "writing-app", "Chinstrap");
+    set_prop(&mux, "max-cluster-duration", "2000000000");
     let sink = gst::ElementFactory::make("filesink")
         .property("location", path.to_string_lossy().to_string())
         .build()
         .map_err(|e| format!("cannot create filesink: {e}"))?;
+    set_prop(&sink, "buffer-mode", "unbuffered");
+    set_prop(&sink, "o-sync", "true");
     Ok((mux, sink))
 }
 
@@ -1284,6 +1287,22 @@ pub fn check_targeting(node: u32, timeout: Duration) -> Result<TargetCheck, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crash_recovery_mux_bounds_clusters_and_flushes_sink_writes() {
+        gst::init().unwrap();
+        let (mux, sink) = file_tail(Path::new("/unused/chinstrap-crash-test.mkv")).unwrap();
+
+        assert_eq!(
+            mux.property::<i64>("max-cluster-duration"),
+            2_000_000_000,
+            "a cluster must not grow past the two-second loss bound"
+        );
+        let mode = sink.property_value("buffer-mode");
+        let (_, mode) = gst::glib::EnumValue::from_value(&mode).expect("filesink buffer mode");
+        assert_eq!(mode.nick(), "unbuffered");
+        assert!(sink.property::<bool>("o-sync"));
+    }
 
     #[test]
     fn portal_target_uses_object_id_path_and_never_falls_back() {

@@ -55,6 +55,7 @@ struct Harness {
     snap: Option<Snapshot>,
     levels: u32,
     errors: Vec<String>,
+    notices: Vec<String>,
 }
 
 impl Harness {
@@ -62,6 +63,7 @@ impl Harness {
         match ev {
             EngineEvent::Snapshot(s) => self.snap = Some(*s),
             EngineEvent::Notice(n) => {
+                self.notices.push(n.message.clone());
                 eprintln!(
                     "selftest: notice {:?}{}: {}{}",
                     n.severity,
@@ -71,6 +73,12 @@ impl Harness {
                 );
             }
             EngineEvent::Level { .. } => self.levels += 1,
+        }
+    }
+
+    fn pump(&mut self) {
+        while let Ok(ev) = self.rx.try_recv() {
+            self.pump_one(ev);
         }
     }
 
@@ -233,6 +241,45 @@ fn check_audio(disc: &pbutils::Discoverer, path: &Path) -> Result<FileCheck, Str
     })
 }
 
+/// Verifies that a preserved file is indexed by Matroska and that its stream is discoverable and
+/// decodable, rather than merely checking that its pathname survived the stop.
+fn verify_preserved_media(
+    disc: &pbutils::Discoverer,
+    path: &Path,
+    input: InputKey,
+) -> Result<serde_json::Value, String> {
+    let duration_ns = studio::recovery::verify_recovered_file(path)?;
+    let stream = if input == InputKey::Microphone {
+        let info = check_audio(disc, path)?;
+        decode_audio(path)?;
+        serde_json::json!({
+            "kind": "audio",
+            "duration_s": info.duration.map(|duration| duration.as_secs_f64()),
+            "decoded": true,
+        })
+    } else {
+        let info = check_video(disc, path)?;
+        let decoded_frames = frame_diffs(path)?.len();
+        if decoded_frames == 0 {
+            return Err("video stream decoded no frames".into());
+        }
+        serde_json::json!({
+            "kind": "video",
+            "width": info.width,
+            "height": info.height,
+            "duration_s": info.duration.map(|duration| duration.as_secs_f64()),
+            "decoded_frames": decoded_frames,
+        })
+    };
+    Ok(serde_json::json!({
+        "path": path.display().to_string(),
+        "bytes": std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0),
+        "matroska_cues_and_duration": true,
+        "discoverable_and_playable": stream,
+        "verified_duration_s": duration_ns as f64 / 1e9,
+    }))
+}
+
 /// (PTS ns, keyframe) of every video frame of a Matroska file, demuxed (not decoded).
 fn frame_times(path: &Path) -> Result<Vec<(u64, bool)>, String> {
     let desc = format!(
@@ -331,6 +378,18 @@ fn run_to_eos(pipeline: &gst::Pipeline, timeout: Duration) -> Result<(), String>
     res
 }
 
+fn decode_audio(path: &Path) -> Result<(), String> {
+    let desc = format!(
+        "filesrc location=\"{}\" ! decodebin ! audioconvert ! fakesink sync=false",
+        path.display()
+    );
+    let pipeline = gst::parse::launch(&desc)
+        .map_err(|error| format!("cannot build audio decoder: {error}"))?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| "audio decoder is not a pipeline")?;
+    run_to_eos(&pipeline, Duration::from_secs(60))
+}
+
 /// Problems with a variable-rate file: it must not be constant-rate, must reach `end_ns`, and
 /// must have a keyframe at least every ~2 s.
 fn check_vfr(frames: &[(u64, bool)], end_ns: u64) -> Result<serde_json::Value, String> {
@@ -383,6 +442,84 @@ pub fn run(dir: &Path) -> i32 {
     }
 }
 
+pub fn crash_child(root: &Path, ready: &Path) -> i32 {
+    child_recording(root, ready, false)
+}
+
+pub fn signal_child(root: &Path, ready: &Path) -> i32 {
+    child_recording(root, ready, true)
+}
+
+fn child_recording(root: &Path, ready: &Path, handle_signals: bool) -> i32 {
+    let result = (|| -> Result<(), String> {
+        std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
+        let mut config = studio::EngineConfig::from_env();
+        config.output_root = root.to_path_buf();
+        config.enable_portal = false;
+        config.fake = false;
+        config.preview = false;
+        config.test_sources = vec![(1, TestBehaviour::default())];
+        let (engine, rx) = studio::start(config).map_err(|e| e.to_string())?;
+        if handle_signals {
+            crate::signal_shutdown::install_handlers().map_err(|e| e.to_string())?;
+            crate::signal_shutdown::spawn_shutdown_watcher(engine.clone())
+                .map_err(|e| e.to_string())?;
+        }
+        let mut harness = Harness {
+            rx,
+            snap: None,
+            levels: 0,
+            errors: Vec::new(),
+            notices: Vec::new(),
+        };
+        engine.send(EngineCommand::AddTestSource);
+        harness
+            .wait_for(Duration::from_secs(30), |snapshot| {
+                snapshot.can_record
+                    && snapshot.sources.iter().any(|source| {
+                        source.id == SourceId(1) && source.state == SourceState::Ready
+                    })
+            })
+            .ok_or("child test source did not become recordable")?;
+        engine.send(EngineCommand::Record);
+        let recording = harness
+            .wait_for(Duration::from_secs(30), |snapshot| {
+                matches!(snapshot.phase, Phase::Recording { segment: 1, .. })
+            })
+            .ok_or("child did not start recording")?;
+        let session_dir = recording
+            .session
+            .as_ref()
+            .ok_or("child has no session")?
+            .dir
+            .clone();
+        let recording_started_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos();
+        harness.sleep(if handle_signals {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_secs(7)
+        });
+        std::fs::write(
+            ready,
+            format!("{}\n{recording_started_ns}", session_dir.display()),
+        )
+        .map_err(|e| e.to_string())?;
+        loop {
+            harness.sleep(Duration::from_millis(100));
+        }
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("selftest child: {error}");
+            1
+        }
+    }
+}
+
 fn run_inner(dir: &Path) -> Result<bool, String> {
     let dir = std::path::absolute(dir).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -419,6 +556,7 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         snap: None,
         levels: 0,
         errors: Vec::new(),
+        notices: Vec::new(),
     };
     let mut warnings: Vec<String> = Vec::new();
 
@@ -590,6 +728,13 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     if waiting.is_none() {
         h.fail("the silent source never showed waiting_for_frame while recording");
     }
+    let reserve_path = waiting
+        .as_ref()
+        .and_then(|snapshot| snapshot.session.as_ref())
+        .map(|session| session.dir.join(".chinstrap-reserve"));
+    if reserve_path.as_ref().is_none_or(|path| !path.exists()) {
+        h.fail("the emergency stop reserve was not present while recording");
+    }
 
     // 3. Record (sent above).
     h.wait_for(Duration::from_secs(15), |s| {
@@ -625,6 +770,9 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         .wait_for(Duration::from_secs(20), |s| s.phase == Phase::Idle)
         .ok_or("Stop never reached Idle")?;
     let session = done.session.clone().ok_or("no session after Stop")?;
+    if reserve_path.as_ref().is_some_and(|path| path.exists()) {
+        h.fail("the emergency stop reserve remained after normal Stop");
+    }
     eprintln!("selftest: session {}", session.dir.display());
     if preview_on {
         // Idle previews come back once the recording pipelines are gone.
@@ -701,6 +849,9 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
                     match res {
                         Err(e) => problem = Some(e),
                         Ok(fc) => {
+                            if let Err(error) = studio::recovery::verify_matroska_index(&f.path) {
+                                problem = Some(format!("Matroska Cues/Duration: {error}"));
+                            }
                             if let (Some(d), Some(sd)) = (fc.duration, seg_dur)
                                 && d.abs_diff(sd) > DURATION_TOLERANCE
                             {
@@ -878,9 +1029,48 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         (None, Ok("standin")) => check_load(&mut h, load_config, &dir, "standin"),
         _ => serde_json::json!("skipped: CHINSTRAP_SELFTEST_CAMERA not set"),
     };
+    let run_safety_check = |name: &str,
+                            check: fn(&Path) -> Result<serde_json::Value, String>,
+                            harness: &mut Harness| {
+        match check(&dir) {
+            Ok(result) => result,
+            Err(error) => {
+                harness.fail(format!("{name} selftest: {error}"));
+                serde_json::json!({"ok": false, "error": error})
+            }
+        }
+    };
+    let crash_recovery_json = run_safety_check("kill-and-recover", check_kill_and_recover, &mut h);
+    let signal_json = run_safety_check("signal-finalization", check_signal_finalization, &mut h);
+    let preflight_json = run_safety_check(
+        "limited-space preflight",
+        check_limited_space_preflight,
+        &mut h,
+    );
+    let reserve_json = run_safety_check(
+        "storage warning and reserve stop",
+        check_storage_warnings_and_reserve_stop,
+        &mut h,
+    );
+    let enospc_json = run_safety_check(
+        "ENOSPC preservation",
+        check_enospc_preserves_all_inputs,
+        &mut h,
+    );
+    let enospc_startup_json =
+        run_safety_check("ENOSPC during startup", check_enospc_during_startup, &mut h);
     let mut seg_json = seg_json;
-    seg_json
-        .push(serde_json::json!({"plan": plan_json, "load": load_json, "previews": previews_json}));
+    seg_json.push(serde_json::json!({
+        "plan": plan_json,
+        "load": load_json,
+        "previews": previews_json,
+        "crash_recovery": crash_recovery_json,
+        "signal_finalization": signal_json,
+        "limited_space_preflight": preflight_json,
+        "storage_warnings_and_reserve": reserve_json,
+        "enospc_preservation": enospc_json,
+        "enospc_startup_preservation": enospc_startup_json,
+    }));
     Ok(summary(
         &h,
         &caps,
@@ -889,6 +1079,866 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         targeting_json,
         transcription_json,
     ))
+}
+
+fn scenario_root(base: &Path, label: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    base.join(format!(".selftest-{label}-{}-{nonce}", std::process::id()))
+}
+
+fn selftest_engine_config(root: &Path, free_bytes: Option<u64>) -> studio::EngineConfig {
+    let mut config = studio::EngineConfig::from_env();
+    config.output_root = root.to_path_buf();
+    config.enable_portal = false;
+    config.fake = false;
+    config.preview = false;
+    config.test_sources = vec![(1, TestBehaviour::default())];
+    config.selftest_free_bytes = free_bytes;
+    config.selftest_min_free_mb = None;
+    config
+}
+
+fn check_limited_space_preflight(base: &Path) -> Result<serde_json::Value, String> {
+    let root = scenario_root(base, "preflight");
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let (engine, rx) =
+        studio::start(selftest_engine_config(&root, Some(0))).map_err(|e| e.to_string())?;
+    let mut harness = Harness {
+        rx,
+        snap: None,
+        levels: 0,
+        errors: Vec::new(),
+        notices: Vec::new(),
+    };
+    engine.send(EngineCommand::AddTestSource);
+    let blocked = harness
+        .wait_for(Duration::from_secs(30), |snapshot| {
+            snapshot
+                .sources
+                .iter()
+                .any(|source| source.id == SourceId(1) && source.state == SourceState::Ready)
+                && snapshot.storage.record_blocked_reason.is_some()
+        })
+        .ok_or("limited-space preflight did not block the test source")?;
+    let reason = blocked
+        .storage
+        .record_blocked_reason
+        .clone()
+        .unwrap_or_default();
+    if blocked.storage.free_bytes != Some(0) || blocked.can_record {
+        return Err("injected zero free bytes were not reflected in preflight".into());
+    }
+    engine.send(EngineCommand::Record);
+    harness.sleep(Duration::from_millis(500));
+    let denied = harness
+        .snap
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.phase == Phase::Idle && snapshot.session.is_none());
+    let rejection_notice = harness
+        .notices
+        .iter()
+        .any(|message| message.contains("Not enough free space"));
+    let stopped = engine.shutdown_blocking(Duration::from_secs(5));
+    if !denied || !rejection_notice || !stopped {
+        return Err(format!(
+            "preflight did not safely refuse Record (denied={denied}, notice={rejection_notice}, shutdown={stopped})"
+        ));
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "free_bytes_injected": 0,
+        "record_refused": denied,
+        "reason": reason,
+        "constrained_volume": false,
+    }))
+}
+
+fn check_storage_warnings_and_reserve_stop(base: &Path) -> Result<serde_json::Value, String> {
+    let root = scenario_root(base, "storage-reserve");
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let mut config = selftest_engine_config(&root, Some(2 * 1024 * 1024 * 1024));
+    config.test_sources = vec![(
+        1,
+        TestBehaviour {
+            size: Some((640, 360)),
+            refresh: Some(30),
+            ..TestBehaviour::default()
+        },
+    )];
+    config.selftest_min_free_mb = Some(1);
+    let (engine, rx) = studio::start(config).map_err(|e| e.to_string())?;
+    let mut harness = Harness {
+        rx,
+        snap: None,
+        levels: 0,
+        errors: Vec::new(),
+        notices: Vec::new(),
+    };
+    engine.send(EngineCommand::AddTestSource);
+    harness
+        .wait_for(Duration::from_secs(30), |snapshot| {
+            snapshot.can_record
+                && snapshot
+                    .sources
+                    .iter()
+                    .any(|source| source.id == SourceId(1) && source.state == SourceState::Ready)
+        })
+        .ok_or("storage-reserve fixture source did not become ready")?;
+    engine.send(EngineCommand::Record);
+    harness
+        .wait_for(Duration::from_secs(30), |snapshot| {
+            matches!(snapshot.phase, Phase::Recording { .. })
+        })
+        .ok_or("storage-reserve fixture did not start recording")?;
+    let measured = harness
+        .wait_for(Duration::from_secs(20), |snapshot| {
+            snapshot.storage.rate_measured
+                && snapshot.storage.estimated_bytes_per_second > 0
+                && snapshot.storage.stop_reserve_bytes > 0
+        })
+        .ok_or("storage-reserve fixture did not measure on-disk growth")?;
+    let initial_rate = measured.storage.estimated_bytes_per_second;
+    let initial_reserve = measured.storage.stop_reserve_bytes;
+    let ten_minute_free = initial_reserve.saturating_add(initial_rate.saturating_mul(500));
+    engine.set_free_bytes_for_selftest(ten_minute_free);
+    let ten_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < ten_deadline
+        && !harness
+            .notices
+            .iter()
+            .any(|notice| notice.contains("Less than 10 minutes"))
+    {
+        harness.pump();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !harness
+        .notices
+        .iter()
+        .any(|notice| notice.contains("Less than 10 minutes"))
+    {
+        return Err("storage monitor did not issue its under-10-minute warning".into());
+    }
+    let three_snapshot = harness
+        .snap
+        .as_ref()
+        .ok_or("storage monitor emitted no snapshot")?;
+    let three_rate = three_snapshot.storage.estimated_bytes_per_second.max(1);
+    let three_reserve = three_snapshot.storage.stop_reserve_bytes;
+    engine
+        .set_free_bytes_for_selftest(three_reserve.saturating_add(three_rate.saturating_mul(120)));
+    let three_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < three_deadline
+        && !harness
+            .notices
+            .iter()
+            .any(|notice| notice.contains("Less than 3 minutes"))
+    {
+        harness.pump();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !harness
+        .notices
+        .iter()
+        .any(|notice| notice.contains("Less than 3 minutes"))
+    {
+        return Err("storage monitor did not issue its under-3-minute warning".into());
+    }
+    let stop_reserve = harness
+        .snap
+        .as_ref()
+        .map(|snapshot| snapshot.storage.stop_reserve_bytes)
+        .unwrap_or(three_reserve);
+    engine.set_free_bytes_for_selftest(0);
+    let stopped = harness
+        .wait_for(Duration::from_secs(20), |snapshot| {
+            snapshot.phase == Phase::Idle
+                && snapshot.session.as_ref().is_some_and(|session| {
+                    session.segments.last().is_some_and(|segment| {
+                        matches!(
+                            &segment.status,
+                            SegmentStatus::Incomplete { reason }
+                                if reason == "stopped: disk almost full"
+                        )
+                    })
+                })
+        })
+        .ok_or("free-space threshold did not stop through normal finalization")?;
+    let segment = stopped
+        .session
+        .as_ref()
+        .and_then(|session| session.segments.last())
+        .ok_or("storage-reserve segment missing")?;
+    if segment.files.is_empty() || segment.files.iter().any(|file| !file.path.exists()) {
+        return Err("storage-reserve stop did not preserve its output files".into());
+    }
+    for file in &segment.files {
+        studio::recovery::verify_recovered_file(&file.path)?;
+    }
+    let session_dir = stopped
+        .session
+        .as_ref()
+        .map(|session| session.dir.as_path())
+        .ok_or("storage-reserve session missing")?;
+    let reserve_released = !session_dir.join(".chinstrap-reserve").exists();
+    if !reserve_released {
+        return Err("storage-reserve stop left the emergency reserve behind".into());
+    }
+    let stop_notice = harness
+        .notices
+        .iter()
+        .any(|notice| notice.contains("stopped: disk almost full"));
+    let shutdown = engine.shutdown_blocking(Duration::from_secs(5));
+    if !stop_notice || !shutdown {
+        return Err(format!(
+            "reserve stop notice/shutdown failed ({stop_notice}/{shutdown})"
+        ));
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "free_space_values_injected": true,
+        "not_hardware_volume_test": true,
+        "warning_under_10_minutes": true,
+        "warning_under_3_minutes": true,
+        "reserve_stop_eos_and_cues_verified": true,
+        "initial_measured_rate_bytes_per_second": initial_rate,
+        "initial_stop_reserve_bytes": initial_reserve,
+        "stop_reserve_bytes": stop_reserve,
+        "files": segment.files.len(),
+        "reserve_released": reserve_released,
+    }))
+}
+
+fn check_enospc_preserves_all_inputs(base: &Path) -> Result<serde_json::Value, String> {
+    let root = scenario_root(base, "enospc");
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let mut config = selftest_engine_config(&root, None);
+    config.test_sources = vec![(1, TestBehaviour::default()), (2, TestBehaviour::default())];
+    let (engine, rx) = studio::start(config).map_err(|e| e.to_string())?;
+    let mut harness = Harness {
+        rx,
+        snap: None,
+        levels: 0,
+        errors: Vec::new(),
+        notices: Vec::new(),
+    };
+    engine.send(EngineCommand::AddTestSource);
+    engine.send(EngineCommand::AddTestSource);
+    harness
+        .wait_for(Duration::from_secs(30), |snapshot| {
+            snapshot.can_record
+                && snapshot
+                    .sources
+                    .iter()
+                    .filter(|source| {
+                        source.id.0 <= 2
+                            && source.kind == SourceKind::TestPattern
+                            && source.state == SourceState::Ready
+                    })
+                    .count()
+                    == 2
+        })
+        .ok_or("ENOSPC fixture sources did not become ready")?;
+    engine.send(EngineCommand::Record);
+    harness
+        .wait_for(Duration::from_secs(30), |snapshot| {
+            matches!(snapshot.phase, Phase::Recording { segment: 1, .. })
+        })
+        .ok_or("ENOSPC fixture did not enter Recording")?;
+    // Let both media streams produce usable content. The separate startup case below exercises
+    // the Pausing/Paused/Starting race; this case proves preserved peers are actually playable.
+    harness.sleep(Duration::from_secs(2));
+    engine.inject_storage_failure_for_selftest(InputKey::Source(SourceId(1)));
+    let stopped = harness
+        .wait_for(Duration::from_secs(30), |snapshot| {
+            snapshot.phase == Phase::Idle
+                && snapshot.session.as_ref().is_some_and(|session| {
+                    session.segments.last().is_some_and(|segment| {
+                        matches!(
+                            &segment.status,
+                            SegmentStatus::Incomplete { reason }
+                                if reason.contains("disk almost full")
+                        )
+                    })
+                })
+        })
+        .ok_or("injected ENOSPC did not stop the segment")?;
+    let segment = stopped
+        .session
+        .as_ref()
+        .and_then(|session| session.segments.last())
+        .ok_or("ENOSPC segment is missing")?;
+    if segment.files.len() < 2 {
+        return Err(format!(
+            "ENOSPC segment has {} files, expected both video inputs",
+            segment.files.len()
+        ));
+    }
+    if !segment
+        .files
+        .iter()
+        .any(|file| file.input == InputKey::Source(SourceId(1)))
+        || !segment
+            .files
+            .iter()
+            .any(|file| file.input == InputKey::Source(SourceId(2)))
+    {
+        return Err("ENOSPC segment omitted one of its video peers".into());
+    }
+    let disc = pbutils::Discoverer::new(gst::ClockTime::from_seconds(5))
+        .map_err(|e| format!("Discoverer: {e}"))?;
+    let mut files = Vec::new();
+    for file in &segment.files {
+        if !file.path.exists() {
+            return Err(format!(
+                "ENOSPC deleted partial input {}",
+                file.path.display()
+            ));
+        }
+        let bytes = std::fs::metadata(&file.path)
+            .map_err(|error| error.to_string())?
+            .len();
+        if bytes == 0 {
+            return Err(format!(
+                "ENOSPC left an empty peer file {}",
+                file.path.display()
+            ));
+        }
+        let media = verify_preserved_media(&disc, &file.path, file.input).map_err(|error| {
+            format!(
+                "preserved peer {} is not playable/indexed: {error}",
+                file.path.display()
+            )
+        })?;
+        files.push(serde_json::json!({
+            "status": format!("{:?}", file.status),
+            "media": media,
+        }));
+    }
+    let reserve_released = stopped
+        .session
+        .as_ref()
+        .is_some_and(|session| !session.dir.join(".chinstrap-reserve").exists());
+    if !reserve_released {
+        return Err("emergency reserve remained after the ENOSPC stop".into());
+    }
+    if !harness
+        .notices
+        .iter()
+        .any(|message| message.contains("injected ENOSPC"))
+        && !harness
+            .notices
+            .iter()
+            .any(|message| message.contains("finalising all recording inputs"))
+    {
+        return Err("the injected ENOSPC event did not reach the storage-failure path".into());
+    }
+    let shutdown = engine.shutdown_blocking(Duration::from_secs(5));
+    if !shutdown {
+        return Err("ENOSPC test engine did not shut down cleanly".into());
+    }
+    if !studio::session::scan_interrupted(&root)
+        .map_err(|error| error.to_string())?
+        .is_empty()
+    {
+        return Err(
+            "playable/indexed ENOSPC files remained falsely discoverable as interrupted".into(),
+        );
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "injected": "engine ENOSPC event seam; no disk fill, physical volume, or filesystem ENOSPC exercised",
+        "preserved_peer_files_verified": files,
+        "reserve_released": reserve_released,
+        "audio_input_verified": segment.files.iter().any(|file| file.input == InputKey::Microphone),
+    }))
+}
+
+fn check_enospc_during_startup(base: &Path) -> Result<serde_json::Value, String> {
+    let root = scenario_root(base, "enospc-startup");
+    std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+    let mut config = selftest_engine_config(&root, None);
+    config.test_sources = vec![(1, TestBehaviour::default()), (2, TestBehaviour::default())];
+    let (engine, rx) = studio::start(config).map_err(|error| error.to_string())?;
+    let mut harness = Harness {
+        rx,
+        snap: None,
+        levels: 0,
+        errors: Vec::new(),
+        notices: Vec::new(),
+    };
+    engine.send(EngineCommand::AddTestSource);
+    engine.send(EngineCommand::AddTestSource);
+    harness
+        .wait_for(Duration::from_secs(30), |snapshot| {
+            snapshot.can_record
+                && snapshot
+                    .sources
+                    .iter()
+                    .filter(|source| source.id.0 <= 2 && source.state == SourceState::Ready)
+                    .count()
+                    == 2
+        })
+        .ok_or("startup ENOSPC fixture sources did not become ready")?;
+    engine.send(EngineCommand::Record);
+    // Preserve the original early event ordering: it reaches the engine before the asynchronous
+    // Paused/Playing state workers can all settle.
+    engine.inject_storage_failure_for_selftest(InputKey::Source(SourceId(1)));
+    let stopped = harness
+        .wait_for(Duration::from_secs(30), |snapshot| {
+            snapshot.phase == Phase::Idle
+                && snapshot.session.as_ref().is_some_and(|session| {
+                    session.segments.last().is_some_and(|segment| {
+                        matches!(segment.status, SegmentStatus::Incomplete { .. })
+                    })
+                })
+        })
+        .ok_or("startup ENOSPC event did not stop the segment")?;
+    let session = stopped
+        .session
+        .as_ref()
+        .ok_or("startup ENOSPC omitted session")?;
+    let segment = session
+        .segments
+        .last()
+        .ok_or("startup ENOSPC omitted segment")?;
+    let mut preserved = Vec::new();
+    let mut unindexed_paths = Vec::new();
+    let disc = pbutils::Discoverer::new(gst::ClockTime::from_seconds(5))
+        .map_err(|error| format!("Discoverer: {error}"))?;
+    for file in &segment.files {
+        if !file.path.exists() {
+            continue;
+        }
+        let bytes = std::fs::metadata(&file.path)
+            .map_err(|error| error.to_string())?
+            .len();
+        if bytes == 0 {
+            continue;
+        }
+        let media = match studio::recovery::verify_matroska_index(&file.path) {
+            Ok(()) => verify_preserved_media(&disc, &file.path, file.input).map_err(|error| {
+                format!(
+                    "indexed startup peer {} is not playable: {error}",
+                    file.path.display()
+                )
+            })?,
+            Err(error) => {
+                unindexed_paths.push(file.path.clone());
+                serde_json::json!({ "index_error": error.to_string() })
+            }
+        };
+        preserved.push(serde_json::json!({
+            "path": file.path.display().to_string(),
+            "bytes": bytes,
+            "status": format!("{:?}", file.status),
+            "media": media,
+        }));
+    }
+    if preserved.is_empty() {
+        return Err("startup ENOSPC left no opened peer files to inspect".into());
+    }
+    let session_dir = session.dir.clone();
+    let shutdown = engine.shutdown_blocking(Duration::from_secs(5));
+    if !shutdown {
+        return Err("startup ENOSPC test engine did not shut down cleanly".into());
+    }
+    let candidates = studio::session::scan_interrupted(&root).map_err(|error| error.to_string())?;
+    let discoverable = candidates
+        .iter()
+        .any(|candidate| candidate.dir == session_dir);
+    if !unindexed_paths.is_empty() && !discoverable {
+        return Err("unindexed startup peer files were not offered for recovery".into());
+    }
+    if discoverable {
+        for path in unindexed_paths {
+            if !path.exists() {
+                return Err(format!(
+                    "recovery candidate hid peer file {}",
+                    path.display()
+                ));
+            }
+            let current = std::fs::metadata(&path)
+                .map_err(|error| error.to_string())?
+                .len();
+            if current == 0 {
+                return Err(format!(
+                    "recovery candidate hid footage in {}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "injected": "engine ENOSPC event seam; no hardware-volume or filesystem-capacity test",
+        "opened_peer_files_retained": preserved,
+        "recovery_candidate_when_unindexed": discoverable,
+    }))
+}
+
+struct SelftestChild(std::process::Child);
+
+impl Drop for SelftestChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_child(mode: &str, root: &Path, ready: &Path) -> Result<SelftestChild, String> {
+    std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+        .arg(mode)
+        .arg(root)
+        .arg(ready)
+        .env("CHINSTRAP_PREVIEW", "0")
+        .env("CHINSTRAP_TEST_SIZE", "320x240")
+        .env("CHINSTRAP_SCREEN_FPS", "30")
+        .spawn()
+        .map(SelftestChild)
+        .map_err(|e| format!("cannot start {mode} child: {e}"))
+}
+
+fn wait_child_ready(
+    child: &mut SelftestChild,
+    ready: &Path,
+    timeout: Duration,
+) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if ready.exists() {
+            return std::fs::read_to_string(ready).map_err(|e| e.to_string());
+        }
+        if let Some(status) = child.0.try_wait().map_err(|e| e.to_string())? {
+            return Err(format!("self-test child exited before readiness: {status}"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Err("timed out waiting for self-test child readiness".into())
+}
+
+fn wait_child_exit(
+    child: &mut SelftestChild,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = child.0.try_wait().map_err(|e| e.to_string())? {
+            return Ok(status);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Err("self-test child did not exit before its deadline".into())
+}
+
+fn check_kill_and_recover(base: &Path) -> Result<serde_json::Value, String> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let root = scenario_root(base, "crash-recovery");
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let ready = root.join("child.ready");
+    let mut child = spawn_child("--selftest-crash-child", &root, &ready)?;
+    let ready_data = wait_child_ready(&mut child, &ready, Duration::from_secs(60))?;
+    let mut lines = ready_data.lines();
+    let session_dir = PathBuf::from(lines.next().ok_or("child omitted its session path")?);
+    let started_ns: u128 = lines
+        .next()
+        .ok_or("child omitted its recording start time")?
+        .parse()
+        .map_err(|e| format!("bad child start time: {e}"))?;
+    let killed_at_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_nanos();
+    child
+        .0
+        .kill()
+        .map_err(|e| format!("cannot SIGKILL fixture: {e}"))?;
+    let status = child
+        .0
+        .wait()
+        .map_err(|e| format!("cannot wait for SIGKILL fixture: {e}"))?;
+    if status.signal() != Some(libc::SIGKILL) {
+        return Err(format!(
+            "crash fixture was not killed with SIGKILL: {status}"
+        ));
+    }
+    let kill_elapsed_ns = killed_at_ns
+        .saturating_sub(started_ns)
+        .min(u64::MAX as u128) as u64;
+
+    let candidates = studio::session::scan_interrupted(&root).map_err(|e| e.to_string())?;
+    if candidates.len() != 1 || candidates[0].dir != session_dir {
+        return Err(format!(
+            "killed session was not offered for recovery: {candidates:?}"
+        ));
+    }
+    let manifest_path = session_dir.join(studio::session::MANIFEST_NAME);
+    let checkpoint_age = std::time::SystemTime::now()
+        .duration_since(
+            std::fs::metadata(&manifest_path)
+                .and_then(|meta| meta.modified())
+                .map_err(|e| e.to_string())?,
+        )
+        .unwrap_or_default();
+    if checkpoint_age > Duration::from_secs(6) {
+        return Err(format!("checkpoint is stale: {checkpoint_age:?}"));
+    }
+    let before = studio::session::read_manifest(&manifest_path).map_err(|e| e.to_string())?;
+    let segment = before
+        .segments
+        .iter()
+        .find(|segment| segment.index == 1)
+        .ok_or("crash checkpoint omitted segment 1")?;
+    if segment.status != "recording" {
+        return Err(format!(
+            "crash checkpoint segment status is {:?}",
+            segment.status
+        ));
+    }
+    let video_input = segment
+        .inputs
+        .iter()
+        .find(|input| input.kind != "microphone")
+        .ok_or("crash checkpoint omitted video input")?;
+    let video = session_dir.join(&segment.dir).join(&video_input.file);
+    if video_input.status != "recording" || video_input.last_pts_ns.is_none() {
+        return Err(format!("video checkpoint was not fresh: {video_input:?}"));
+    }
+    let checkpoint_pts = video_input.last_pts_ns.unwrap();
+    let actual_pts = frame_times(&video)?
+        .last()
+        .map(|frame| frame.0)
+        .ok_or("no persisted frames in killed video file")?;
+    let checkpoint_lag_ns = actual_pts.abs_diff(checkpoint_pts);
+    if checkpoint_lag_ns > 5_000_000_000 {
+        return Err(format!(
+            "last_pts checkpoint lagged the last frame by {checkpoint_lag_ns} ns"
+        ));
+    }
+    let last_frame_to_kill_ns = kill_elapsed_ns.checked_sub(actual_pts).ok_or_else(|| {
+        format!(
+            "last persisted video frame PTS {actual_pts} ns is after SIGKILL at {kill_elapsed_ns} ns"
+        )
+    })?;
+    if last_frame_to_kill_ns > 2_000_000_000 {
+        return Err(format!(
+            "last persisted video frame was {last_frame_to_kill_ns} ns before SIGKILL, over the 2 s test bound"
+        ));
+    }
+    let audio_input = segment
+        .inputs
+        .iter()
+        .find(|input| input.kind == "microphone");
+    let audio_path = audio_input.map(|input| session_dir.join(&segment.dir).join(&input.file));
+    if let Some(input) = audio_input {
+        if input.status != "recording" {
+            return Err(format!("audio checkpoint was not recording: {input:?}"));
+        }
+        if input.last_pts_ns.is_none() {
+            return Err("crash checkpoint omitted the microphone's last timestamp".into());
+        }
+    }
+    if studio::recovery::verify_matroska_index(&video).is_ok() {
+        return Err("SIGKILL fixture unexpectedly already had Cues and Duration".into());
+    }
+    let recovery = studio::recovery::recover_session(&session_dir)?;
+    if recovery.recovered_files == 0 || recovery.failed_files != 0 {
+        return Err(format!("kill-and-recover result was {recovery:?}"));
+    }
+    let after = studio::session::read_manifest(&manifest_path).map_err(|e| e.to_string())?;
+    let recovered_segment = after
+        .segments
+        .iter()
+        .find(|segment| segment.index == 1)
+        .ok_or("recovery omitted segment 1")?;
+    if recovered_segment.status != "incomplete"
+        || recovered_segment.reason.as_deref() != Some("recovered after interruption")
+        || recovered_segment
+            .inputs
+            .iter()
+            .any(|input| input.status != "complete")
+    {
+        return Err(format!(
+            "recovery manifest is not terminal and repaired: {recovered_segment:?}"
+        ));
+    }
+    let mut recovered_files = 0;
+    for input in &recovered_segment.inputs {
+        let path = session_dir.join(&recovered_segment.dir).join(&input.file);
+        studio::recovery::verify_recovered_file(&path)?;
+        recovered_files += 1;
+    }
+    let duration_ns = recovered_segment.duration_ns.unwrap_or(0);
+    if duration_ns == 0 || duration_ns.abs_diff(kill_elapsed_ns) > 2_000_000_000 {
+        return Err(format!(
+            "recovered media duration {duration_ns} ns is not within two seconds of kill time {kill_elapsed_ns} ns"
+        ));
+    }
+    if frame_diffs(&video)?.is_empty() {
+        return Err("recovered video did not decode any frames".into());
+    }
+    let audio_duration_s = if let Some(path) = audio_path {
+        let disc = pbutils::Discoverer::new(gst::ClockTime::from_seconds(5))
+            .map_err(|e| format!("Discoverer: {e}"))?;
+        let audio = check_audio(&disc, &path)?;
+        decode_audio(&path)?;
+        let duration = audio.duration.ok_or("recovered audio has no duration")?;
+        if duration.is_zero() {
+            return Err("recovered audio has zero duration".into());
+        }
+        Some(duration.as_secs_f64())
+    } else {
+        None
+    };
+    if !studio::session::scan_interrupted(&root)
+        .map_err(|e| e.to_string())?
+        .is_empty()
+    {
+        return Err("successfully recovered session remained a candidate".into());
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "child_signal": "SIGKILL",
+        "recovered_files": recovered_files,
+        "duration_s": duration_ns as f64 / 1e9,
+        "kill_elapsed_s": kill_elapsed_ns as f64 / 1e9,
+        "last_frame_to_kill_s": last_frame_to_kill_ns as f64 / 1e9,
+        "checkpoint_age_s": checkpoint_age.as_secs_f64(),
+        "checkpoint_lag_s": checkpoint_lag_ns as f64 / 1e9,
+        "audio_recovered_and_discoverable": audio_duration_s.is_some(),
+        "audio_duration_s": audio_duration_s,
+        "cues_duration_verified": true,
+        "playable": true,
+    }))
+}
+
+fn check_signal_finalization(base: &Path) -> Result<serde_json::Value, String> {
+    let mut signals = Vec::new();
+    for (name, signal) in [
+        ("SIGTERM", libc::SIGTERM),
+        ("SIGINT", libc::SIGINT),
+        ("SIGHUP", libc::SIGHUP),
+    ] {
+        signals.push(check_signal_finalization_one(base, name, signal)?);
+    }
+    Ok(serde_json::json!({"ok": true, "signals": signals}))
+}
+
+fn check_signal_finalization_one(
+    base: &Path,
+    signal_name: &str,
+    signal_number: libc::c_int,
+) -> Result<serde_json::Value, String> {
+    use std::os::unix::process::ExitStatusExt;
+
+    let root = scenario_root(
+        base,
+        &format!("signal-{}", signal_name.to_ascii_lowercase()),
+    );
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    let ready = root.join("child.ready");
+    let mut child = spawn_child("--selftest-signal-child", &root, &ready)?;
+    let ready_data = wait_child_ready(&mut child, &ready, Duration::from_secs(60))?;
+    let session_dir = PathBuf::from(
+        ready_data
+            .lines()
+            .next()
+            .ok_or("signal child omitted its session path")?,
+    );
+    if !studio::session::scan_interrupted(&root)
+        .map_err(|e| e.to_string())?
+        .is_empty()
+    {
+        return Err("live recording lock did not suppress recovery discovery".into());
+    }
+    // SAFETY: sending the selected handled signal to the explicitly spawned self-test child PID.
+    if unsafe { libc::kill(child.0.id() as libc::pid_t, signal_number) } != 0 {
+        return Err(format!(
+            "cannot send {signal_name} to self-test child: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let status = wait_child_exit(&mut child, Duration::from_secs(12))?;
+    if status.code() != Some(128 + signal_number) || status.signal().is_some() {
+        return Err(format!("{signal_name} child exited unexpectedly: {status}"));
+    }
+    let manifest =
+        studio::session::read_manifest(&session_dir.join(studio::session::MANIFEST_NAME))
+            .map_err(|e| e.to_string())?;
+    let segment = manifest
+        .segments
+        .iter()
+        .find(|segment| segment.index == 1)
+        .ok_or("signal shutdown manifest omitted segment 1")?;
+    if !matches!(segment.status.as_str(), "complete" | "incomplete")
+        || segment.inputs.iter().any(|input| {
+            matches!(
+                input.status.as_str(),
+                "starting" | "recording" | "finalizing"
+            )
+        })
+    {
+        return Err(format!(
+            "signal shutdown left nonterminal manifest state: {segment:?}"
+        ));
+    }
+    let disc = pbutils::Discoverer::new(gst::ClockTime::from_seconds(5))
+        .map_err(|e| format!("Discoverer: {e}"))?;
+    let mut playable_video = None;
+    let mut verified_inputs = Vec::new();
+    let mut audio_verified = false;
+    for input in &segment.inputs {
+        if input.status != "complete" {
+            return Err(format!(
+                "handled {signal_name} left input {} in state {}: {:?}",
+                input.key, input.status, input.error
+            ));
+        }
+        let path = session_dir.join(&segment.dir).join(&input.file);
+        let media = verify_preserved_media(
+            &disc,
+            &path,
+            if input.kind == "microphone" {
+                InputKey::Microphone
+            } else {
+                InputKey::Camera
+            },
+        )?;
+        if input.kind == "microphone" {
+            audio_verified = true;
+        } else {
+            playable_video = Some(path);
+        }
+        verified_inputs.push(media);
+    }
+    if playable_video.is_none() {
+        return Err("signal shutdown did not finalize a playable video".into());
+    }
+    let reserve_released = !session_dir.join(".chinstrap-reserve").exists();
+    if !reserve_released {
+        return Err("signal shutdown left the emergency reserve behind".into());
+    }
+    if !studio::session::scan_interrupted(&root)
+        .map_err(|e| e.to_string())?
+        .is_empty()
+    {
+        return Err("signal-finalized session was still offered as interrupted".into());
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "signal": signal_name,
+        "exit_code": status.code(),
+        "terminal_manifest": true,
+        "verified_inputs": verified_inputs,
+        "audio_finalized_and_playable": audio_verified,
+        "cues_duration_verified": true,
+        "playable": true,
+        "reserve_released": reserve_released,
+        "live_lock_suppressed_recovery": true,
+    }))
 }
 
 /// Preview frames of `keys` over [`PREVIEW_WINDOW`] (after each has its first one): enough of
@@ -1436,6 +2486,7 @@ fn check_load(
         snap: None,
         levels: 0,
         errors: Vec::new(),
+        notices: Vec::new(),
     };
     let result = (|| -> Result<serde_json::Value, String> {
         let first = l
@@ -1507,6 +2558,7 @@ fn check_load(
         })
         .ok_or("load never reached Recording")?;
         l.sleep(Duration::from_secs(secs));
+        let live_storage = l.snap.as_ref().map(|snapshot| snapshot.storage.clone());
         engine.send(EngineCommand::Stop);
         let done = l
             .wait_for(Duration::from_secs(30), |s| s.phase == Phase::Idle)
@@ -1516,6 +2568,50 @@ fn check_load(
             .as_ref()
             .and_then(|s| s.segments.first().cloned())
             .ok_or("no load segment")?;
+        let output_bytes = seg.files.iter().fold(0u64, |total, file| {
+            total.saturating_add(
+                std::fs::metadata(&file.path)
+                    .map(|meta| meta.len())
+                    .unwrap_or(0),
+            )
+        });
+        let duration_secs = seg
+            .duration
+            .map(|duration| duration.as_secs_f64())
+            .unwrap_or(secs as f64);
+        let measured_rate = if duration_secs > 0.0 {
+            output_bytes as f64 / duration_secs
+        } else {
+            0.0
+        };
+        let planned_rate = ready.storage.estimated_bytes_per_second as f64;
+        let error_pct = if measured_rate > 0.0 {
+            (planned_rate - measured_rate).abs() / measured_rate * 100.0
+        } else {
+            f64::INFINITY
+        };
+        let live_rate = live_storage
+            .as_ref()
+            .map(|storage| storage.estimated_bytes_per_second);
+        let rate_was_measured = live_storage
+            .as_ref()
+            .is_some_and(|storage| storage.rate_measured);
+        if !rate_was_measured {
+            l.fail("4K load did not expose an on-disk measured storage rate");
+        }
+        if error_pct > 35.0 {
+            l.fail(format!(
+                "planned rate {:.0} B/s is {:.1}% from measured disk growth {:.0} B/s (limit 35%)",
+                planned_rate, error_pct, measured_rate
+            ));
+        }
+        let storage_rate_json = serde_json::json!({
+            "planned_bytes_per_second": planned_rate,
+            "measured_bytes_per_second": measured_rate,
+            "live_measured_bytes_per_second": live_rate,
+            "relative_error_pct": error_pct,
+            "within_35_percent": error_pct <= 35.0 && rate_was_measured,
+        });
         let reference = if standin {
             InputKey::Source(SourceId(3))
         } else {
@@ -1588,6 +2684,7 @@ fn check_load(
         Ok(serde_json::json!({
             "seconds": secs, "windows": format!("{mode:?}"), "reference": format!("{reference:?}"),
             "plan": plan, "files": files,
+            "storage_rate": storage_rate_json,
             "repeat_pct_counters": counter_pct,
             "repeat_pct_diff": pct, "pairs": pairs,
             "repeat_pct_diff_after_5s": late_pct,

@@ -669,6 +669,32 @@ pub fn format_bytes(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
+/// Human-readable decimal gigabytes per minute from a byte-per-second rate.
+pub fn format_storage_rate(bytes_per_second: u64) -> String {
+    format!(
+        "{:.2} GB/min",
+        bytes_per_second as f64 * 60.0 / 1_000_000_000.0
+    )
+}
+
+/// Severity color for the toolbar hint and blocked-storage state.
+pub fn record_hint_color(
+    recording: bool,
+    remaining_seconds: Option<u64>,
+    storage_blocked: bool,
+    idle_over_capacity: bool,
+) -> u32 {
+    if storage_blocked || (recording && remaining_seconds.is_some_and(|seconds| seconds <= 180)) {
+        RED
+    } else if (recording && remaining_seconds.is_some_and(|seconds| seconds <= 600))
+        || idle_over_capacity
+    {
+        AMBER
+    } else {
+        MUTED
+    }
+}
+
 /// One-line quality summary for a video input, and whether anything in it deserves attention
 /// (repeats over 1 %, any dropped frame).
 pub fn quality_summary(q: &InputQuality) -> (String, bool) {
@@ -1055,6 +1081,20 @@ mod tests {
         assert_eq!(format_rate(144, 1), "144");
         assert_eq!(format_rate(30000, 1001), "29.97");
         assert_eq!(format_fps(25.0), "25");
+    }
+
+    #[test]
+    fn storage_rate_and_low_space_hint_are_units_and_severity_aware() {
+        assert_eq!(format_storage_rate(1_000_000_000 / 60), "1.00 GB/min");
+        assert_eq!(
+            record_hint_color(true, Some(180), false, false),
+            RED,
+            "the stop-threshold warning must not be muted while recording"
+        );
+        assert_eq!(record_hint_color(true, Some(600), false, false), AMBER);
+        assert_eq!(record_hint_color(false, None, true, false), RED);
+        assert_eq!(record_hint_color(false, None, false, true), AMBER);
+        assert_eq!(record_hint_color(true, Some(601), false, false), MUTED);
     }
 
     #[test]

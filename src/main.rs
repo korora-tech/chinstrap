@@ -2,6 +2,7 @@
 #[allow(clippy::too_many_arguments)]
 mod explorer;
 mod selftest;
+mod signal_shutdown;
 mod studio;
 mod ui;
 
@@ -19,6 +20,18 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("--transcribe-worker") => std::process::exit(studio::transcribe::run_worker()),
         Some("--transcribe") => std::process::exit(studio::transcribe::run_cli(&args[2..])),
+        Some("--selftest-crash-child") | Some("--selftest-signal-child") => {
+            let (Some(root), Some(ready)) = (args.get(2), args.get(3)) else {
+                eprintln!("usage: chinstrap --selftest-(crash|signal)-child <root> <ready-file>");
+                std::process::exit(2);
+            };
+            let result = if args[1] == "--selftest-crash-child" {
+                selftest::crash_child(&PathBuf::from(root), &PathBuf::from(ready))
+            } else {
+                selftest::signal_child(&PathBuf::from(root), &PathBuf::from(ready))
+            };
+            std::process::exit(result);
+        }
         Some("--download-model") => {
             let name = args.get(2).map(String::as_str);
             if args.len() > 3 || name.is_some_and(|n| n.starts_with('-')) {
@@ -53,6 +66,13 @@ fn main() {
         eprintln!("chinstrap: {e}");
         std::process::exit(1)
     });
+    if let Err(e) = signal_shutdown::install_handlers()
+        .and_then(|_| signal_shutdown::spawn_shutdown_watcher(engine.clone()))
+    {
+        eprintln!("chinstrap: cannot install signal shutdown handlers: {e}");
+        let _ = engine.shutdown_blocking(Duration::from_secs(8));
+        std::process::exit(1);
+    }
 
     application().run(move |cx: &mut App| {
         cx.bind_keys([
