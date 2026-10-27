@@ -7,13 +7,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use gpui::prelude::*;
 use gpui::{
     App, ClickEvent, Context, Div, EventEmitter, FocusHandle, Focusable, FontWeight, KeyDownEvent,
-    RenderImage, ScrollHandle, SharedString, Stateful, Task, Window, div, prelude::*, px, rgb,
+    RenderImage, ScrollHandle, SharedString, Stateful, Task, Window, div, px, rgb,
 };
 use smallvec::SmallVec;
 
-use super::theme::*;
+use super::theme::{
+    ACCENT, ACCENT_TEXT, AMBER, BG, BORDER, GREEN, MUTED, PANEL, PANEL_RAISED, RED, SECONDARY,
+    SIDEBAR, TEXT, TOOLBAR,
+};
 use super::widgets::{
     ButtonStyle, OnClick, SegmentActions, SourceRowExtras, badge, button, caption, checkbox_row,
     chip, format_bytes, format_duration, format_fps, format_rate, icon_button, level_meter,

@@ -8,7 +8,8 @@ mod ui;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use gpui::{App, Bounds, KeyBinding, WindowBounds, WindowOptions, prelude::*, px, size};
+use gpui::prelude::*;
+use gpui::{App, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size};
 use gpui_platform::application;
 
 use ui::{Cut, Quit, ShowExplorer, ShowStudio, ToggleRecord};

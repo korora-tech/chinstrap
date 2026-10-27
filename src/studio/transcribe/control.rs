@@ -17,7 +17,10 @@ use super::model::{self, DlError, DlEvent, DlOpts, Resolved};
 use super::proto::{self, BackendReq, Job};
 use super::worker::{self, CommandFactory, WorkerCmd, WorkerEvent, WorkerHandle, WorkerSink};
 use crate::studio::session::{self, ManifestTranscript};
-use crate::studio::types::*;
+use crate::studio::types::{
+    EngineCommand, ModelState, OtherSessionJobs, Severity, TranscribeStage, TranscriptStatus,
+    TranscriptionInfo, WhisperBackend,
+};
 
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 

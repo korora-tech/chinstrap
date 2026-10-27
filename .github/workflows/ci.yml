@@ -2,11 +2,20 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'refactor/**']
   pull_request:
-    branches: [main]
+    branches: [main, 'refactor/**']
 
 jobs:
+  quality:
+    name: Rust format and Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - run: nix develop -c cargo fmt --all -- --check
+      - run: nix develop -c cargo clippy --all-targets -- -D warnings
+
   package:
     name: Nix package
     runs-on: ubuntu-latest
