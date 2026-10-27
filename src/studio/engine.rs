@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,7 @@ use super::preview::{self, Previews, Tap};
 use super::recorder::{self, InputPipeline, Rate, VideoSource};
 use super::session::{self, Manifest, ManifestInput, ManifestQuality, ManifestSegment};
 use super::stamp::{self, Counters, SizeSlot, UNSET};
+use super::storage;
 use super::transcribe::control::{JobKey, ModelEvent, SegView, Transcription, TxConfig};
 use super::transcribe::vocab;
 use super::transcribe::worker::WorkerEvent;
@@ -45,6 +46,10 @@ pub struct EngineConfig {
     pub test_sources: Vec<(u32, recorder::TestBehaviour)>,
     /// Live previews of the camera and sources (`CHINSTRAP_PREVIEW=0` turns them off).
     pub preview: bool,
+    /// Injected filesystem free bytes for `--selftest` scenarios; normal runs leave this unset.
+    pub selftest_free_bytes: Option<u64>,
+    /// Injected `CHINSTRAP_MIN_FREE_MB` for low-space self-tests only.
+    pub selftest_min_free_mb: Option<u64>,
 }
 
 /// `CHINSTRAP_FRAME_RATE`: native (default), 60, 30.
@@ -95,6 +100,8 @@ impl EngineConfig {
             frame_rate,
             test_sources: Vec::new(),
             preview: preview::enabled_from_env(),
+            selftest_free_bytes: None,
+            selftest_min_free_mb: None,
         }
     }
 }
@@ -128,10 +135,23 @@ pub(super) enum Msg {
     Cmd(EngineCommand),
     Portal(PortalOutcome),
     Worker(WorkerResult),
+    /// Injectable storage failure at the engine event boundary; used only by the self-test.
+    SelftestNoSpace {
+        key: InputKey,
+    },
+    /// Injectable filesystem free-space value; only used by self-tests.
+    SelftestFreeBytes {
+        bytes: u64,
+    },
     /// Transcription worker thread (§12.3).
     Transcribe(WorkerEvent),
     /// Model check/download thread (§12.5).
     Model(ModelEvent),
+    RecoveryDone {
+        name: String,
+        dir: PathBuf,
+        result: Result<super::recovery::RecoveryResult, String>,
+    },
     Shutdown {
         deadline: Instant,
         /// Receives true when every active segment was finalized before the deadline.
@@ -168,6 +188,16 @@ impl EngineHandle {
         if let Err(mpsc::SendError(Msg::Cmd(cmd))) = self.inner.tx.send(Msg::Cmd(cmd)) {
             eprintln!("chinstrap: engine thread is gone; dropped command {cmd:?}");
         }
+    }
+
+    /// Injects an ENOSPC event at the real engine failure handler, for the self-test only.
+    pub(crate) fn inject_storage_failure_for_selftest(&self, key: InputKey) {
+        let _ = self.inner.tx.send(Msg::SelftestNoSpace { key });
+    }
+
+    /// Replaces the free-space value observed by the storage monitor in self-tests only.
+    pub(crate) fn set_free_bytes_for_selftest(&self, bytes: u64) {
+        let _ = self.inner.tx.send(Msg::SelftestFreeBytes { bytes });
     }
 
     /// The newest preview frame of every previewed input (the camera and each source).
@@ -286,6 +316,7 @@ const FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const NULL_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const SIZE_EVERY: Duration = Duration::from_secs(1);
+const MANIFEST_RETRY: Duration = Duration::from_secs(1);
 const LEVEL_EVERY: Duration = Duration::from_millis(100);
 /// Why a command is refused while a Record waits for the idle previews to stop.
 const STARTING: &str = "a recording is starting";
@@ -322,12 +353,96 @@ enum Stage {
     Nulling,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageFinalizeAction {
+    GracefulEos,
+    InjectEos,
+    AwaitState,
+    AlreadyStopping,
+}
+
+fn storage_finalize_action(stage: &Stage) -> StorageFinalizeAction {
+    match stage {
+        Stage::Running { .. } => StorageFinalizeAction::GracefulEos,
+        Stage::Paused => StorageFinalizeAction::InjectEos,
+        Stage::Pausing | Stage::Starting => StorageFinalizeAction::AwaitState,
+        Stage::Draining { .. } | Stage::Nulling => StorageFinalizeAction::AlreadyStopping,
+    }
+}
+
+struct CheckpointWriteState {
+    last_success: Instant,
+    pending: bool,
+}
+
+impl CheckpointWriteState {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_success: now,
+            pending: false,
+        }
+    }
+
+    fn request_if_due(&mut self, recording: bool, now: Instant, manifest_dirty: &mut bool) -> bool {
+        if session::checkpoint_due(recording, self.last_success, now) {
+            self.pending = true;
+            *manifest_dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn write_result(&mut self, succeeded: bool, now: Instant, manifest_dirty: &mut bool) {
+        if succeeded {
+            *manifest_dirty = false;
+            if self.pending {
+                self.last_success = now;
+                self.pending = false;
+            }
+        } else {
+            // Keep the manifest dirty and the checkpoint due until an atomic write succeeds.
+            *manifest_dirty = true;
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Outcome {
     Complete,
     Failed(String),
-    /// Failed, and the partial file is deleted.
+    /// Failed before useful output; remove the file only if it contains no data.
     Discard(String),
+}
+
+fn storage_stop_outcome(outcome: Option<Outcome>) -> Option<Outcome> {
+    match outcome {
+        None | Some(Outcome::Discard(_)) => Some(Outcome::Failed(
+            "storage stop; partial file preserved".into(),
+        )),
+        other => other,
+    }
+}
+
+fn discard_recovery_reason(path: Option<&Path>, encoded: u64, reason: &str) -> Option<String> {
+    let bytes = path
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map_or(0, |metadata| metadata.len());
+    (bytes > 0 || encoded > 0).then(|| retained_discard_reason(reason))
+}
+
+fn retained_discard_reason(reason: &str) -> String {
+    format!("recovery failed: early-failed file retained for recovery: {reason}")
+}
+
+fn finish_discard(path: Option<&Path>, encoded: u64, reason: &str) -> String {
+    if let Some(recoverable) = discard_recovery_reason(path, encoded, reason) {
+        return recoverable;
+    }
+    if let Some(path) = path {
+        let _ = std::fs::remove_file(path);
+    }
+    reason.to_string()
 }
 
 enum PipeKind {
@@ -336,6 +451,8 @@ enum PipeKind {
         key: InputKey,
         rec: InputPipeline,
         resize_at: Option<Instant>,
+        /// Keeps recovery locked while this pipeline or one of its worker threads is alive.
+        _session_lock: session::SessionLock,
     },
     Probe {
         source: SourceId,
@@ -411,6 +528,7 @@ struct Seg {
     started_wall: Option<String>,
     started_at: Option<Instant>,
     timed_out: bool,
+    stop_reason: Option<String>,
     files: Vec<FileRec>,
 }
 
@@ -418,6 +536,8 @@ struct Session {
     name: String,
     dir: PathBuf,
     created: String,
+    _lock: session::SessionLock,
+    reserve_path: Option<PathBuf>,
     segs: Vec<Seg>,
 }
 
@@ -445,6 +565,12 @@ struct Engine {
     sources: Vec<Source>,
     captures: HashMap<CaptureId, Capture>,
     output_root: PathBuf,
+    min_free_mb: u64,
+    storage: StorageInfo,
+    storage_rate_tracker: storage::StorageRateTracker,
+    storage_free_bytes_override: Option<u64>,
+    storage_warning_level: u8,
+    recoveries: Vec<RecoveryCandidate>,
     phase: Phase,
     portal_busy: bool,
     session: Option<Session>,
@@ -464,6 +590,8 @@ struct Engine {
     shutdown_clean: bool,
     resize_after: Option<Duration>,
     last_sizes: Instant,
+    checkpoint: CheckpointWriteState,
+    manifest_retry_at: Option<Instant>,
     last_level: Instant,
     dirty: bool,
     manifest_dirty: bool,
@@ -585,6 +713,15 @@ fn quality_of(rec: &InputPipeline, bytes: u64) -> Option<InputQuality> {
         },
         start_offset: (first != UNSET).then(|| Duration::from_nanos(first)),
     })
+}
+
+fn retain_session_lock_until_process_exit(lock: session::SessionLock) {
+    static LOCKS: OnceLock<Mutex<Vec<session::SessionLock>>> = OnceLock::new();
+    LOCKS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(lock);
 }
 
 fn spawn_named(name: String, f: impl FnOnce() + Send + 'static) {
@@ -771,6 +908,16 @@ impl Engine {
             selected_microphone,
             sources: Vec::new(),
             captures: HashMap::new(),
+            min_free_mb: cfg.selftest_min_free_mb.unwrap_or_else(|| {
+                storage::parse_minimum_free_mb(
+                    std::env::var("CHINSTRAP_MIN_FREE_MB").ok().as_deref(),
+                )
+            }),
+            storage: StorageInfo::default(),
+            storage_rate_tracker: storage::StorageRateTracker::default(),
+            storage_free_bytes_override: cfg.selftest_free_bytes,
+            storage_warning_level: 0,
+            recoveries: Vec::new(),
             phase: Phase::Idle,
             portal_busy: false,
             session: None,
@@ -787,6 +934,8 @@ impl Engine {
             shutdown_clean: true,
             resize_after: recorder::test_resize_after(),
             last_sizes: now,
+            checkpoint: CheckpointWriteState::new(now),
+            manifest_retry_at: None,
             last_level: now,
             dirty: true,
             manifest_dirty: false,
@@ -803,7 +952,42 @@ impl Engine {
     }
 
     fn run(mut self, rx: mpsc::Receiver<Msg>) {
-        // First event is always a Snapshot; startup notices follow it.
+        // Discover stale sessions before the first Snapshot so recovery actions are immediately visible.
+        match session::scan_interrupted(&self.output_root) {
+            Ok(found) => {
+                for item in found {
+                    let segments = item
+                        .segments
+                        .iter()
+                        .map(u32::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.pending_notices.push(Notice {
+                        severity: Severity::Warning,
+                        input: None,
+                        message: format!(
+                            "An earlier recording was interrupted: {}, segment {}. Recover / Show folder / Dismiss.",
+                            item.name, segments
+                        ),
+                        detail: None,
+                    });
+                    self.recoveries.push(RecoveryCandidate {
+                        name: item.name,
+                        dir: item.dir,
+                        segments: item.segments,
+                        recovering: false,
+                        error: None,
+                    });
+                }
+            }
+            Err(error) => self.pending_notices.push(Notice {
+                severity: Severity::Error,
+                input: None,
+                message: format!("Cannot scan for interrupted recordings: {error}"),
+                detail: None,
+            }),
+        }
+        self.refresh_storage();
         self.snapshot();
         for n in std::mem::take(&mut self.pending_notices) {
             let _ = self.events.send_blocking(EngineEvent::Notice(n));
@@ -919,6 +1103,8 @@ impl Engine {
             frame_rate_default: self.frame_rate_default,
             selected_camera_mode: self.camera_mode.clone(),
             capacity: self.capacity(),
+            storage: self.storage.clone(),
+            recoveries: self.recoveries.clone(),
             vocabulary: self.vocabulary.clone(),
             previews: self
                 .preview_keys()
@@ -941,7 +1127,11 @@ impl Engine {
         if self.transcription.take_dirty() {
             self.dirty = true;
         }
-        if self.manifest_dirty {
+        if self.manifest_dirty
+            && self
+                .manifest_retry_at
+                .is_none_or(|retry_at| Instant::now() >= retry_at)
+        {
             self.write_manifest();
         }
         if self.dirty {
@@ -950,8 +1140,9 @@ impl Engine {
     }
 
     fn write_manifest(&mut self) {
-        self.manifest_dirty = false;
         let Some(s) = &self.session else {
+            self.manifest_dirty = false;
+            self.manifest_retry_at = None;
             return;
         };
         let mut m = Manifest::new(&s.name, s.created.clone());
@@ -1022,7 +1213,12 @@ impl Engine {
                     .collect(),
             });
         }
-        if let Err(e) = session::write_manifest(&s.dir, &m) {
+        let result = session::write_manifest(&s.dir, &m);
+        let now = Instant::now();
+        self.checkpoint
+            .write_result(result.is_ok(), now, &mut self.manifest_dirty);
+        self.manifest_retry_at = result.is_err().then_some(now + MANIFEST_RETRY);
+        if let Err(e) = result {
             self.notice(
                 Severity::Error,
                 None,
@@ -1097,6 +1293,7 @@ impl Engine {
                 .iter()
                 .any(|s| s.info.state == SourceState::Checking)
             && !self.frozen_inputs().is_empty()
+            && self.storage.record_blocked_reason.is_none()
     }
 
     fn seg_mut(&mut self, index: u32) -> Option<&mut Seg> {
@@ -1147,11 +1344,38 @@ impl Engine {
             Msg::Cmd(cmd) => self.command(cmd),
             Msg::Portal(outcome) => self.portal_outcome(outcome),
             Msg::Worker(w) => self.worker_result(w),
+            Msg::SelftestNoSpace { key } => {
+                if self.test_sources.is_empty() {
+                    self.notice(
+                        Severity::Error,
+                        Some(key),
+                        "Rejected self-test storage failure outside an injected test engine",
+                    );
+                } else if let Some(id) = self
+                    .pipes
+                    .iter()
+                    .find(|pipe| pipe.input().is_some_and(|(_, input)| input == key))
+                    .map(|pipe| pipe.id)
+                {
+                    self.disk_full_error(id, "injected ENOSPC test event".into());
+                } else {
+                    self.notice(
+                        Severity::Error,
+                        Some(key),
+                        "Self-test storage failure could not find the requested input",
+                    );
+                }
+            }
+            Msg::SelftestFreeBytes { bytes } => {
+                self.storage_free_bytes_override = Some(bytes);
+                self.refresh_storage();
+            }
             Msg::Transcribe(e) => self.transcription.on_worker(e),
             Msg::Model(e) => {
                 let segs = self.seg_views();
                 self.transcription.on_model(e, &segs);
             }
+            Msg::RecoveryDone { name, dir, result } => self.recovery_done(name, dir, result),
             Msg::Shutdown { deadline, ack } => self.begin_shutdown(deadline, Some(ack)),
         }
     }
@@ -1174,6 +1398,7 @@ impl Engine {
             | EngineCommand::RemoveSource(_)
             | EngineCommand::SetOutputRoot(_)
             | EngineCommand::EndSession
+            | EngineCommand::RecoverSession { .. }
             | EngineCommand::SetFrameRateMode { .. }
             | EngineCommand::SelectCameraMode(_)
                 if busy =>
@@ -1350,12 +1575,16 @@ impl Engine {
                     if self.manifest_dirty {
                         self.write_manifest();
                     }
+                    self.release_session_reserve(Severity::Warning);
                     self.session = None;
                     // Its transcription jobs keep running (§12.3 policy 11).
                     self.transcription.set_session(None);
                     self.dirty = true;
                 }
             }
+            EngineCommand::RecoverSession { name } => self.start_recovery(name),
+            EngineCommand::ShowSessionFolder { name } => self.show_session_folder(name),
+            EngineCommand::DismissRecovery { name } => self.dismiss_recovery(name),
             EngineCommand::Record => self.record(&cmd),
             EngineCommand::Stop => self.stop(&cmd),
             EngineCommand::ToggleRecord => match self.phase {
@@ -1377,6 +1606,148 @@ impl Engine {
                 }
             }
         }
+    }
+
+    fn start_recovery(&mut self, name: &str) {
+        let Some(candidate) = self
+            .recoveries
+            .iter()
+            .find(|item| item.name == name)
+            .cloned()
+        else {
+            self.notice(
+                Severity::Warning,
+                None,
+                "This interrupted session is no longer available",
+            );
+            return;
+        };
+        if candidate.recovering {
+            self.notice(
+                Severity::Info,
+                None,
+                "Recovery is already running for this session",
+            );
+            return;
+        }
+        if let Some(item) = self.recoveries.iter_mut().find(|item| item.name == name) {
+            item.recovering = true;
+            item.error = None;
+        }
+        self.dirty = true;
+        let tx = self.tx.clone();
+        let worker_name = candidate.name.clone();
+        let worker_dir = candidate.dir.clone();
+        let spawn = std::thread::Builder::new()
+            .name(format!("chinstrap-recovery-{}", candidate.name))
+            .spawn(move || {
+                let result = super::recovery::recover_session(&worker_dir);
+                let _ = tx.send(Msg::RecoveryDone {
+                    name: worker_name,
+                    dir: worker_dir,
+                    result,
+                });
+            });
+        if let Err(error) = spawn {
+            if let Some(item) = self.recoveries.iter_mut().find(|item| item.name == name) {
+                item.recovering = false;
+                item.error = Some(error.to_string());
+            }
+            self.notice(
+                Severity::Error,
+                None,
+                format!("Cannot start recovery for {name}: {error}"),
+            );
+            self.dirty = true;
+        }
+    }
+
+    fn show_session_folder(&self, name: &str) {
+        let Some(candidate) = self.recoveries.iter().find(|item| item.name == name) else {
+            self.notice(
+                Severity::Warning,
+                None,
+                "This interrupted session is no longer available",
+            );
+            return;
+        };
+        if let Err(error) = std::process::Command::new("xdg-open")
+            .arg(&candidate.dir)
+            .spawn()
+        {
+            self.notice(
+                Severity::Error,
+                None,
+                format!("Cannot open the interrupted session folder: {error}"),
+            );
+        }
+    }
+
+    fn dismiss_recovery(&mut self, name: &str) {
+        let before = self.recoveries.len();
+        self.recoveries.retain(|item| item.name != name);
+        if self.recoveries.len() != before {
+            self.dirty = true;
+        }
+    }
+
+    fn recovery_done(
+        &mut self,
+        name: String,
+        dir: PathBuf,
+        result: Result<super::recovery::RecoveryResult, String>,
+    ) {
+        match result {
+            Ok(result) => {
+                if result.failed_files == 0 {
+                    self.recoveries.retain(|item| item.name != name);
+                } else if let Some(item) = self.recoveries.iter_mut().find(|item| item.name == name)
+                {
+                    item.recovering = false;
+                    item.error = Some(
+                        "Some files could not be recovered; original footage was preserved. Retry or show the folder.".into(),
+                    );
+                }
+                for (segment, mic) in &result.mic_files {
+                    self.transcription.segment_completed(
+                        JobKey {
+                            session_dir: dir.clone(),
+                            segment: *segment,
+                        },
+                        Some(mic.clone()),
+                    );
+                }
+                let severity = if result.failed_files == 0 {
+                    Severity::Info
+                } else {
+                    Severity::Warning
+                };
+                let message = if result.failed_files == 0 {
+                    format!(
+                        "Recovery of {name} finished: {} file(s) recovered",
+                        result.recovered_files
+                    )
+                } else {
+                    format!(
+                        "Recovery of {name} partially finished: {} file(s) recovered, {} file(s) left untouched; retry remains available",
+                        result.recovered_files, result.failed_files
+                    )
+                };
+                self.notice(severity, None, message);
+            }
+            Err(error) => {
+                if let Some(item) = self.recoveries.iter_mut().find(|item| item.name == name) {
+                    item.recovering = false;
+                    item.error = Some(error.clone());
+                }
+                self.notice(
+                    Severity::Error,
+                    None,
+                    format!("Recovery of {name} failed: {error}"),
+                );
+            }
+        }
+        self.dirty = true;
     }
 
     /// The current session's segments as the transcription state needs them.
@@ -1440,6 +1811,11 @@ impl Engine {
     // ---- recording control -------------------------------------------------------------------
 
     fn record(&mut self, cmd: &EngineCommand) {
+        self.refresh_storage();
+        if let Some(why) = self.storage.record_blocked_reason.clone() {
+            self.reject(cmd, &why);
+            return;
+        }
         if !self.can_record() {
             let why = if self.record_pending {
                 STARTING
@@ -1467,16 +1843,58 @@ impl Engine {
     /// Record, once nothing else uses the inputs: opens the session if needed and starts a
     /// segment with the frozen input set.
     fn begin_recording(&mut self) {
+        self.refresh_storage();
+        if let Some(why) = self.storage.record_blocked_reason.clone() {
+            self.record_pending = false;
+            self.notice(
+                Severity::Error,
+                None,
+                format!("Recording did not start: {why}"),
+            );
+            self.dirty = true;
+            return;
+        }
         if self.session.is_none() {
             match session::create_session_dir(&self.output_root, &session::session_name_now()) {
                 Ok((name, dir)) => {
+                    let lock = match session::SessionLock::acquire(&dir) {
+                        Ok(lock) => lock,
+                        Err(e) => {
+                            let _ = std::fs::remove_dir(&dir);
+                            self.notice(
+                                Severity::Error,
+                                None,
+                                format!("Cannot lock the new recording session: {e}"),
+                            );
+                            return;
+                        }
+                    };
+                    let reserve = match storage::create_emergency_reserve(
+                        &dir,
+                        storage::EMERGENCY_RESERVE_BYTES,
+                    ) {
+                        Ok(path) => path,
+                        Err(e) => {
+                            drop(lock);
+                            let _ = std::fs::remove_dir_all(&dir);
+                            self.notice(
+                                Severity::Error,
+                                None,
+                                format!("Cannot reserve emergency stop space: {e}"),
+                            );
+                            return;
+                        }
+                    };
                     self.transcription.set_session(Some(dir.clone()));
                     self.session = Some(Session {
                         name,
                         dir,
                         created: session::wall_now(),
+                        _lock: lock,
+                        reserve_path: Some(reserve),
                         segs: Vec::new(),
                     });
+                    self.storage_warning_level = 0;
                     self.write_manifest();
                 }
                 Err(e) => {
@@ -1487,6 +1905,22 @@ impl Engine {
                             "Cannot create a session in {}: {e}",
                             self.output_root.display()
                         ),
+                    );
+                    return;
+                }
+            }
+        }
+        if let Some(session) = self.session.as_mut()
+            && session.reserve_path.is_none()
+        {
+            match storage::create_emergency_reserve(&session.dir, storage::EMERGENCY_RESERVE_BYTES)
+            {
+                Ok(path) => session.reserve_path = Some(path),
+                Err(e) => {
+                    self.notice(
+                        Severity::Error,
+                        None,
+                        format!("Cannot reserve emergency stop space: {e}"),
                     );
                     return;
                 }
@@ -1572,6 +2006,7 @@ impl Engine {
             return;
         };
         let index = sess.segs.len() as u32 + 1;
+        let session_lock = sess._lock.clone();
         let dir = match session::create_segment_dir(&sess.dir, index) {
             Ok(d) => d,
             Err(e) => {
@@ -1735,6 +2170,7 @@ impl Engine {
             started_wall: None,
             started_at: None,
             timed_out: false,
+            stop_reason: None,
             files,
         };
         if let Some(s) = self.session.as_mut() {
@@ -1759,6 +2195,7 @@ impl Engine {
                     key,
                     rec: ip,
                     resize_at: None,
+                    _session_lock: session_lock.clone(),
                 },
                 stage: Stage::Pausing,
                 deadline: Some(self.deadline_cap(Instant::now() + START_TIMEOUT)),
@@ -1880,6 +2317,164 @@ impl Engine {
             warning: p.warning(),
             notes: p.notes.clone(),
         }
+    }
+
+    fn measured_storage_rate(&mut self) -> Option<u64> {
+        let segment = match &self.phase {
+            Phase::Recording { segment, .. } => *segment,
+            _ => return None,
+        };
+        let bytes = self
+            .session
+            .as_ref()?
+            .segs
+            .iter()
+            .find(|seg| seg.index == segment)?
+            .files
+            .iter()
+            .map(|file| {
+                std::fs::metadata(&file.file.path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0)
+            })
+            .fold(0u64, u64::saturating_add);
+        self.storage_rate_tracker
+            .observe(segment, bytes, Instant::now())
+            .filter(|rate| *rate > 0)
+    }
+
+    /// Refreshes the conservative plan rate and available space for the current selection.
+    fn refresh_storage(&mut self) {
+        let inputs = self.frozen_inputs();
+        let demands = self.demands(&inputs);
+        let plan = self.plan_for(&inputs);
+        let mut video_kbps = Vec::new();
+        for assigned in &plan.inputs {
+            let Some(demand) = demands.iter().find(|d| d.key == assigned.key) else {
+                continue;
+            };
+            let role = if demand.camera {
+                Role::Camera
+            } else {
+                Role::Screen
+            };
+            let width = demand.size.0.min(assigned.max.0);
+            let height = demand.size.1.min(assigned.max.1);
+            let fps = assigned.fps.ceil().clamp(1.0, i32::MAX as f64) as i32;
+            video_kbps.push(encoders::bitrate_kbps(
+                role,
+                assigned.enc.codec(),
+                width,
+                height,
+                (fps, 1),
+            ));
+        }
+        let planned_rate =
+            storage::estimate_bytes_per_second(&video_kbps, inputs.contains(&InputKey::Microphone));
+        let measured_rate = self.measured_storage_rate();
+        let rate = measured_rate.unwrap_or(planned_rate);
+        let free = match self.storage_free_bytes_override {
+            Some(bytes) => Ok(bytes),
+            None => storage::available_bytes(&self.output_root),
+        };
+        let free_bytes = free.as_ref().ok().copied();
+        let reserve = storage::stop_reserve_bytes(rate, self.min_free_mb);
+        let required_before_start = reserve.saturating_add(storage::EMERGENCY_RESERVE_BYTES);
+        let record_blocked_reason = if inputs.is_empty() {
+            None
+        } else {
+            match &free {
+                Err(e) => Some(format!("Cannot check output free space: {e}")),
+                Ok(bytes) if *bytes < required_before_start => Some(format!(
+                    "Not enough free space to start safely ({} bytes available; {} bytes including the emergency stop reserve required)",
+                    bytes, required_before_start
+                )),
+                Ok(_) => None,
+            }
+        };
+        let next = StorageInfo {
+            free_bytes,
+            estimated_bytes_per_second: rate,
+            rate_measured: measured_rate.is_some(),
+            remaining_seconds: free_bytes
+                .and_then(|bytes| storage::remaining_seconds(bytes.saturating_sub(reserve), rate)),
+            stop_reserve_bytes: reserve,
+            record_blocked_reason,
+        };
+        if self.storage != next {
+            self.storage = next;
+            self.dirty = true;
+        }
+    }
+
+    /// Monitors free space once per second and sends one warning at each threshold per session.
+    fn monitor_storage(&mut self) {
+        if !matches!(self.phase, Phase::Recording { .. }) {
+            return;
+        }
+        let Some(free_bytes) = self.storage.free_bytes else {
+            self.stop_for_storage("stopped: could not verify free space");
+            return;
+        };
+        let level = self
+            .storage
+            .remaining_seconds
+            .map(storage::warning_level)
+            .unwrap_or(0);
+        if level > self.storage_warning_level {
+            self.storage_warning_level = level;
+            let message = if level >= 2 {
+                "Less than 3 minutes remain before the storage stop reserve"
+            } else {
+                "Less than 10 minutes remain before the storage stop reserve"
+            };
+            self.notice(Severity::Warning, None, message);
+        }
+        if storage::stop_threshold_reached(free_bytes, self.storage.stop_reserve_bytes) {
+            self.stop_for_storage("stopped: disk almost full");
+        }
+    }
+
+    fn release_session_reserve(&mut self, severity: Severity) {
+        let Some(path) = self
+            .session
+            .as_ref()
+            .and_then(|session| session.reserve_path.clone())
+        else {
+            return;
+        };
+        match storage::release_emergency_reserve(&path) {
+            Ok(()) => {
+                if let Some(session) = self.session.as_mut()
+                    && session.reserve_path.as_deref() == Some(path.as_path())
+                {
+                    session.reserve_path = None;
+                }
+            }
+            Err(error) => self.notice(
+                severity,
+                None,
+                format!("Could not release emergency stop space: {error}"),
+            ),
+        }
+    }
+
+    /// Use the ordinary shared-deadline EOS path for every input, retaining incomplete status.
+    fn stop_for_storage(&mut self, reason: &str) {
+        let Some(segment) = self.current_seg() else {
+            return;
+        };
+        if let Some(g) = self.seg_mut(segment) {
+            g.stop_reason = Some(reason.to_string());
+        }
+        self.release_session_reserve(Severity::Error);
+        self.cut_pending = false;
+        self.record_pending = false;
+        self.finalize_segment(segment);
+        self.phase = Phase::Stopping { segment };
+        self.notice(Severity::Warning, None, reason);
+        self.dirty = true;
+        self.manifest_dirty = true;
     }
 
     /// Encoder and timing for a planned video input; `limit` caps the size.
@@ -2027,6 +2622,11 @@ impl Engine {
         }
         let deadline = self.deadline_cap(Instant::now() + FINALIZE_TIMEOUT);
         self.finalize_deadline = Some(deadline);
+        let preserve_partial_files = self
+            .session
+            .as_ref()
+            .and_then(|session| session.segs.iter().find(|seg| seg.index == segment))
+            .is_some_and(|seg| seg.stop_reason.is_some());
         let ids: Vec<(u64, Stage)> = self
             .pipes
             .iter()
@@ -2034,17 +2634,43 @@ impl Engine {
             .map(|p| (p.id, p.stage.clone()))
             .collect();
         for (id, stage) in ids {
-            match stage {
-                Stage::Running { .. } => self.finalize_input(id, true),
-                Stage::Pausing | Stage::Paused | Stage::Starting => self.request_null(
-                    id,
-                    Some(Outcome::Discard("stopped before recording started".into())),
-                ),
-                Stage::Draining { .. } | Stage::Nulling => {}
+            if preserve_partial_files {
+                match storage_finalize_action(&stage) {
+                    StorageFinalizeAction::GracefulEos => self.finalize_input(id, true),
+                    StorageFinalizeAction::InjectEos => {
+                        self.preserve_storage_input(id);
+                        self.finalize_input(id, false);
+                    }
+                    StorageFinalizeAction::AwaitState => self.preserve_storage_input(id),
+                    StorageFinalizeAction::AlreadyStopping => self.preserve_storage_input(id),
+                }
+            } else {
+                match stage {
+                    Stage::Running { .. } => self.finalize_input(id, true),
+                    Stage::Pausing | Stage::Paused | Stage::Starting => self.request_null(
+                        id,
+                        Some(Outcome::Discard("stopped before recording started".into())),
+                    ),
+                    Stage::Draining { .. } | Stage::Nulling => {}
+                }
             }
         }
         self.manifest_dirty = true;
         self.dirty = true;
+    }
+
+    fn preserve_storage_input(&mut self, id: u64) {
+        if let Some(pipe) = self.pipes.iter_mut().find(|pipe| pipe.id == id) {
+            pipe.outcome = storage_stop_outcome(pipe.outcome.take());
+        }
+    }
+
+    fn storage_stop_pending_for(&self, id: u64) -> bool {
+        let Some(pipe) = self.pipes.iter().find(|pipe| pipe.id == id) else {
+            return false;
+        };
+        matches!(self.phase, Phase::Stopping { segment } if pipe.input().is_some_and(|(s, _)| s == segment))
+            && matches!(pipe.outcome, Some(Outcome::Failed(_)))
     }
 
     /// Finalizes one input (§6): healthy → pipeline EOS then inject after 1 s; broken → inject
@@ -2070,18 +2696,26 @@ impl Engine {
         let Some(p) = self.pipes.iter_mut().find(|p| p.id == id) else {
             return;
         };
-        let PipeKind::Input { seg, key, rec, .. } = &p.kind else {
+        let PipeKind::Input {
+            seg,
+            key,
+            rec,
+            _session_lock,
+            ..
+        } = &p.kind
+        else {
             return;
         };
-        let (seg, key) = (*seg, *key);
+        let (seg, key, session_lock) = (*seg, *key, _session_lock.clone());
         match p.stage {
             Stage::Running { .. } => {}
+            Stage::Paused if !healthy => {}
             Stage::Draining {
                 inject_at: Some(_),
                 deadline: d,
             } if !healthy => {
                 // Already draining via the pipeline; escalate to injection now.
-                inject_eos(rec.eos_target.clone(), id);
+                inject_eos(rec.eos_target.clone(), id, session_lock.clone());
                 p.stage = Stage::Draining {
                     inject_at: None,
                     deadline: d,
@@ -2096,7 +2730,9 @@ impl Engine {
             // segment even when the source sent nothing since (a static window).
             let base = rec.base.load(Ordering::Acquire);
             let tail = rec.tail.clone().zip(stop_ns.filter(|_| base != UNSET));
+            let worker_lock = session_lock.clone();
             spawn_named(format!("chinstrap-gst-eos-{id}"), move || {
+                let _session_lock = worker_lock;
                 if let Some((t, stop)) = tail {
                     t.push_at(stop.saturating_sub(base));
                 }
@@ -2107,7 +2743,7 @@ impl Engine {
                 deadline,
             };
         } else {
-            inject_eos(rec.eos_target.clone(), id);
+            inject_eos(rec.eos_target.clone(), id, session_lock.clone());
             p.stage = Stage::Draining {
                 inject_at: None,
                 deadline,
@@ -2145,14 +2781,48 @@ impl Engine {
             p.in_flight = Some(target);
         }
         let tx = self.tx.clone();
+        let session_lock = self
+            .pipes
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(|p| match &p.kind {
+                PipeKind::Input { _session_lock, .. } => Some(_session_lock.clone()),
+                PipeKind::Probe { .. } | PipeKind::Preview { .. } => None,
+            });
         spawn_named(format!("chinstrap-gst-worker-{id}"), move || {
-            let result = pipeline
-                .set_state(target)
-                .map(|_| ())
-                .map_err(|e| e.to_string());
+            let _session_lock = session_lock;
+            let result = match pipeline.set_state(target) {
+                Ok(gst::StateChangeSuccess::Async) if target == gst::State::Null => {
+                    Err("GStreamer did not confirm the asynchronous NULL transition".to_string())
+                }
+                Ok(_) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            };
             drop(pipeline);
             let _ = tx.send(Msg::Worker(WorkerResult { id, target, result }));
         });
+    }
+
+    /// Disk-full is a segment-wide failure: preserve the affected file, set a terminal failure
+    /// outcome before the shared EOS path, and never route it through early-error discard.
+    fn disk_full_error(&mut self, id: u64, detail: String) {
+        let Some((segment, key)) = self.pipes.iter().find(|p| p.id == id).and_then(Pipe::input)
+        else {
+            return;
+        };
+        let reason = format!("disk is full: {detail}");
+        if let Some(pipe) = self.pipes.iter_mut().find(|p| p.id == id)
+            && pipe.outcome.is_none()
+        {
+            pipe.outcome = Some(Outcome::Failed(reason.clone()));
+        }
+        self.set_file_status(segment, key, InputStatus::Failed { reason });
+        self.notice(
+            Severity::Error,
+            Some(key),
+            "The disk is full; finalising all recording inputs together",
+        );
+        self.stop_for_storage("stopped: disk almost full");
     }
 
     /// Marks an input failed. Before recording (or within the first 3 s with nothing muxed):
@@ -2209,8 +2879,57 @@ impl Engine {
         {
             p.in_flight = None;
         }
-        // Pick up an error message posted during the transition, for a better reason.
-        self.drain_bus(w.id);
+        if w.target == gst::State::Null
+            && let Err(error) = &w.result
+        {
+            let input = self
+                .pipes
+                .iter()
+                .find(|p| p.id == w.id)
+                .and_then(Pipe::input);
+            if let Some((seg, key)) = input {
+                let reason = format!("{NOT_FINALIZED}: could not confirm NULL state: {error}");
+                if let Some(p) = self.pipes.iter_mut().find(|p| p.id == w.id) {
+                    p.abandoned = true;
+                    p.deadline = None;
+                    p.null_pending = false;
+                    p.last_error = Some(error.clone());
+                    p.outcome = Some(Outcome::Failed(reason.clone()));
+                }
+                self.set_file_status(
+                    seg,
+                    key,
+                    InputStatus::Failed {
+                        reason: reason.clone(),
+                    },
+                );
+                self.notice(Severity::Error, Some(key), format!("{key:?}: {reason}"));
+                if self.shutdown.is_some() {
+                    self.shutdown_clean = false;
+                }
+            } else {
+                self.remove_pipe(w.id);
+            }
+            return;
+        }
+        // A Discard result can unlink its file. Poll peer buses and the filesystem before that
+        // cleanup, otherwise a pending ENOSPC or reserve threshold can lose the race to removal.
+        let may_discard = w.target == gst::State::Null
+            && self
+                .pipes
+                .iter()
+                .any(|p| p.id == w.id && matches!(p.outcome.as_ref(), Some(Outcome::Discard(_))));
+        if may_discard {
+            let ids: Vec<u64> = self.pipes.iter().map(|p| p.id).collect();
+            for id in ids {
+                self.drain_bus(id);
+            }
+            self.refresh_storage();
+            self.monitor_storage();
+        } else {
+            // Pick up an error posted during this pipeline's transition, for a better reason.
+            self.drain_bus(w.id);
+        }
         // A Null deferred behind this transition runs now.
         if w.target != gst::State::Null
             && let Some(p) = self.pipes.iter_mut().find(|p| p.id == w.id)
@@ -2237,6 +2956,9 @@ impl Engine {
                     if let Some(p) = self.pipes.iter_mut().find(|p| p.id == w.id) {
                         p.stage = Stage::Paused;
                         p.deadline = None;
+                    }
+                    if self.storage_stop_pending_for(w.id) {
+                        self.finalize_input(w.id, false);
                     }
                 }
                 Err(e) => {
@@ -2285,6 +3007,9 @@ impl Engine {
                                 };
                                 self.dirty = true;
                             }
+                        }
+                        if self.storage_stop_pending_for(w.id) {
+                            self.finalize_input(w.id, false);
                         }
                     }
                     Err(e) => {
@@ -2349,10 +3074,8 @@ impl Engine {
                         self.set_file_status(seg, key, InputStatus::Failed { reason: r })
                     }
                     Some(Outcome::Discard(r)) => {
-                        if let Some(path) = path.as_ref() {
-                            let _ = std::fs::remove_file(path);
-                        }
-                        self.set_file_status(seg, key, InputStatus::Failed { reason: r })
+                        let reason = finish_discard(path.as_deref(), encoded, &r);
+                        self.set_file_status(seg, key, InputStatus::Failed { reason })
                     }
                     None => self.set_file_status(
                         seg,
@@ -2431,6 +3154,7 @@ impl Engine {
                 }
             }
             gst::MessageView::Error(e) => {
+                let out_of_space = e.error().matches(gst::ResourceError::NoSpaceLeft);
                 let text = error_text(e);
                 eprintln!(
                     "chinstrap: gst error in {} from {}: {text}",
@@ -2446,6 +3170,8 @@ impl Engine {
                     self.preview_failed(id, text);
                 } else if is_probe {
                     self.probe_done(id, Err(text));
+                } else if out_of_space {
+                    self.disk_full_error(id, text);
                 } else {
                     match p.stage {
                         Stage::Nulling => {}
@@ -3155,11 +3881,15 @@ impl Engine {
                         );
                     }
                     if let Some((seg, key)) = input {
+                        if self.shutdown.is_some() {
+                            self.shutdown_clean = false;
+                        }
                         let status = match outcome {
                             Some(Outcome::Complete) => InputStatus::Complete,
-                            Some(Outcome::Failed(r)) | Some(Outcome::Discard(r)) => {
-                                InputStatus::Failed { reason: r }
-                            }
+                            Some(Outcome::Failed(reason)) => InputStatus::Failed { reason },
+                            Some(Outcome::Discard(reason)) => InputStatus::Failed {
+                                reason: retained_discard_reason(&reason),
+                            },
                             None => InputStatus::Failed {
                                 reason: "did not stop".into(),
                             },
@@ -3206,9 +3936,11 @@ impl Engine {
                 Stage::Draining { deadline, .. } => {
                     // Healthy EOS did not arrive within 1 s: inject as for a broken input.
                     if let Some(p) = self.pipes.iter_mut().find(|p| p.id == id)
-                        && let PipeKind::Input { rec, .. } = &p.kind
+                        && let PipeKind::Input {
+                            rec, _session_lock, ..
+                        } = &p.kind
                     {
-                        inject_eos(rec.eos_target.clone(), id);
+                        inject_eos(rec.eos_target.clone(), id, _session_lock.clone());
                         p.stage = Stage::Draining {
                             inject_at: None,
                             deadline,
@@ -3333,6 +4065,19 @@ impl Engine {
                 g.stop_ns = Some(stop_now);
             }
             stop_ns = g.stop_ns;
+            if g.stop_reason.is_some() {
+                for f in &mut g.files {
+                    if f.file.path.exists()
+                        && let Err(error) = super::recovery::verify_matroska_index(&f.file.path)
+                    {
+                        f.file.status = InputStatus::Failed {
+                            reason: format!(
+                                "recovery failed: storage stop left an unindexed file: {error}"
+                            ),
+                        };
+                    }
+                }
+            }
             for f in &mut g.files {
                 match f.file.status {
                     InputStatus::Complete => {
@@ -3350,7 +4095,9 @@ impl Engine {
                     }
                 }
             }
-            g.status = if survivors.is_empty() {
+            g.status = if let Some(reason) = g.stop_reason.clone() {
+                SegmentStatus::Incomplete { reason }
+            } else if survivors.is_empty() {
                 SegmentStatus::Incomplete {
                     reason: "every input failed".into(),
                 }
@@ -3391,6 +4138,10 @@ impl Engine {
                 _ => true,
             })
             .collect();
+        let continue_cut = cut && self.shutdown.is_none() && !next.is_empty();
+        if !continue_cut {
+            self.release_session_reserve(Severity::Warning);
+        }
         self.phase = Phase::Idle;
         if cut && self.shutdown.is_none() {
             if next.is_empty() {
@@ -3433,6 +4184,13 @@ impl Engine {
             return;
         }
         self.last_sizes = now;
+        self.refresh_storage();
+        self.monitor_storage();
+        self.checkpoint.request_if_due(
+            matches!(self.phase, Phase::Recording { .. }),
+            now,
+            &mut self.manifest_dirty,
+        );
         self.check_mic_stall();
         self.refresh_quality();
         let Some(seg) = self.current_seg() else {
@@ -3630,9 +4388,12 @@ impl Engine {
                 // the deadline: its file is as finalized as it will get, so keep that outcome.
                 let settled = match (&p.stage, &p.outcome) {
                     (Stage::Nulling, Some(Outcome::Complete)) => Some(InputStatus::Complete),
-                    (Stage::Nulling, Some(Outcome::Failed(r) | Outcome::Discard(r))) => {
-                        Some(InputStatus::Failed { reason: r.clone() })
-                    }
+                    (Stage::Nulling, Some(Outcome::Failed(reason))) => Some(InputStatus::Failed {
+                        reason: reason.clone(),
+                    }),
+                    (Stage::Nulling, Some(Outcome::Discard(reason))) => Some(InputStatus::Failed {
+                        reason: retained_discard_reason(reason),
+                    }),
                     _ => None,
                 };
                 if let Some((s, k)) = input {
@@ -3679,7 +4440,22 @@ impl Engine {
                 std::mem::forget(c.fd);
             }
         }
+        // If shutdown is leaving any input pipeline behind, its detached worker or GStreamer
+        // streaming thread may still touch the file after this engine is dropped. Keep recovery
+        // excluded until process exit, even if those workers outlive the engine thread.
+        let live_session_locks: Vec<_> = self
+            .pipes
+            .iter()
+            .filter_map(|p| match &p.kind {
+                PipeKind::Input { _session_lock, .. } => Some(_session_lock.clone()),
+                PipeKind::Probe { .. } | PipeKind::Preview { .. } => None,
+            })
+            .collect();
+        for lock in live_session_locks {
+            retain_session_lock_until_process_exit(lock);
+        }
         self.phase = Phase::Idle;
+        self.release_session_reserve(Severity::Warning);
         self.write_manifest();
         self.snapshot();
         let clean = self.shutdown_clean;
@@ -3691,8 +4467,509 @@ impl Engine {
 
 /// Sends EOS into the sink pad of the first element after the source, on a worker thread
 /// (the pad's stream lock may be held by a streaming thread).
-fn inject_eos(pad: gst::Pad, id: u64) {
+fn inject_eos(pad: gst::Pad, id: u64, session_lock: session::SessionLock) {
     spawn_named(format!("chinstrap-gst-inject-{id}"), move || {
+        let _session_lock = session_lock;
         pad.send_event(gst::event::Eos::new());
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_stop_does_not_discard_open_starting_peers() {
+        assert_eq!(
+            storage_finalize_action(&Stage::Pausing),
+            StorageFinalizeAction::AwaitState
+        );
+        assert_eq!(
+            storage_finalize_action(&Stage::Paused),
+            StorageFinalizeAction::InjectEos
+        );
+        assert_eq!(
+            storage_finalize_action(&Stage::Starting),
+            StorageFinalizeAction::AwaitState
+        );
+        assert_eq!(
+            storage_finalize_action(&Stage::Running {
+                since: Instant::now()
+            }),
+            StorageFinalizeAction::GracefulEos
+        );
+        assert_eq!(
+            storage_finalize_action(&Stage::Nulling),
+            StorageFinalizeAction::AlreadyStopping
+        );
+    }
+
+    #[test]
+    fn storage_stop_overrides_pending_discard_to_preserve_footage() {
+        assert_eq!(
+            storage_stop_outcome(Some(Outcome::Discard("early failure".into()))),
+            Some(Outcome::Failed(
+                "storage stop; partial file preserved".into()
+            ))
+        );
+        assert_eq!(
+            storage_stop_outcome(Some(Outcome::Complete)),
+            Some(Outcome::Complete)
+        );
+    }
+
+    #[test]
+    fn early_discard_preserves_nonempty_output_as_recovery_candidate() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("chinstrap-early-discard-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("partial.mkv");
+        std::fs::write(&path, b"already-written media").unwrap();
+
+        let reason = finish_discard(Some(&path), 0, "early source failure");
+
+        assert_eq!(
+            reason,
+            "recovery failed: early-failed file retained for recovery: early source failure"
+        );
+        assert!(path.exists(), "written output must not be unlinked");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn early_discard_removes_empty_output_without_changing_failure_reason() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("chinstrap-empty-discard-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.mkv");
+        std::fs::write(&path, b"").unwrap();
+
+        let reason = finish_discard(Some(&path), 0, "early source failure");
+
+        assert_eq!(reason, "early source failure");
+        assert!(
+            !path.exists(),
+            "empty output should retain early-discard cleanup"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn early_discard_preserves_frames_even_when_file_size_is_stale() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("chinstrap-stale-size-discard-{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("encoded.mkv");
+        std::fs::write(&path, b"").unwrap();
+
+        let reason = finish_discard(Some(&path), 1, "early source failure");
+
+        assert_eq!(
+            reason,
+            "recovery failed: early-failed file retained for recovery: early source failure"
+        );
+        assert!(
+            path.exists(),
+            "encoded-frame evidence should prevent unlinking"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn retained_early_discard_error_is_retryable_after_null_timeout() {
+        assert_eq!(
+            retained_discard_reason("did not reach Null"),
+            "recovery failed: early-failed file retained for recovery: did not reach Null"
+        );
+    }
+
+    fn test_input_pipe(
+        id: u64,
+        key: InputKey,
+        outcome: Option<Outcome>,
+        session_lock: session::SessionLock,
+    ) -> Pipe {
+        let pipeline = gst::Pipeline::with_name(&format!("storage-test-{id}"));
+        let sink = gst::ElementFactory::make("fakesink")
+            .name(format!("storage-test-sink-{id}"))
+            .build()
+            .unwrap();
+        pipeline.add(&sink).unwrap();
+        let bus = pipeline.bus().unwrap();
+        let rec = InputPipeline {
+            pipeline: pipeline.clone(),
+            bus: bus.clone(),
+            eos_target: sink.static_pad("sink").unwrap(),
+            base: Arc::new(std::sync::atomic::AtomicU64::new(UNSET)),
+            first_pts: Arc::new(std::sync::atomic::AtomicU64::new(UNSET)),
+            last_pts: Arc::new(std::sync::atomic::AtomicU64::new(UNSET)),
+            size: Arc::new(std::sync::Mutex::new(None)),
+            resize_filter: None,
+            convert: None,
+            encoder: None,
+            rate: None,
+            warning: None,
+            counters: Arc::new(Counters::default()),
+            videorate: None,
+            leaky: None,
+            tail: None,
+            preview: None,
+        };
+        Pipe {
+            id,
+            capture: None,
+            pipeline,
+            bus,
+            kind: PipeKind::Input {
+                seg: 1,
+                key,
+                rec,
+                resize_at: None,
+                _session_lock: session_lock,
+            },
+            stage: Stage::Nulling,
+            deadline: None,
+            outcome,
+            abandoned: false,
+            last_error: None,
+            in_flight: Some(gst::State::Null),
+            null_pending: false,
+        }
+    }
+
+    fn storage_test_engine(root: &Path, storage_error: bool) -> (Engine, PathBuf) {
+        gst::init().unwrap();
+        let session_dir = root.join("session");
+        let segment_dir = session_dir.join("segment-001");
+        std::fs::create_dir_all(&segment_dir).unwrap();
+        let session_lock = session::SessionLock::acquire(&session_dir).unwrap();
+        let camera_path = segment_dir.join("camera.mkv");
+        let mic_path = segment_dir.join("mic.mkv");
+        std::fs::write(&camera_path, b"").unwrap();
+        std::fs::write(&mic_path, b"").unwrap();
+
+        let make_file = |key: InputKey, path: PathBuf| {
+            let (kind, codec) = match key {
+                InputKey::Camera => ("camera", "h264"),
+                InputKey::Microphone => ("microphone", "opus"),
+                InputKey::Source(_) => ("test", "h264"),
+            };
+            let label = format!("{kind} test");
+            let error = "early failure";
+            let meta: ManifestInput = serde_json::from_value(serde_json::json!({
+                "key": key_string(key),
+                "kind": kind,
+                "label": label,
+                "file": path.file_name().unwrap().to_string_lossy(),
+                "codec": codec,
+                "status": "failed",
+                "error": error,
+            }))
+            .unwrap();
+            FileRec {
+                file: InputFile {
+                    input: key,
+                    label,
+                    path,
+                    status: InputStatus::Failed {
+                        reason: error.into(),
+                    },
+                    bytes: 0,
+                    waiting_for_frame: false,
+                    quality: None,
+                },
+                meta,
+                first: None,
+                last: None,
+                size: None,
+                counters: None,
+            }
+        };
+        let now = Instant::now();
+        let session = Session {
+            name: "storage-test".into(),
+            dir: session_dir.clone(),
+            created: "test".into(),
+            _lock: session_lock.clone(),
+            reserve_path: None,
+            segs: vec![Seg {
+                index: 1,
+                dir: segment_dir,
+                status: SegmentStatus::Recording,
+                base_ns: Some(0),
+                stop_ns: None,
+                gap_ns: None,
+                started_wall: Some("test".into()),
+                started_at: Some(now),
+                timed_out: false,
+                stop_reason: None,
+                files: vec![
+                    make_file(InputKey::Camera, camera_path.clone()),
+                    make_file(InputKey::Microphone, mic_path),
+                ],
+            }],
+        };
+        let camera = test_input_pipe(
+            1,
+            InputKey::Camera,
+            Some(Outcome::Discard("early failure".into())),
+            session_lock.clone(),
+        );
+        let microphone = test_input_pipe(2, InputKey::Microphone, None, session_lock);
+        if storage_error {
+            let error =
+                gst::message::Error::new(gst::ResourceError::NoSpaceLeft, "injected ENOSPC");
+            let _ = microphone.bus.post(error);
+        }
+
+        let (tx, _rx) = mpsc::channel();
+        let (events, _event_rx) = async_channel::unbounded();
+        let now = Instant::now();
+        let tx_config = TxConfig {
+            models_dir: root.join("models"),
+            resolved: super::super::transcribe::model::Resolved::External {
+                id: "missing-test-model".into(),
+                path: root.join("missing-test-model.bin"),
+            },
+            resolve_warning: None,
+            force_cpu: true,
+            language: None,
+            gpu_device: 0,
+            make_command: Arc::new(|| Ok(std::process::Command::new("true"))),
+            worker_sink: Arc::new(|_| {}),
+            model_sink: Arc::new(|_| {}),
+            dl_opts: super::super::transcribe::model::DlOpts::default(),
+            url_for: Arc::new(|_| String::new()),
+        };
+        let devices = Devices::start();
+        let engine = Engine {
+            tx,
+            events,
+            caps: Capabilities::default(),
+            encoders: Vec::new(),
+            gpu_encoders: Vec::new(),
+            screen_fps: 30,
+            frame_rate_default: FrameRateMode::Native,
+            camera_mode: None,
+            vocabulary: VocabularyInfo::default(),
+            last_vocab_check: now,
+            test_sources: Vec::new(),
+            devices,
+            selected_camera: None,
+            selected_microphone: None,
+            sources: Vec::new(),
+            captures: HashMap::new(),
+            output_root: root.to_path_buf(),
+            min_free_mb: 0,
+            storage: StorageInfo::default(),
+            storage_rate_tracker: storage::StorageRateTracker::default(),
+            storage_free_bytes_override: None,
+            storage_warning_level: 0,
+            recoveries: Vec::new(),
+            phase: Phase::Recording {
+                segment: 1,
+                started_at: now,
+            },
+            portal_busy: false,
+            session: Some(session),
+            portal: None,
+            clock: gst::SystemClock::obtain(),
+            pipes: vec![camera, microphone],
+            next_pipe: 3,
+            next_source: 1,
+            next_capture: 1,
+            cut_pending: false,
+            gap_from: None,
+            finalize_deadline: None,
+            shutdown: None,
+            shutdown_clean: true,
+            resize_after: None,
+            last_sizes: now,
+            checkpoint: CheckpointWriteState::new(now),
+            manifest_retry_at: None,
+            last_level: now,
+            dirty: false,
+            manifest_dirty: false,
+            warned: HashSet::new(),
+            pending_notices: Vec::new(),
+            transcription: Transcription::new(tx_config),
+            previews: Previews::default(),
+            preview_on: false,
+            preview_state: HashMap::new(),
+            preview_seen: HashMap::new(),
+            preview_retry: HashMap::new(),
+            record_pending: false,
+        };
+        (engine, camera_path)
+    }
+
+    fn storage_test_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "chinstrap-storage-order-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn null_timeout_marks_shutdown_unclean() {
+        let root = storage_test_root("null-timeout-shutdown-ack");
+        let (mut engine, _) = storage_test_engine(&root, false);
+        engine.pipes.retain(|p| p.id == 1);
+        let now = Instant::now();
+        let pipe = engine.pipes.iter_mut().find(|p| p.id == 1).unwrap();
+        pipe.stage = Stage::Nulling;
+        pipe.deadline = Some(now - Duration::from_secs(1));
+        pipe.outcome = Some(Outcome::Discard("stopped before recording started".into()));
+        engine.shutdown = Some((now + Duration::from_secs(1), Vec::new()));
+        engine.shutdown_clean = true;
+
+        engine.check_deadlines();
+
+        assert!(engine.pipes.iter().find(|p| p.id == 1).unwrap().abandoned);
+        assert!(
+            !engine.shutdown_clean,
+            "an unresolved NULL transition must not be acknowledged as clean"
+        );
+        engine.devices.stop();
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_null_transition_keeps_recovery_locked_after_session_owner_drops() {
+        let root = storage_test_root("null-failure-lock");
+        let session_dir = root.join("session");
+        let (mut engine, path) = storage_test_engine(&root, false);
+        engine.pipes.retain(|p| p.id == 1);
+
+        engine.worker_result(WorkerResult {
+            id: 1,
+            target: gst::State::Null,
+            result: Err("injected NULL transition failure".into()),
+        });
+        let status_is_retryable = matches!(
+            engine.session.as_ref().unwrap().segs[0].files[0].file.status,
+            InputStatus::Failed { ref reason } if reason.starts_with(NOT_FINALIZED)
+        );
+        engine.write_manifest();
+        engine.session.take();
+        let file_is_preserved = path.exists();
+        let lock_is_held = session::SessionLock::is_locked(&session_dir).unwrap();
+        let recovery_is_blocked = session::scan_interrupted(&root).unwrap().is_empty();
+
+        engine.devices.stop();
+        drop(engine);
+        let recovery_is_discoverable_after_release = session::scan_interrupted(&root)
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate.dir == session_dir);
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert!(
+            file_is_preserved,
+            "failed NULL must never run early-discard unlink"
+        );
+        assert!(
+            status_is_retryable,
+            "unfinished output must remain retryable"
+        );
+        assert!(
+            lock_is_held,
+            "the input pipe must retain its session-lock lease"
+        );
+        assert!(
+            recovery_is_blocked,
+            "recovery must wait while a writer may remain"
+        );
+        assert!(
+            recovery_is_discoverable_after_release,
+            "recovery should discover the partial file after the worker lease is released"
+        );
+    }
+
+    #[test]
+    fn pending_storage_bus_error_precedes_discard_worker_unlink() {
+        let root = storage_test_root("enospc");
+        let (mut engine, path) = storage_test_engine(&root, true);
+
+        engine.worker_result(WorkerResult {
+            id: 1,
+            target: gst::State::Null,
+            result: Ok(()),
+        });
+
+        assert!(path.exists(), "pending ENOSPC must preserve the peer file");
+        assert!(matches!(engine.phase, Phase::Stopping { segment: 1 }));
+        assert!(matches!(
+            engine.session.as_ref().unwrap().segs[0].files[0].file.status,
+            InputStatus::Failed { ref reason }
+                if reason == "storage stop; partial file preserved"
+        ));
+        engine.devices.stop();
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn early_discard_still_unlinks_empty_file_without_storage_stop() {
+        let root = storage_test_root("early-discard");
+        let (mut engine, path) = storage_test_engine(&root, false);
+
+        engine.worker_result(WorkerResult {
+            id: 1,
+            target: gst::State::Null,
+            result: Ok(()),
+        });
+
+        assert!(
+            !path.exists(),
+            "normal early-error discard should still unlink empty output"
+        );
+        assert!(matches!(
+            engine.session.as_ref().unwrap().segs[0].files[0].file.status,
+            InputStatus::Failed { ref reason } if reason == "early failure"
+        ));
+        engine.devices.stop();
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_manifest_checkpoint_keeps_dirty_and_retries_from_last_success() {
+        let started = Instant::now();
+        let mut state = CheckpointWriteState::new(started);
+        let mut manifest_dirty = false;
+        let first_attempt = started + Duration::from_secs(5);
+
+        assert!(state.request_if_due(true, first_attempt, &mut manifest_dirty));
+        assert!(manifest_dirty);
+        state.write_result(false, first_attempt, &mut manifest_dirty);
+        assert!(manifest_dirty, "failed write must remain dirty for retry");
+        assert_eq!(state.last_success, started);
+        assert!(state.pending);
+
+        let retry = first_attempt + Duration::from_secs(1);
+        assert!(state.request_if_due(true, retry, &mut manifest_dirty));
+        state.write_result(true, retry, &mut manifest_dirty);
+        assert!(!manifest_dirty);
+        assert_eq!(state.last_success, retry);
+        assert!(!state.pending);
+        assert!(!state.request_if_due(true, retry + Duration::from_secs(4), &mut manifest_dirty));
+        assert!(state.request_if_due(true, retry + Duration::from_secs(5), &mut manifest_dirty));
+    }
 }

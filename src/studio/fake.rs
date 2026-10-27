@@ -377,6 +377,8 @@ impl FakeEngine {
             frame_rate_default: self.frame_rate_default,
             selected_camera_mode: self.camera_mode.clone(),
             capacity: self.capacity(),
+            storage: StorageInfo::default(),
+            recoveries: Vec::new(),
             vocabulary: self.vocabulary.clone(),
             previews: self.preview_sent.clone(),
         };
@@ -782,6 +784,12 @@ impl FakeEngine {
             EngineCommand::CancelOtherSessionTranscriptions => {
                 self.reject(&cmd, "no jobs from earlier sessions")
             }
+            EngineCommand::RecoverSession { .. }
+            | EngineCommand::ShowSessionFolder { .. }
+            | EngineCommand::DismissRecovery { .. } => self.reject(
+                &cmd,
+                "interrupted-session recovery is unavailable in the fake engine",
+            ),
         }
     }
 
@@ -1419,6 +1427,8 @@ mod tests {
             frame_rate: FrameRateMode::Native,
             test_sources: Vec::new(),
             preview: true,
+            selftest_free_bytes: None,
+            selftest_min_free_mb: None,
         }
     }
 

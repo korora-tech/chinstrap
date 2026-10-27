@@ -217,6 +217,27 @@ pub struct PlannedInput {
     pub load_pct: u32,
 }
 
+/// Current output-filesystem capacity and the conservative session-rate estimate.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct StorageInfo {
+    pub free_bytes: Option<u64>,
+    pub estimated_bytes_per_second: u64,
+    pub rate_measured: bool,
+    pub remaining_seconds: Option<u64>,
+    pub stop_reserve_bytes: u64,
+    /// A reason Record is refused, or `None` when the current estimate fits.
+    pub record_blocked_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryCandidate {
+    pub name: String,
+    pub dir: PathBuf,
+    pub segments: Vec<u32>,
+    pub recovering: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SegmentSummary {
     pub index: u32,
@@ -257,6 +278,10 @@ pub struct Snapshot {
     /// The selected camera's mode override (a `CameraModeInfo::label`); None = automatic.
     pub selected_camera_mode: Option<String>,
     pub capacity: CapacityPlan,
+    /// Free-space estimate for the current selection on the output filesystem.
+    pub storage: StorageInfo,
+    /// Interrupted sessions from prior launches that are not locked by a live process.
+    pub recoveries: Vec<RecoveryCandidate>,
     pub vocabulary: VocabularyInfo,
     /// Live preview state of the selected camera and every source; the frames themselves come
     /// from `EngineHandle::previews()`, never through the Snapshot.
@@ -364,6 +389,9 @@ pub enum EngineCommand {
     ToggleRecord,         // Record if Idle, Stop if Recording, else rejected
     Cut,
     EndSession,           // Idle only
+    RecoverSession { name: String },
+    ShowSessionFolder { name: String },
+    DismissRecovery { name: String },
     // Transcription (§12.2): contract extension; existing variants unchanged.
     DownloadModel,                 // Missing|Failed, or Ready{vad_download:Some}; downloads only missing files; resumes
     CancelModelDownload,           // Downloading|Verifying only

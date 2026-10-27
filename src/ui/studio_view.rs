@@ -16,9 +16,9 @@ use smallvec::SmallVec;
 use super::theme::*;
 use super::widgets::{
     ButtonStyle, OnClick, SegmentActions, SourceRowExtras, badge, button, caption, checkbox_row,
-    chip, format_bytes, format_duration, format_fps, format_rate, icon_button, level_meter,
-    notice_row, preview_tile, progress_bar, radio_row, segment_row, segmented, source_row,
-    text_field,
+    chip, format_bytes, format_duration, format_fps, format_rate, format_storage_rate, icon_button,
+    level_meter, notice_row, preview_tile, progress_bar, radio_row, record_hint_color, segment_row,
+    segmented, source_row, text_field,
 };
 use super::{Cut, ToggleRecord};
 use crate::studio::{
@@ -586,7 +586,9 @@ impl StudioView {
         );
 
         let record_hint: SharedString = if idle && !snap.can_record {
-            if snap.portal_busy {
+            if let Some(reason) = &snap.storage.record_blocked_reason {
+                reason.clone().into()
+            } else if snap.portal_busy {
                 "Waiting for the picker…".into()
             } else if snap
                 .sources
@@ -597,6 +599,20 @@ impl StudioView {
             } else {
                 "Select at least one recordable input".into()
             }
+        } else if recording
+            && snap
+                .storage
+                .remaining_seconds
+                .is_some_and(|seconds| seconds <= 180)
+        {
+            "Disk nearly full: recording will stop at the reserved free-space threshold".into()
+        } else if recording
+            && snap
+                .storage
+                .remaining_seconds
+                .is_some_and(|seconds| seconds <= 600)
+        {
+            "Low disk space: less than 10 minutes estimated remaining".into()
         } else if recording {
             "Selection is locked while recording".into()
         } else if idle && snap.capacity.over {
@@ -665,11 +681,12 @@ impl StudioView {
                     .child(
                         div()
                             .text_size(px(10.0))
-                            .text_color(rgb(if idle && snap.capacity.over {
-                                AMBER
-                            } else {
-                                MUTED
-                            }))
+                            .text_color(rgb(record_hint_color(
+                                recording,
+                                snap.storage.remaining_seconds,
+                                snap.storage.record_blocked_reason.is_some(),
+                                idle && snap.capacity.over,
+                            )))
                             .child(record_hint),
                     )
                     .child(new_session)
@@ -1153,6 +1170,7 @@ impl StudioView {
                     ),
             )
             .when_some(self.capacity_panel(snap), |d, p| d.child(p))
+            .when_some(self.recovery_panel(snap, cx), |d, p| d.child(p))
             .child(
                 div()
                     .text_size(px(10.0))
@@ -1168,9 +1186,50 @@ impl StudioView {
     /// recording (P1-5).
     fn capacity_panel(&self, snap: &Snapshot) -> Option<Div> {
         let plan = &snap.capacity;
-        if plan.inputs.is_empty() && plan.warning.is_none() && plan.notes.is_empty() {
+        if plan.inputs.is_empty()
+            && plan.warning.is_none()
+            && plan.notes.is_empty()
+            && snap.storage.free_bytes.is_none()
+            && snap.storage.record_blocked_reason.is_none()
+        {
             return None;
         }
+        let remaining = snap
+            .storage
+            .remaining_seconds
+            .map(|seconds| format_duration(Duration::from_secs(seconds)))
+            .unwrap_or_else(|| "unavailable".to_string());
+        let free = snap
+            .storage
+            .free_bytes
+            .map(format_bytes)
+            .unwrap_or_else(|| "unavailable".to_string());
+        let rate_label = if snap.storage.rate_measured {
+            "measured"
+        } else {
+            "planned"
+        };
+        let storage_line = format!(
+            "Storage: {free} free · {rate_label} {} · ~{remaining} at {rate_label} rate · reserve {}",
+            format_storage_rate(snap.storage.estimated_bytes_per_second),
+            format_bytes(snap.storage.stop_reserve_bytes),
+        );
+        let storage_color = if snap.storage.record_blocked_reason.is_some()
+            || snap
+                .storage
+                .remaining_seconds
+                .is_some_and(|seconds| seconds <= 180)
+        {
+            RED
+        } else if snap
+            .storage
+            .remaining_seconds
+            .is_some_and(|seconds| seconds <= 600)
+        {
+            AMBER
+        } else {
+            MUTED
+        };
         let rows = plan.inputs.iter().map(|p| {
             div()
                 .flex()
@@ -1239,6 +1298,21 @@ impl StudioView {
                         )),
                 )
                 .children(rows)
+                .child(
+                    div()
+                        .mt_1()
+                        .text_size(px(10.0))
+                        .text_color(rgb(storage_color))
+                        .child(storage_line),
+                )
+                .when_some(snap.storage.record_blocked_reason.clone(), |d, reason| {
+                    d.child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(rgb(0xffb0a8))
+                            .child(reason),
+                    )
+                })
                 .when_some(plan.warning.clone(), |d, w| {
                     d.child(
                         div()
@@ -1263,6 +1337,109 @@ impl StudioView {
                         .text_color(rgb(MUTED))
                         .child(n.clone())
                 })),
+        )
+    }
+
+    fn recovery_panel(&self, snap: &Snapshot, cx: &mut Context<Self>) -> Option<Div> {
+        if snap.recoveries.is_empty() {
+            return None;
+        }
+        let rows = snap
+            .recoveries
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let segments = candidate
+                    .segments
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(0x5a3a1a))
+                    .bg(rgb(0x211810))
+                    .px_2()
+                    .py_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_size(px(11.0))
+                            .text_color(rgb(0xffd9a0))
+                            .child(format!(
+                                "An earlier recording was interrupted: {}, segment {}",
+                                candidate.name, segments
+                            )),
+                    )
+                    .when_some(candidate.error.clone(), |d, error| {
+                        d.child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(rgb(0xffb0a8))
+                                .child(error),
+                        )
+                    })
+                    .child(button(
+                        ("recover-session", index),
+                        if candidate.recovering {
+                            "Recovering…"
+                        } else {
+                            "Recover"
+                        },
+                        None,
+                        ButtonStyle::Primary,
+                        (!candidate.recovering).then(|| {
+                            self.send_on_click(
+                                EngineCommand::RecoverSession {
+                                    name: candidate.name.clone(),
+                                },
+                                cx,
+                            )
+                        }),
+                    ))
+                    .child(button(
+                        ("show-session-folder", index),
+                        "Show folder",
+                        None,
+                        ButtonStyle::Secondary,
+                        Some(self.send_on_click(
+                            EngineCommand::ShowSessionFolder {
+                                name: candidate.name.clone(),
+                            },
+                            cx,
+                        )),
+                    ))
+                    .child(button(
+                        ("dismiss-recovery", index),
+                        "Dismiss",
+                        None,
+                        ButtonStyle::Secondary,
+                        Some(self.send_on_click(
+                            EngineCommand::DismissRecovery {
+                                name: candidate.name.clone(),
+                            },
+                            cx,
+                        )),
+                    ))
+            });
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(0x5a3a1a))
+                .bg(rgb(0x19140f))
+                .px_3()
+                .py_2()
+                .child(caption("INTERRUPTED RECORDINGS"))
+                .children(rows),
         )
     }
 
