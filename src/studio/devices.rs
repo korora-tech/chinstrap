@@ -8,7 +8,7 @@ use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::*;
 
-use super::types::{CameraModeInfo, DeviceId, DeviceInfo, DeviceKind};
+use super::types::{CameraModeInfo, DeviceId, DeviceInfo, DeviceKind, GpuConvert};
 
 /// Largest camera mode recorded without downscaling (DCI 4K width, UHD height).
 pub const CAMERA_MAX_W: i32 = 4096;
@@ -142,6 +142,31 @@ impl CameraClass {
         match self {
             CameraClass::Usable(m) => Some(m),
             CameraClass::Unsupported(_) => None,
+        }
+    }
+}
+
+/// Whether JPEG parsing and decoding are available for MJPEG camera modes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JpegDecodeSupport {
+    Available,
+    #[default]
+    Unavailable,
+}
+
+/// Capabilities that determine which advertised camera modes can be recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CameraSupport {
+    pub gpu_convert: Option<GpuConvert>,
+    pub jpeg_decode: JpegDecodeSupport,
+}
+
+impl CameraSupport {
+    fn supports(self, path: CameraPath) -> bool {
+        match path {
+            CameraPath::Raw => true,
+            CameraPath::Jpeg => self.jpeg_decode == JpegDecodeSupport::Available,
+            CameraPath::DmaBuf => self.gpu_convert.is_some(),
         }
     }
 }
@@ -312,19 +337,20 @@ pub fn caps_summary(caps: &gst::CapsRef) -> String {
 
 /// Camera classification (§5.4), a pure function over the device caps.
 #[cfg(test)]
-pub fn classify_camera(caps: &gst::CapsRef, gpu_convert: bool) -> CameraClass {
-    classify_camera_with(caps, gpu_convert, true)
+pub fn classify_camera(caps: &gst::CapsRef, support: CameraSupport) -> CameraClass {
+    classify_camera_with(caps, support)
 }
 
-/// As [`classify_camera`]; `jpeg_ok` is false when jpegparse/jpegdec are missing (MJPEG modes
-/// are not chosen), `gpu_convert` false when no GPU path exists (DMA-BUF modes are not chosen).
-pub fn classify_camera_with(caps: &gst::CapsRef, gpu_convert: bool, jpeg_ok: bool) -> CameraClass {
+/// As [`classify_camera`], with the capabilities that determine usable camera modes.
+pub fn classify_camera_with(caps: &gst::CapsRef, support: CameraSupport) -> CameraClass {
     let modes = camera_modes(caps);
-    let best = usable_modes(caps, gpu_convert, jpeg_ok).into_iter().next();
+    let best = usable_modes(caps, support).into_iter().next();
     let best = best.as_ref();
     match best {
         Some(m) => CameraClass::Usable(m.clone()),
-        None if modes.iter().any(|m| m.path == CameraPath::Jpeg) && !jpeg_ok => {
+        None if modes.iter().any(|m| m.path == CameraPath::Jpeg)
+            && support.jpeg_decode == JpegDecodeSupport::Unavailable =>
+        {
             CameraClass::Unsupported("MJPEG needs jpegparse and jpegdec, which are missing".into())
         }
         None => CameraClass::Unsupported(format!("no usable format: {}", caps_summary(caps))),
@@ -332,14 +358,10 @@ pub fn classify_camera_with(caps: &gst::CapsRef, gpu_convert: bool, jpeg_ok: boo
 }
 
 /// Every mode that can be recorded, best (the automatic choice) first, one per label.
-pub fn usable_modes(caps: &gst::CapsRef, gpu_convert: bool, jpeg_ok: bool) -> Vec<CameraMode> {
+pub fn usable_modes(caps: &gst::CapsRef, support: CameraSupport) -> Vec<CameraMode> {
     let mut modes: Vec<CameraMode> = camera_modes(caps)
         .into_iter()
-        .filter(|m| match m.path {
-            CameraPath::Raw => true,
-            CameraPath::Jpeg => jpeg_ok,
-            CameraPath::DmaBuf => gpu_convert,
-        })
+        .filter(|m| support.supports(m.path))
         .collect();
     modes.sort_by_key(|m| std::cmp::Reverse(mode_rank(m)));
     let mut seen = std::collections::HashSet::new();
@@ -416,8 +438,7 @@ pub struct Devices {
     next_id: u32,
     pub cameras: Vec<Entry>,
     pub microphones: Vec<Entry>,
-    /// jpegparse/jpegdec are present (MJPEG cameras are usable).
-    jpeg_ok: bool,
+    camera_support: CameraSupport,
 }
 
 fn rate_label(rate: i32) -> String {
@@ -431,7 +452,7 @@ fn rate_label(rate: i32) -> String {
 impl Devices {
     /// Creates and starts the monitor (Video/Source + Audio/Source). Blocks briefly while the
     /// providers probe; called on the engine thread before the first Snapshot.
-    pub fn start() -> Self {
+    pub fn start(camera_support: CameraSupport) -> Self {
         let monitor = gst::DeviceMonitor::new();
         monitor.add_filter(Some("Video/Source"), None);
         monitor.add_filter(Some("Audio/Source"), None);
@@ -446,12 +467,8 @@ impl Devices {
             next_id: 1,
             cameras: Vec::new(),
             microphones: Vec::new(),
-            jpeg_ok: true,
+            camera_support,
         }
-    }
-
-    pub fn set_jpeg_ok(&mut self, ok: bool) {
-        self.jpeg_ok = ok;
     }
 
     pub fn stop(&self) {
@@ -469,7 +486,7 @@ impl Devices {
     }
 
     /// Re-reads the device list. Returns true if anything visible changed.
-    pub fn enumerate(&mut self, gpu_convert: bool) -> bool {
+    pub fn enumerate(&mut self) -> bool {
         let mut cameras = Vec::new();
         let mut microphones = Vec::new();
         for device in self.monitor.devices() {
@@ -490,8 +507,8 @@ impl Devices {
             };
             let caps = device.caps().unwrap_or_else(gst::Caps::new_empty);
             if device.has_classes("Video/Source") {
-                let class = classify_camera_with(&caps, gpu_convert, self.jpeg_ok);
-                let modes = usable_modes(&caps, gpu_convert, self.jpeg_ok);
+                let class = classify_camera_with(&caps, self.camera_support);
+                let modes = usable_modes(&caps, self.camera_support);
                 let detail = match &class {
                     CameraClass::Usable(m) => format!("{origin} · {}", m.label()),
                     CameraClass::Unsupported(_) => origin.clone(),
@@ -558,7 +575,7 @@ impl Devices {
     }
 
     /// Drains hotplug messages without blocking. Returns true if the device list changed.
-    pub fn poll(&mut self, gpu_convert: bool) -> bool {
+    pub fn poll(&mut self) -> bool {
         let mut dirty = false;
         while let Some(msg) = self.bus.pop() {
             if matches!(
@@ -570,7 +587,7 @@ impl Devices {
                 dirty = true;
             }
         }
-        dirty && self.enumerate(gpu_convert)
+        dirty && self.enumerate()
     }
 
     pub fn camera(&self, id: DeviceId) -> Option<&Entry> {
@@ -603,6 +620,23 @@ mod tests {
         }
     }
 
+    const GPU_JPEG_SUPPORT: CameraSupport = CameraSupport {
+        gpu_convert: Some(GpuConvert::Va),
+        jpeg_decode: JpegDecodeSupport::Available,
+    };
+    const CPU_JPEG_SUPPORT: CameraSupport = CameraSupport {
+        gpu_convert: None,
+        jpeg_decode: JpegDecodeSupport::Available,
+    };
+    const GPU_NO_JPEG_SUPPORT: CameraSupport = CameraSupport {
+        gpu_convert: Some(GpuConvert::Va),
+        jpeg_decode: JpegDecodeSupport::Unavailable,
+    };
+    const CPU_NO_JPEG_SUPPORT: CameraSupport = CameraSupport {
+        gpu_convert: None,
+        jpeg_decode: JpegDecodeSupport::Unavailable,
+    };
+
     /// The exact caps of the Sony ILCE-7CM2 (uvcvideo) as PipeWire reports them.
     const ILCE_7CM2: &str = "video/x-raw(memory:DMABuf), drm-format=NV12, format=DMA_DRM, \
         interlace-mode=progressive, width=3840, height=2160, framerate=25/1, colorimetry=bt709; \
@@ -613,7 +647,7 @@ mod tests {
     #[test]
     fn ilce_7cm2_records_native_4k25_raw() {
         let c = caps(ILCE_7CM2);
-        let m = usable(classify_camera(&c, true));
+        let m = usable(classify_camera(&c, GPU_JPEG_SUPPORT));
         assert_eq!(m.path, CameraPath::Raw);
         assert_eq!(m.format.as_deref(), Some("NV12"));
         assert_eq!((m.width, m.height), (3840, 2160));
@@ -629,9 +663,9 @@ mod tests {
         let filter = gst::Caps::from_str(&m.source_caps()).unwrap();
         assert!(filter.can_intersect(&c));
         // Same result without a GPU path; without MJPEG support too.
-        assert_eq!(usable(classify_camera_with(&c, false, false)), m);
+        assert_eq!(usable(classify_camera_with(&c, CPU_NO_JPEG_SUPPORT)), m);
         // The mode list: the automatic choice first, then the other advertised paths.
-        let modes = usable_modes(&c, true, true);
+        let modes = usable_modes(&c, GPU_JPEG_SUPPORT);
         assert_eq!(modes[0], m);
         let labels: Vec<String> = modes.iter().map(|m| m.label()).collect();
         assert!(labels.iter().any(|l| l.contains("MJPEG")), "{labels:?}");
@@ -645,7 +679,7 @@ mod tests {
             "video/x-raw(memory:DMABuf), drm-format=NV12, format=DMA_DRM, width=3840, height=2160, framerate=25/1; \
              image/jpeg, width=3840, height=2160, framerate=25/1",
         );
-        let m = usable(classify_camera(&c, true));
+        let m = usable(classify_camera(&c, GPU_JPEG_SUPPORT));
         assert_eq!(m.path, CameraPath::Jpeg);
         assert_eq!(
             m.source_caps(),
@@ -655,14 +689,14 @@ mod tests {
         let c = caps(
             "video/x-raw(memory:DMABuf), drm-format=NV12, format=DMA_DRM, width=3840, height=2160, framerate=25/1",
         );
-        let m = usable(classify_camera(&c, true));
+        let m = usable(classify_camera(&c, GPU_JPEG_SUPPORT));
         assert_eq!(m.path, CameraPath::DmaBuf);
         assert_eq!(
             m.source_caps(),
             "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12,width=3840,height=2160,framerate=25/1"
         );
         assert!(matches!(
-            classify_camera(&c, false),
+            classify_camera(&c, CPU_JPEG_SUPPORT),
             CameraClass::Unsupported(_)
         ));
     }
@@ -677,12 +711,12 @@ mod tests {
              image/jpeg,width=1920,height=1080,framerate={ (fraction)30/1, (fraction)24/1, (fraction)15/1 }; \
              image/jpeg,width=1280,height=720,framerate={ (fraction)30/1, (fraction)15/1 }",
         );
-        let m = usable(classify_camera(&c, true));
+        let m = usable(classify_camera(&c, GPU_JPEG_SUPPORT));
         assert_eq!(m.path, CameraPath::Jpeg);
         assert_eq!((m.width, m.height, m.fps_n, m.fps_d), (1920, 1080, 30, 1));
         assert_eq!(m.label(), "1920×1080 @30 · MJPEG");
         // Without MJPEG decoders: the best smooth raw mode (640×480@30) wins over 1080p5.
-        let m = usable(classify_camera_with(&c, true, false));
+        let m = usable(classify_camera_with(&c, GPU_NO_JPEG_SUPPORT));
         assert_eq!(m.path, CameraPath::Raw);
         assert_eq!((m.width, m.height, m.fps_n), (640, 480, 30));
     }
@@ -693,7 +727,7 @@ mod tests {
             "image/jpeg,width=1920,height=1080,framerate=30/1; \
              video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1",
         );
-        let m = usable(classify_camera(&c, true));
+        let m = usable(classify_camera(&c, GPU_JPEG_SUPPORT));
         assert_eq!(m.path, CameraPath::Raw);
         assert_eq!(m.format.as_deref(), Some("YUY2"));
     }
@@ -706,22 +740,25 @@ mod tests {
              image/jpeg,width=1920,height=1080,framerate=60/1; \
              image/jpeg,width=4096,height=2160,framerate=30/1",
         );
-        let m = usable(classify_camera(&c, true));
+        let m = usable(classify_camera(&c, GPU_JPEG_SUPPORT));
         assert_eq!((m.width, m.height, m.fps_n), (4096, 2160, 30));
         assert_eq!(m.output_size(), (4096, 2160), "DCI 4K is recorded unscaled");
         // A faster mode at the same size wins.
         let c =
             caps("image/jpeg,width=3840,height=2160,framerate={ (fraction)30/1, (fraction)60/1 }");
-        assert_eq!(usable(classify_camera(&c, true)).fps_n, 60);
+        assert_eq!(usable(classify_camera(&c, GPU_JPEG_SUPPORT)).fps_n, 60);
         // 120 fps is capped to 60, and a native 60 fps mode is preferred over it.
         let c = caps("image/jpeg,width=1920,height=1080,framerate={ (fraction)120/1 }");
-        assert_eq!(usable(classify_camera(&c, true)).output_fps(), (60, 1));
+        assert_eq!(
+            usable(classify_camera(&c, GPU_JPEG_SUPPORT)).output_fps(),
+            (60, 1)
+        );
         let c =
             caps("image/jpeg,width=1920,height=1080,framerate={ (fraction)120/1, (fraction)60/1 }");
-        assert_eq!(usable(classify_camera(&c, true)).fps_n, 60);
+        assert_eq!(usable(classify_camera(&c, GPU_JPEG_SUPPORT)).fps_n, 60);
         // NTSC rates are kept exactly.
         let c = caps("video/x-raw,format=NV12,width=1920,height=1080,framerate=30000/1001");
-        let m = usable(classify_camera(&c, false));
+        let m = usable(classify_camera(&c, CPU_JPEG_SUPPORT));
         assert_eq!(m.output_fps(), (30000, 1001));
         assert_eq!(m.label(), "1920×1080 @29.97 · NV12");
     }
@@ -729,7 +766,7 @@ mod tests {
     #[test]
     fn above_4k_is_downscaled_and_smaller_modes_win() {
         let c = caps("video/x-raw,format=NV12,width=6144,height=3456,framerate=30/1");
-        let m = usable(classify_camera(&c, false));
+        let m = usable(classify_camera(&c, CPU_JPEG_SUPPORT));
         assert_eq!((m.width, m.height), (6144, 3456));
         let (w, h) = m.output_size();
         assert!(w <= CAMERA_MAX_W && h <= CAMERA_MAX_H, "{w}×{h}");
@@ -738,7 +775,7 @@ mod tests {
             "video/x-raw,format=NV12,width=6144,height=3456,framerate=30/1; \
              video/x-raw,format=NV12,width=3840,height=2160,framerate=30/1",
         );
-        assert_eq!(usable(classify_camera(&c, false)).width, 3840);
+        assert_eq!(usable(classify_camera(&c, CPU_JPEG_SUPPORT)).width, 3840);
     }
 
     #[test]
@@ -746,31 +783,31 @@ mod tests {
         // Any-size sources (v4l2loopback, virtual cameras) are not pushed to 4K60.
         let c =
             caps("video/x-raw,format=YUY2,width=[2,8192],height=[1,8192],framerate=[1/1,120/1]");
-        let m = usable(classify_camera(&c, false));
+        let m = usable(classify_camera(&c, CPU_JPEG_SUPPORT));
         assert_eq!((m.width, m.height, m.fps_n, m.fps_d), (1920, 1080, 30, 1));
         assert_eq!(m.label(), "1920×1080 @30 · YUY2");
         // A range entirely above the defaults uses its minimum.
         let c = caps(
             "video/x-raw,format=YUY2,width=[2560,8192],height=[1440,8192],framerate=[50/1,120/1]",
         );
-        let m = usable(classify_camera(&c, false));
+        let m = usable(classify_camera(&c, CPU_JPEG_SUPPORT));
         assert_eq!((m.width, m.height, m.fps_n), (2560, 1440, 50));
         let c = caps("video/x-raw,format=YUY2,width=[2,1280],height=[1,720],framerate=[1/1,30/1]");
-        let m = usable(classify_camera(&c, false));
+        let m = usable(classify_camera(&c, CPU_JPEG_SUPPORT));
         assert_eq!((m.width, m.height, m.fps_n), (1280, 720, 30));
     }
 
     #[test]
     fn slow_raw_only_is_still_usable() {
         let c = caps("video/x-raw,format=YUY2,width=640,height=480,framerate=15/1");
-        let m = usable(classify_camera(&c, false));
+        let m = usable(classify_camera(&c, CPU_JPEG_SUPPORT));
         assert_eq!((m.width, m.height, m.fps_n), (640, 480, 15));
     }
 
     #[test]
     fn mjpeg_without_decoder_is_unsupported() {
         let c = caps("image/jpeg,width=1920,height=1080,framerate=30/1");
-        match classify_camera_with(&c, true, false) {
+        match classify_camera_with(&c, GPU_NO_JPEG_SUPPORT) {
             CameraClass::Unsupported(r) => assert!(r.contains("jpegparse"), "{r}"),
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -784,7 +821,7 @@ mod tests {
              video/x-raw(memory:DMABuf),format=UNKNOWN,width=[2,8192],height=[1,8192]; \
              video/x-raw,format=UNKNOWN,width=[2,8192],height=[1,8192]",
         );
-        let m = usable(classify_camera(&c, true));
+        let m = usable(classify_camera(&c, GPU_JPEG_SUPPORT));
         assert_eq!(m.path, CameraPath::DmaBuf);
         assert_eq!((m.width, m.height), (1920, 1080));
         assert_eq!(m.output_fps(), (30, 1));
@@ -793,7 +830,7 @@ mod tests {
             "{}",
             m.source_caps()
         );
-        match classify_camera(&c, false) {
+        match classify_camera(&c, CPU_JPEG_SUPPORT) {
             CameraClass::Unsupported(r) => assert!(r.starts_with("no usable format:"), "{r}"),
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -803,13 +840,48 @@ mod tests {
     fn nothing_usable() {
         let c = caps("video/x-bayer,format=rggb,width=640,height=480,framerate=30/1");
         assert!(matches!(
-            classify_camera(&c, true),
+            classify_camera(&c, GPU_JPEG_SUPPORT),
             CameraClass::Unsupported(_)
         ));
         assert!(matches!(
-            classify_camera(&gst::Caps::new_empty(), true),
+            classify_camera(&gst::Caps::new_empty(), GPU_JPEG_SUPPORT),
             CameraClass::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn camera_support_distinguishes_gpu_and_jpeg_paths() {
+        let c = caps(
+            "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format=NV12,width=1920,height=1080,framerate=30/1; \
+             image/jpeg,width=1920,height=1080,framerate=30/1",
+        );
+        let cpu_with_jpeg = CameraSupport {
+            gpu_convert: None,
+            jpeg_decode: JpegDecodeSupport::Available,
+        };
+        let gpu_without_jpeg = CameraSupport {
+            gpu_convert: Some(super::super::types::GpuConvert::Va),
+            jpeg_decode: JpegDecodeSupport::Unavailable,
+        };
+
+        assert_eq!(
+            usable(classify_camera_with(&c, cpu_with_jpeg)).path,
+            CameraPath::Jpeg
+        );
+        assert_eq!(
+            usable(classify_camera_with(&c, gpu_without_jpeg)).path,
+            CameraPath::DmaBuf
+        );
+        assert!(
+            usable_modes(&c, cpu_with_jpeg)
+                .iter()
+                .all(|m| m.path == CameraPath::Jpeg)
+        );
+        assert!(
+            usable_modes(&c, gpu_without_jpeg)
+                .iter()
+                .all(|m| m.path == CameraPath::DmaBuf)
+        );
     }
 
     #[test]

@@ -136,6 +136,19 @@ pub fn portal_source_caps(cap: Option<i32>) -> String {
     }
 }
 
+/// Inputs for one video recording pipeline.
+pub struct VideoInputSpec<'a> {
+    pub name: &'a str,
+    pub source: VideoSource<'a>,
+    pub convert: Option<GpuConvert>,
+    pub encoder: VideoEncoder,
+    pub role: Role,
+    pub target: VideoTarget,
+    pub clock: &'a gst::Clock,
+    pub path: &'a Path,
+    pub preview: Option<Tap>,
+}
+
 /// Selftest hooks for a test pattern (never set by the app).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TestBehaviour {
@@ -272,12 +285,27 @@ fn leaky_queue() -> Result<gst::Element, String> {
     Ok(q)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepeaterBackend {
+    Va,
+    Cpu,
+}
+
+impl RepeaterBackend {
+    fn factory(self) -> &'static str {
+        match self {
+            Self::Va => "vacompositor",
+            Self::Cpu => "compositor",
+        }
+    }
+}
+
 /// The constant-rate repeater for portal sources: a live aggregator that outputs a frame every
 /// `fps` period from the first input frame until EOS, repeating the last input frame.
 /// Compositors only send frames on damage, so a static window would otherwise stop recording
 /// after its first frame, and videorate only duplicates once a newer frame arrives.
-fn repeater(va: bool, fps: (i32, i32)) -> Result<gst::Element, String> {
-    let factory = if va { "vacompositor" } else { "compositor" };
+fn repeater(backend: RepeaterBackend, fps: (i32, i32)) -> Result<gst::Element, String> {
+    let factory = backend.factory();
     let agg = gst::ElementFactory::make(factory)
         .property("force-live", true)
         .build()
@@ -522,18 +550,18 @@ fn install_timed_keyframes(pad: &gst::Pad) {
 
 /// Builds a video input (§5.2 screen/window/test, §5.4 camera) in NULL. With `preview`, a tee
 /// feeds a throttled preview branch (see `preview.rs`) that can never fail the input.
-#[allow(clippy::too_many_arguments)]
-pub fn build_video(
-    name: &str,
-    source: VideoSource<'_>,
-    convert: Option<GpuConvert>,
-    enc: VideoEncoder,
-    role: Role,
-    target: VideoTarget,
-    clock: &gst::Clock,
-    path: &Path,
-    preview: Option<Tap>,
-) -> Result<InputPipeline, String> {
+pub fn build_video(spec: VideoInputSpec<'_>) -> Result<InputPipeline, String> {
+    let VideoInputSpec {
+        name,
+        source,
+        convert,
+        encoder: enc,
+        role,
+        target,
+        clock,
+        path,
+        preview,
+    } = spec;
     let pipeline = new_pipeline(name, clock);
     let base = Arc::new(AtomicU64::new(UNSET));
     let counters = Arc::new(Counters::default());
@@ -673,8 +701,12 @@ pub fn build_video(
                     repeat_caps = Some(caps.clone());
                     mid.push(caps);
                     // VAMemory end to end exactly when outcaps carries it (encoders::outcaps_string).
-                    let va = convert == Some(GpuConvert::Va) && enc.is_gpu();
-                    let agg = repeater(va, fps)?;
+                    let backend = if convert == Some(GpuConvert::Va) && enc.is_gpu() {
+                        RepeaterBackend::Va
+                    } else {
+                        RepeaterBackend::Cpu
+                    };
+                    let agg = repeater(backend, fps)?;
                     repeater_el = Some(agg.clone());
                     mid.push(agg);
                 }
@@ -1284,6 +1316,35 @@ pub fn check_targeting(node: u32, timeout: Duration) -> Result<TargetCheck, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeater_backend_selects_compositor_by_capability() {
+        assert_eq!(RepeaterBackend::Va.factory(), "vacompositor");
+        assert_eq!(RepeaterBackend::Cpu.factory(), "compositor");
+    }
+
+    #[test]
+    fn video_input_spec_groups_named_pipeline_configuration() {
+        gst::init().unwrap();
+        let clock = gst::SystemClock::obtain();
+        let spec = VideoInputSpec {
+            name: "test-video",
+            source: VideoSource::Test(TestBehaviour::default()),
+            convert: None,
+            encoder: VideoEncoder::X264,
+            role: Role::Screen,
+            target: VideoTarget {
+                rate: Rate::Cfr((30, 1)),
+                max: (1920, 1080),
+            },
+            clock: &clock,
+            path: Path::new("test.mkv"),
+            preview: None,
+        };
+        assert_eq!(spec.name, "test-video");
+        assert_eq!(spec.encoder, VideoEncoder::X264);
+        assert_eq!(spec.target.rate.cfr(), Some((30, 1)));
+    }
 
     #[test]
     fn portal_target_uses_object_id_path_and_never_falls_back() {
