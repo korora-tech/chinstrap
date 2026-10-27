@@ -25,6 +25,7 @@ pub const SOURCE_CAPS: &str = "video/x-raw(memory:DMABuf),format=DMA_DRM; video/
 pub const TEST_SIZE: (i32, i32) = (1280, 720);
 pub const TEST_RESIZE_CAPS: &str = "video/x-raw,width=1000,height=700,framerate=30/1";
 pub const MIC_CAPS: &str = "audio/x-raw,rate=48000,channels=[1,2]";
+pub const SYSTEM_AUDIO_CAPS: &str = "audio/x-raw,rate=48000,channels=2,layout=interleaved";
 
 /// Parses a `WxH` size (both sides 16..=8192).
 pub fn parse_size(v: &str) -> Option<(i32, i32)> {
@@ -940,6 +941,117 @@ pub fn build_mic(
     })
 }
 
+/// Creates a PipeWire capture stream for an output sink's monitor ports. A `None` target leaves
+/// `target-object` unset, allowing PipeWire's session manager to follow the current default.
+/// `stream.capture.sink` selects the output sink's monitor ports rather than its playback inputs.
+pub(super) fn system_audio_source(
+    name: &str,
+    target_serial: Option<&str>,
+) -> Result<gst::Element, String> {
+    let src = gst::ElementFactory::make("pipewiresrc")
+        .name(name)
+        .build()
+        .map_err(|e| format!("cannot create PipeWire system-audio source: {e}"))?;
+    if let Some(serial) = target_serial {
+        src.set_property("target-object", serial);
+    }
+    src.set_property("client-name", name);
+    src.set_property_from_str("on-disconnect", "error");
+    let props = gst::Structure::builder("props")
+        .field("media.class", "Stream/Input/Audio")
+        .field("stream.capture.sink", true)
+        .field("node.dont-fallback", true)
+        .field("node.name", name);
+    let props = if target_serial.is_some() {
+        props.field("node.dont-move", true)
+    } else {
+        props
+    };
+    src.set_property("stream-properties", props.build());
+    Ok(src)
+}
+
+/// Builds the optional system-audio input as a separate stereo Opus file on the shared clock.
+pub(super) fn build_system_audio(
+    name: &str,
+    target_serial: Option<&str>,
+    clock: &gst::Clock,
+    path: &Path,
+) -> Result<InputPipeline, String> {
+    let src = system_audio_source("system-src", target_serial)?;
+    build_system_audio_from_source(name, src, clock, path)
+}
+
+/// Synthetic sine source used by `--selftest` only when there is no PipeWire output.
+pub(super) fn build_system_audio_test_tone(
+    name: &str,
+    clock: &gst::Clock,
+    path: &Path,
+) -> Result<InputPipeline, String> {
+    let src = gst::ElementFactory::make("audiotestsrc")
+        .name("system-src")
+        .build()
+        .map_err(|e| format!("cannot create system-audio test source: {e}"))?;
+    set_prop(&src, "is-live", "true");
+    set_prop(&src, "wave", "sine");
+    set_prop(&src, "freq", "440");
+    set_prop(&src, "volume", "0.25");
+    build_system_audio_from_source(name, src, clock, path)
+}
+
+fn build_system_audio_from_source(
+    name: &str,
+    src: gst::Element,
+    clock: &gst::Clock,
+    path: &Path,
+) -> Result<InputPipeline, String> {
+    let pipeline = new_pipeline(name, clock);
+    let base = Arc::new(AtomicU64::new(UNSET));
+    let level = make("level")?;
+    set_prop(&level, "interval", "100000000");
+    set_prop(&level, "post-messages", "true");
+    let opus = make("opusenc")?;
+    set_prop(&opus, "bitrate", "192000");
+    let first_q = queue()?;
+    let (mux, sink) = file_tail(path)?;
+    let chain = vec![
+        src.clone(),
+        first_q.clone(),
+        make("audioconvert")?,
+        make("audioresample")?,
+        capsfilter(SYSTEM_AUDIO_CAPS)?,
+        level,
+        queue()?,
+        opus.clone(),
+        mux,
+        sink,
+    ];
+    link_chain(&pipeline, &chain)?;
+    stamp::install_audio(&src_pad(&src)?, clock.clone(), base.clone());
+    let counters = Arc::new(Counters::default());
+    let (first_pts, last_pts) = mux_probe(&opus, counters.clone())?;
+    let bus = pipeline.bus().ok_or("pipeline has no bus")?;
+    Ok(InputPipeline {
+        pipeline,
+        bus,
+        eos_target: sink_pad(&first_q)?,
+        base,
+        first_pts,
+        last_pts,
+        size: Arc::new(Mutex::new(None)),
+        resize_filter: None,
+        convert: None,
+        encoder: None,
+        rate: None,
+        warning: None,
+        counters,
+        videorate: None,
+        leaky: None,
+        tail: None,
+        preview: None,
+    })
+}
+
 /// Builds an idle preview pipeline (`PipeKind::Preview`) in NULL: the input's source and its
 /// caps, then the preview branch (`preview.rs`). The only consumer of its node while it runs:
 /// recording starts only once it is Null again (D4).
@@ -1287,6 +1399,7 @@ pub fn check_targeting(node: u32, timeout: Duration) -> Result<TargetCheck, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gstreamer_pbutils::prelude::*;
 
     #[test]
     fn crash_recovery_mux_bounds_clusters_and_flushes_sink_writes() {
@@ -1339,6 +1452,118 @@ mod tests {
         // Without a portal fd the normal daemon is used (fd stays -1).
         let src = portal_source("src2", None, 7).unwrap();
         assert_eq!(src.property::<i32>("fd"), -1);
+    }
+
+    #[test]
+    fn system_audio_source_targets_sink_monitor_ports() {
+        gst::init().unwrap();
+        let specific = system_audio_source("system-specific", Some("70")).unwrap();
+        assert_eq!(
+            specific
+                .property::<Option<String>>("target-object")
+                .as_deref(),
+            Some("70")
+        );
+        let props = specific
+            .property::<Option<gst::Structure>>("stream-properties")
+            .expect("PipeWire stream properties");
+        assert!(props.get::<bool>("stream.capture.sink").unwrap());
+        assert!(props.get::<bool>("node.dont-fallback").unwrap());
+        assert!(
+            props.get::<bool>("node.dont-move").unwrap_or(false),
+            "explicit sink targets must not be moved by the session manager"
+        );
+
+        let default = system_audio_source("system-default", None).unwrap();
+        assert_eq!(default.property::<Option<String>>("target-object"), None);
+        let props = default
+            .property::<Option<gst::Structure>>("stream-properties")
+            .expect("PipeWire stream properties");
+        assert!(props.get::<bool>("stream.capture.sink").unwrap());
+        assert!(props.get::<bool>("node.dont-fallback").unwrap());
+        assert!(
+            !props.get::<bool>("node.dont-move").unwrap_or(false),
+            "default target must remain movable so it follows PipeWire's current output"
+        );
+    }
+
+    #[test]
+    fn system_audio_test_tone_records_stereo_opus_at_48khz() {
+        gst::init().unwrap();
+        for factory in [
+            "audiotestsrc",
+            "audioconvert",
+            "audioresample",
+            "level",
+            "opusenc",
+            "matroskamux",
+        ] {
+            if !encoders::has_element(factory) {
+                eprintln!("{factory} missing; skipped");
+                return;
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "chinstrap-system-audio-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("system.mkv");
+        let clock = gst::SystemClock::obtain();
+        let input = build_system_audio_test_tone("system-audio-test", &clock, &path).unwrap();
+        let base = clock.time().nseconds() + 100_000_000;
+        input.base.store(base, Ordering::Release);
+        input
+            .pipeline
+            .set_base_time(gst::ClockTime::from_nseconds(base));
+        input.pipeline.set_state(gst::State::Playing).unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let source = input.pipeline.by_name("system-src").expect("test source");
+        assert!(source.send_event(gst::event::Eos::new()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "system-audio test tone did not reach EOS"
+            );
+            if let Some(message) = input.bus.timed_pop_filtered(
+                gst::ClockTime::from_nseconds(
+                    remaining.min(Duration::from_millis(100)).as_nanos() as u64
+                ),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            ) {
+                match message.view() {
+                    gst::MessageView::Eos(_) => break,
+                    gst::MessageView::Error(error) => {
+                        panic!("system-audio test pipeline: {}", error.error())
+                    }
+                    _ => {}
+                }
+            }
+        }
+        input.pipeline.set_state(gst::State::Null).unwrap();
+        let first_pts = input.first_pts.load(Ordering::Acquire);
+        assert_ne!(first_pts, UNSET, "system track should record its first_pts");
+
+        let discoverer =
+            gstreamer_pbutils::Discoverer::new(gst::ClockTime::from_seconds(5)).unwrap();
+        let uri = gst::glib::filename_to_uri(&path, None).unwrap();
+        let info = discoverer.discover_uri(&uri).unwrap();
+        let streams = info.audio_streams();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].sample_rate(), 48_000);
+        assert_eq!(streams[0].channels(), 2);
+        assert!(
+            streams[0]
+                .caps()
+                .unwrap()
+                .to_string()
+                .contains("audio/x-opus")
+        );
+        assert!(info.duration().is_some_and(|d| d.nseconds() > 0));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

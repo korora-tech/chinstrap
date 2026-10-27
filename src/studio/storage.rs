@@ -95,11 +95,17 @@ pub fn stop_reserve_bytes(bytes_per_second: u64, minimum_mb: u64) -> u64 {
 }
 
 /// Worst-case planned output rate plus the 30% encoder headroom, in bytes per second.
-pub fn estimate_bytes_per_second(video_kbps: &[u32], microphone_selected: bool) -> u64 {
+pub fn estimate_bytes_per_second(
+    video_kbps: &[u32],
+    microphone_selected: bool,
+    system_audio_selected: bool,
+) -> u64 {
     let video_rate = video_kbps
         .iter()
         .fold(0u64, |sum, rate| sum.saturating_add(*rate as u64));
-    let total_kbps = video_rate.saturating_add(if microphone_selected { 192 } else { 0 });
+    let total_kbps = video_rate
+        .saturating_add(if microphone_selected { 192 } else { 0 })
+        .saturating_add(if system_audio_selected { 192 } else { 0 });
     let numerator = total_kbps.saturating_mul(1000).saturating_mul(130);
     numerator.saturating_add(799) / 800
 }
@@ -244,9 +250,15 @@ mod tests {
 
     #[test]
     fn estimate_includes_microphone_and_thirty_percent_margin() {
-        assert_eq!(estimate_bytes_per_second(&[8_000], false), 1_300_000);
-        assert_eq!(estimate_bytes_per_second(&[8_000], true), 1_331_200);
-        assert_eq!(estimate_bytes_per_second(&[], false), 0);
+        assert_eq!(estimate_bytes_per_second(&[8_000], false, false), 1_300_000);
+        assert_eq!(estimate_bytes_per_second(&[8_000], true, false), 1_331_200);
+        assert_eq!(estimate_bytes_per_second(&[], false, false), 0);
+    }
+
+    #[test]
+    fn estimate_adds_system_audio_only_when_selected() {
+        assert_eq!(estimate_bytes_per_second(&[8_000], true, false), 1_331_200);
+        assert_eq!(estimate_bytes_per_second(&[8_000], true, true), 1_362_400);
     }
 
     #[test]

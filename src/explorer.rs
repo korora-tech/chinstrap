@@ -47,7 +47,7 @@ const CATEGORIES: &[Category] = &[
             },
             Feature {
                 title: "System Audio",
-                description: "Record application output and operating-system sounds without installing another driver.",
+                description: "Available now: record application output and operating-system sounds in a separate file on the shared clock.",
             },
             Feature {
                 title: "Per-Source Files",

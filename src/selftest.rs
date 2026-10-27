@@ -26,9 +26,9 @@ use gstreamer_pbutils as pbutils;
 use gstreamer_pbutils::prelude::*;
 
 use crate::studio::{
-    self, EngineCommand, EngineEvent, FrameRateMode, InputKey, InputStatus, ModelState, Phase,
-    PreviewOrigin, Previews, SegmentStatus, Severity, Snapshot, SourceId, SourceKind, SourceState,
-    TestBehaviour, TranscriptStatus,
+    self, DEFAULT_SYSTEM_AUDIO_ID, DeviceId, EngineCommand, EngineEvent, FrameRateMode, InputKey,
+    InputStatus, ModelState, Phase, PreviewOrigin, Previews, SegmentStatus, Severity, Snapshot,
+    SourceId, SourceKind, SourceState, TestBehaviour, TranscriptStatus,
 };
 
 const DURATION_TOLERANCE: Duration = Duration::from_millis(600);
@@ -49,6 +49,45 @@ const MAX_REPEAT_PCT: f64 = 1.0;
 const PREVIEW_WINDOW: Duration = Duration::from_secs(3);
 const PREVIEW_MIN_FRAMES: u64 = 5;
 const PREVIEW_MIN_FPS: f64 = 8.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SystemAudioSelfTestSource {
+    Monitor(DeviceId),
+    SyntheticTone,
+    Skipped(&'static str),
+}
+
+fn required_elements_available(missing: &[String], class: studio::InputClass) -> bool {
+    !studio::REQUIRED_ELEMENTS
+        .iter()
+        .any(|(name, required_class, _)| {
+            (*required_class == class || *required_class == studio::InputClass::Any)
+                && missing.iter().any(|m| m == name)
+        })
+}
+
+fn system_audio_selftest_source(
+    has_output: bool,
+    pipewire_available: bool,
+    audio_chain_available: bool,
+    test_tone_available: bool,
+) -> SystemAudioSelfTestSource {
+    if !audio_chain_available {
+        return SystemAudioSelfTestSource::Skipped("Opus/audio elements unavailable");
+    }
+    if has_output {
+        return if pipewire_available {
+            SystemAudioSelfTestSource::Monitor(DEFAULT_SYSTEM_AUDIO_ID)
+        } else {
+            SystemAudioSelfTestSource::Skipped("PipeWire source unavailable")
+        };
+    }
+    if test_tone_available {
+        SystemAudioSelfTestSource::SyntheticTone
+    } else {
+        SystemAudioSelfTestSource::Skipped("no output sink or audiotestsrc")
+    }
+}
 
 struct Harness {
     rx: async_channel::Receiver<EngineEvent>,
@@ -73,6 +112,7 @@ impl Harness {
                 );
             }
             EngineEvent::Level { .. } => self.levels += 1,
+            EngineEvent::SystemAudioLevel { .. } => {}
         }
     }
 
@@ -140,6 +180,8 @@ struct FileCheck {
     fps: Option<(i32, i32)>,
     profile: Option<String>,
     level: Option<String>,
+    sample_rate: Option<u32>,
+    channels: Option<u32>,
 }
 
 /// Parses "W×H @F" out of a camera detail label ("pipewire #2148 · 3840×2160 @25 · NV12").
@@ -210,6 +252,8 @@ fn check_video(disc: &pbutils::Discoverer, path: &Path) -> Result<FileCheck, Str
         fps: (rate.numer() > 0).then(|| (rate.numer(), rate.denom())),
         profile: field("profile"),
         level: field("level"),
+        sample_rate: None,
+        channels: None,
     })
 }
 
@@ -238,6 +282,8 @@ fn check_audio(disc: &pbutils::Discoverer, path: &Path) -> Result<FileCheck, Str
         fps: None,
         profile: None,
         level: None,
+        sample_rate: Some(a.sample_rate()),
+        channels: Some(a.channels()),
     })
 }
 
@@ -249,11 +295,15 @@ fn verify_preserved_media(
     input: InputKey,
 ) -> Result<serde_json::Value, String> {
     let duration_ns = studio::recovery::verify_recovered_file(path)?;
-    let stream = if input == InputKey::Microphone {
-        let info = check_audio(disc, path)?;
+    let stream = if matches!(input, InputKey::Microphone | InputKey::SystemAudio) {
+        let info = if input == InputKey::SystemAudio {
+            check_system_audio(disc, path)?
+        } else {
+            check_audio(disc, path)?
+        };
         decode_audio(path)?;
         serde_json::json!({
-            "kind": "audio",
+            "kind": if input == InputKey::SystemAudio { "system_audio" } else { "audio" },
             "duration_s": info.duration.map(|duration| duration.as_secs_f64()),
             "decoded": true,
         })
@@ -278,6 +328,17 @@ fn verify_preserved_media(
         "discoverable_and_playable": stream,
         "verified_duration_s": duration_ns as f64 / 1e9,
     }))
+}
+
+fn check_system_audio(disc: &pbutils::Discoverer, path: &Path) -> Result<FileCheck, String> {
+    let file = check_audio(disc, path)?;
+    if file.channels != Some(2) {
+        return Err(format!(
+            "system audio has {:?} channels, expected stereo",
+            file.channels
+        ));
+    }
+    Ok(file)
 }
 
 /// (PTS ns, keyframe) of every video frame of a Matroska file, demuxed (not decoded).
@@ -643,7 +704,38 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     engine.send(EngineCommand::SelectCamera(camera));
     let mic = first.microphones.first().map(|m| m.id);
     engine.send(EngineCommand::SelectMicrophone(mic));
-    for d in first.cameras.iter().chain(first.microphones.iter()) {
+    let system_audio_source = system_audio_selftest_source(
+        first
+            .system_audio_devices
+            .iter()
+            .any(|d| d.id == DEFAULT_SYSTEM_AUDIO_ID),
+        required_elements_available(
+            &first.capabilities.missing_elements,
+            studio::InputClass::PipeWire,
+        ),
+        required_elements_available(
+            &first.capabilities.missing_elements,
+            studio::InputClass::Mic,
+        ),
+        gst::ElementFactory::find("audiotestsrc").is_some(),
+    );
+    match system_audio_source {
+        SystemAudioSelfTestSource::Monitor(id) => {
+            engine.send(EngineCommand::SelectSystemAudio(Some(id)));
+        }
+        SystemAudioSelfTestSource::SyntheticTone => {
+            engine.send(EngineCommand::SelectSystemAudioTestTone);
+        }
+        SystemAudioSelfTestSource::Skipped(reason) => {
+            warnings.push(format!("system audio check skipped: {reason}"));
+        }
+    }
+    for d in first
+        .cameras
+        .iter()
+        .chain(first.microphones.iter())
+        .chain(first.system_audio_devices.iter())
+    {
         eprintln!(
             "selftest: device {:?} {:?} \"{}\" [{}]{}",
             d.id,
@@ -676,6 +768,11 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
                     .any(|x| x.id == SourceId(NATIVE_ID) && x.frame_rate == FrameRateMode::Native)
                 && s.selected_camera == camera
                 && s.selected_microphone == mic
+                && match system_audio_source {
+                    SystemAudioSelfTestSource::Monitor(id) => s.selected_system_audio == Some(id),
+                    SystemAudioSelfTestSource::SyntheticTone => s.system_audio_test_tone,
+                    SystemAudioSelfTestSource::Skipped(_) => true,
+                }
                 && s.can_record
         })
         .ok_or("test sources never became Ready / can_record")?;
@@ -773,6 +870,10 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     if reserve_path.as_ref().is_some_and(|path| path.exists()) {
         h.fail("the emergency stop reserve remained after normal Stop");
     }
+    let system_audio_expected = matches!(
+        system_audio_source,
+        SystemAudioSelfTestSource::Monitor(_) | SystemAudioSelfTestSource::SyntheticTone
+    );
     eprintln!("selftest: session {}", session.dir.display());
     if preview_on {
         // Idle previews come back once the recording pipelines are gone.
@@ -814,11 +915,18 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         if seg.index == 2 && !seg.files.iter().any(|f| f.input == silent_key) {
             h.fail("segment 2 dropped the silent source after Cut");
         }
+        if system_audio_expected && !seg.files.iter().any(|f| f.input == InputKey::SystemAudio) {
+            h.fail(format!(
+                "segment {} has no system-audio input despite the self-test selection",
+                seg.index
+            ));
+        }
         for f in &seg.files {
             let critical = f.input == test_key
                 || f.input == native_key
                 || f.input == late_key
-                || (camera_critical && f.input == InputKey::Camera);
+                || (camera_critical && f.input == InputKey::Camera)
+                || (system_audio_expected && f.input == InputKey::SystemAudio);
             let mut problem: Option<String> = None;
             if f.input == silent_key {
                 // P1-6: zero frames is a failure, never a complete (empty) file.
@@ -841,10 +949,10 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
                 if meta == 0 {
                     problem = Some("missing or empty file".into());
                 } else {
-                    let res = if f.input == InputKey::Microphone {
-                        check_audio(&disc, &f.path)
-                    } else {
-                        check_video(&disc, &f.path)
+                    let res = match f.input {
+                        InputKey::Microphone => check_audio(&disc, &f.path),
+                        InputKey::SystemAudio => check_system_audio(&disc, &f.path),
+                        _ => check_video(&disc, &f.path),
                     };
                     match res {
                         Err(e) => problem = Some(e),
@@ -890,7 +998,7 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
                             }
                             // P1-7: every video file starts at segment time zero.
                             let mut frames_json = serde_json::Value::Null;
-                            if f.input != InputKey::Microphone {
+                            if !matches!(f.input, InputKey::Microphone | InputKey::SystemAudio) {
                                 match frame_times(&f.path) {
                                     Ok(frames) => {
                                         let first = frames.first().map_or(u64::MAX, |x| x.0);
@@ -916,6 +1024,7 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
                                 "width": fc.width, "height": fc.height,
                                 "framerate": fc.fps.map(|(n, d)| format!("{n}/{d}")),
                                 "profile": fc.profile, "level": fc.level,
+                                "sample_rate": fc.sample_rate, "channels": fc.channels,
                                 "duration_s": fc.duration.map(|d| d.as_secs_f64()),
                                 "quality": f.quality.as_ref().map(|q| serde_json::json!({
                                     "encoder": q.encoder.map(|e| e.element_name()),
@@ -959,11 +1068,14 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     let manifest_ok = check_manifest(
         &mut h,
         &mut warnings,
-        &session.manifest,
-        &session.dir,
-        test_id.0,
-        mic.is_some(),
-        camera.is_some(),
+        ManifestExpectations {
+            path: &session.manifest,
+            dir: &session.dir,
+            test_id: test_id.0,
+            microphone: mic.is_some(),
+            camera: camera.is_some(),
+            system_audio: system_audio_expected,
+        },
     );
     let _ = manifest_ok;
     check_manifest_extras(&mut h, &session.manifest);
@@ -1060,6 +1172,21 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     let enospc_startup_json =
         run_safety_check("ENOSPC during startup", check_enospc_during_startup, &mut h);
     let mut seg_json = seg_json;
+    let system_audio_check = match system_audio_source {
+        SystemAudioSelfTestSource::Monitor(id) => serde_json::json!({
+            "status": "checked",
+            "source": "PipeWire default-output monitor",
+            "device_id": id.0,
+        }),
+        SystemAudioSelfTestSource::SyntheticTone => serde_json::json!({
+            "status": "checked",
+            "source": "synthetic 440 Hz test tone",
+        }),
+        SystemAudioSelfTestSource::Skipped(reason) => serde_json::json!({
+            "status": "skipped",
+            "reason": reason,
+        }),
+    };
     seg_json.push(serde_json::json!({
         "plan": plan_json,
         "load": load_json,
@@ -1070,6 +1197,7 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         "storage_warnings_and_reserve": reserve_json,
         "enospc_preservation": enospc_json,
         "enospc_startup_preservation": enospc_startup_json,
+        "system_audio": system_audio_check,
     }));
     Ok(summary(
         &h,
@@ -2711,15 +2839,28 @@ fn studio_manifest(path: &Path) -> Result<serde_json::Value, String> {
     serde_json::from_slice(&bytes).map_err(|e| e.to_string())
 }
 
+struct ManifestExpectations<'a> {
+    path: &'a Path,
+    dir: &'a Path,
+    test_id: u32,
+    microphone: bool,
+    camera: bool,
+    system_audio: bool,
+}
+
 fn check_manifest(
     h: &mut Harness,
     warnings: &mut Vec<String>,
-    path: &Path,
-    dir: &Path,
-    test_id: u32,
-    mic: bool,
-    camera: bool,
+    expected: ManifestExpectations<'_>,
 ) -> bool {
+    let ManifestExpectations {
+        path,
+        dir,
+        test_id,
+        microphone: mic,
+        camera,
+        system_audio,
+    } = expected;
     let before = h.errors.len();
     let m = match studio_manifest(path) {
         Ok(m) => m,
@@ -2778,6 +2919,44 @@ fn check_manifest(
                 .find(|i| i["key"] == key && i["status"] == "complete")
                 .and_then(|i| i["first_pts_ns"].as_u64())
         };
+        if system_audio {
+            match inputs.iter().find(|i| i["key"] == "system") {
+                Some(i)
+                    if i["file"] == "system.mkv"
+                        && i["status"] == "complete"
+                        && first("system").is_some() => {}
+                Some(i) => h.fail(format!(
+                    "segment {idx}: system manifest entry is incomplete or malformed: {i}"
+                )),
+                None => h.fail(format!("segment {idx}: no system manifest entry")),
+            }
+            if mic {
+                match (first("mic"), first("system")) {
+                    (Some(mic_pts), Some(system_pts)) => {
+                        let skew = mic_pts.abs_diff(system_pts);
+                        eprintln!(
+                            "selftest: segment {idx} first_pts mic={:.3}s system={:.3}s skew={:.1}ms",
+                            mic_pts as f64 / 1e9,
+                            system_pts as f64 / 1e9,
+                            skew as f64 / 1e6
+                        );
+                        if skew > 20_000_000 {
+                            h.fail(format!(
+                                "segment {idx}: system/mic first_pts skew {:.1} ms > 20 ms",
+                                skew as f64 / 1e6
+                            ));
+                        }
+                    }
+                    (mic_pts, system_pts) => h.fail(format!(
+                        "segment {idx}: system/mic first_pts missing (mic={mic_pts:?}, system={system_pts:?})"
+                    )),
+                }
+            } else {
+                warnings.push(format!(
+                    "segment {idx}: system/mic first_pts comparison skipped: no microphone"
+                ));
+            }
+        }
         if mic {
             match (first(&test_key), first("mic")) {
                 (Some(t), Some(a)) => {
@@ -2855,4 +3034,37 @@ fn summary(
     println!("{out}");
     let _ = Severity::Info;
     ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_audio_selftest_uses_default_monitor_when_available() {
+        assert_eq!(
+            system_audio_selftest_source(true, true, true, true),
+            SystemAudioSelfTestSource::Monitor(DEFAULT_SYSTEM_AUDIO_ID)
+        );
+    }
+
+    #[test]
+    fn system_audio_selftest_uses_tone_only_without_an_output_sink() {
+        assert_eq!(
+            system_audio_selftest_source(false, true, true, true),
+            SystemAudioSelfTestSource::SyntheticTone
+        );
+    }
+
+    #[test]
+    fn system_audio_selftest_reports_missing_sources_as_skipped() {
+        assert_eq!(
+            system_audio_selftest_source(false, true, true, false),
+            SystemAudioSelfTestSource::Skipped("no output sink or audiotestsrc")
+        );
+        assert_eq!(
+            system_audio_selftest_source(true, true, false, true),
+            SystemAudioSelfTestSource::Skipped("Opus/audio elements unavailable")
+        );
+    }
 }

@@ -51,9 +51,9 @@ pub struct ManifestSegment {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ManifestInput {
-    /// "camera" | "mic" | "source:<id>"
+    /// "camera" | "mic" | "system" | "source:<id>"
     pub key: String,
-    /// "camera" | "microphone" | "monitor" | "window" | "virtual" | "test"
+    /// "camera" | "microphone" | "system-audio" | "monitor" | "window" | "virtual" | "test"
     pub kind: String,
     pub label: String,
     pub file: String,

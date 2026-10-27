@@ -3,16 +3,17 @@ use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DeviceId(pub u32);   // engine-assigned, stable for process lifetime (keyed by object.serial / node.name)
+pub const DEFAULT_SYSTEM_AUDIO_ID: DeviceId = DeviceId(0); // reserved synthetic target: current output
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SourceId(pub u32);   // engine-assigned, monotonically increasing, never reused
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CaptureId(pub u32);  // one portal session; may own several SourceIds (shared lifetime)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum InputKey { Camera, Microphone, Source(SourceId) }
+pub enum InputKey { Camera, Microphone, SystemAudio, Source(SourceId) }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeviceKind { Camera, Microphone }
+pub enum DeviceKind { Camera, Microphone, SystemAudio }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DeviceInfo {
@@ -262,9 +263,15 @@ pub struct Snapshot {
     pub capabilities: Capabilities,
     pub cameras: Vec<DeviceInfo>,
     pub microphones: Vec<DeviceInfo>,
+    /// Synthetic Default output option followed by one item per PipeWire output sink.
+    pub system_audio_devices: Vec<DeviceInfo>,
     pub sources: Vec<SourceInfo>,
     pub selected_camera: Option<DeviceId>,
     pub selected_microphone: Option<DeviceId>,
+    /// `None` disables system audio; `DEFAULT_SYSTEM_AUDIO_ID` follows PipeWire's current sink.
+    pub selected_system_audio: Option<DeviceId>,
+    /// Set only by the self-test-only synthetic audio source command.
+    pub system_audio_test_tone: bool,
     pub output_root: PathBuf,
     pub phase: Phase,
     pub portal_busy: bool,              // picker open
@@ -380,6 +387,9 @@ pub enum EngineCommand {
     RefreshDevices,
     SelectCamera(Option<DeviceId>),
     SelectMicrophone(Option<DeviceId>),
+    SelectSystemAudio(Option<DeviceId>), // None disables capture; default output is id 0
+    /// Internal self-test fallback when no PipeWire output sink exists.
+    SelectSystemAudioTestTone,
     AddPortalSources,     // Idle && !portal_busy only
     AddTestSource,
     RemoveSource(SourceId),
@@ -424,4 +434,5 @@ pub enum EngineEvent {
     Snapshot(Box<Snapshot>),             // after EVERY state change; first event is always a Snapshot
     Notice(Notice),
     Level { rms_db: f32, peak_db: f32 }, // mic only, ≤10 Hz, max over channels, while recording
+    SystemAudioLevel { rms_db: f32, peak_db: f32 }, // system audio only, ≤10 Hz
 }
