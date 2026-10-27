@@ -175,6 +175,29 @@ This writes `recording.transcript.json`, `recording.srt` and `recording.vtt` nex
 | `CHINSTRAP_WHISPER_GPU_DEVICE` | Vulkan device index (default 0) |
 | `CHINSTRAP_WHISPER_DEBUG=1` | Show whisper.cpp and ggml logs |
 
+### Home Manager
+
+The flake's `homeModules.default` adds `programs.chinstrap`:
+
+```nix
+{
+  imports = [ inputs.chinstrap.homeModules.default ];
+
+  programs.chinstrap = {
+    enable = true;
+    # Each name becomes CHINSTRAP_<NAME>; true and false become 1 and 0.
+    settings = {
+      whisper_lang = "en";
+      min_free_mb = 4096;
+    };
+    glossary = [ "Rawkode" "Kubernetes" ];
+    replacements."raw code" = "Rawkode";
+  };
+}
+```
+
+`settings` is set in a wrapper around the binary, so it applies however Chinstrap is started. `glossary` and `replacements` write `glossary.txt` and `replacements.txt`; a file written this way is read-only, so the Vocabulary panel refuses to edit it. Leave either empty to keep editing it in the app.
+
 ## Self-test
 
 ```sh

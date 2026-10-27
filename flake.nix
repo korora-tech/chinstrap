@@ -131,6 +131,96 @@
         };
       });
 
+      homeModules = {
+        default = self.homeModules.chinstrap;
+        chinstrap = import ./nix/hm-module.nix self;
+      };
+
+      # Evaluates the Home Manager module against stub options.
+      checks = forAllSystems (
+        pkgs:
+        let
+          inherit (nixpkgs) lib;
+          system = pkgs.stdenv.hostPlatform.system;
+          hmStub = {
+            options = {
+              home.packages = lib.mkOption {
+                type = lib.types.listOf lib.types.package;
+                default = [ ];
+              };
+              assertions = lib.mkOption {
+                type = lib.types.listOf lib.types.attrs;
+                default = [ ];
+              };
+              xdg.configFile = lib.mkOption {
+                type = lib.types.attrsOf (lib.types.attrsOf lib.types.anything);
+                default = { };
+              };
+            };
+          };
+          eval =
+            settings:
+            (lib.evalModules {
+              modules = [
+                hmStub
+                self.homeModules.default
+                {
+                  _module.args.pkgs = pkgs;
+                  programs.chinstrap = settings;
+                }
+              ];
+            }).config;
+          plain = eval { enable = true; };
+          # A stand-in binary, so the wrapper check does not build Chinstrap.
+          stub = pkgs.writeShellScriptBin "chinstrap" "true";
+          full = eval {
+            enable = true;
+            package = stub;
+            settings = {
+              whisper_lang = "en";
+              min_free_mb = 4096;
+              preview = false;
+            };
+            glossary = [
+              "Rawkode"
+              "Kubernetes"
+            ];
+            replacements."raw code" = "Rawkode";
+          };
+          bad = eval {
+            enable = true;
+            glossary = [ "# not a term" ];
+            replacements."a => b" = "c";
+          };
+          checks = [
+            (lib.assertMsg (
+              plain.home.packages == [ self.packages.${system}.default ]
+            ) "installs the package unwrapped without settings")
+            (lib.assertMsg (plain.xdg.configFile == { }) "leaves the vocabulary files alone by default")
+            (lib.assertMsg (lib.all (a: a.assertion) full.assertions) "assertions hold")
+            (lib.assertMsg (
+              lib.length (lib.filter (a: !a.assertion) bad.assertions) == 2
+            ) "invalid vocabulary is refused")
+            (lib.assertMsg (
+              full.xdg.configFile."chinstrap/glossary.txt".text == "Rawkode\nKubernetes\n"
+            ) "writes the glossary")
+            (lib.assertMsg (
+              full.xdg.configFile."chinstrap/replacements.txt".text == "raw code => Rawkode\n"
+            ) "writes the replacement rules")
+          ];
+        in
+        {
+          hm-module = pkgs.runCommand "chinstrap-hm-module-check" { } ''
+            echo ${toString (lib.all lib.id checks)} > $out
+            # The wrapper sets each setting as CHINSTRAP_<NAME>; booleans become 1 or 0.
+            wrapper=${lib.getExe full.programs.chinstrap.finalPackage}
+            grep -q "CHINSTRAP_WHISPER_LANG='en'" $wrapper
+            grep -q "CHINSTRAP_MIN_FREE_MB='4096'" $wrapper
+            grep -q "CHINSTRAP_PREVIEW='0'" $wrapper
+          '';
+        }
+      );
+
       apps = forAllSystems (pkgs: {
         default = {
           type = "app";
