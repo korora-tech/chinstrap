@@ -32,6 +32,7 @@ use super::transcribe::control::{JobKey, ModelEvent, SegView, Transcription, TxC
 use super::transcribe::vocab;
 use super::transcribe::worker::WorkerEvent;
 use super::types::*;
+use crate::control::{ControlStatus, ControlStatusHub};
 
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
@@ -133,6 +134,10 @@ pub(super) struct WorkerResult {
 /// Messages to the engine thread (SPEC §3.2).
 pub(super) enum Msg {
     Cmd(EngineCommand),
+    Request {
+        command: EngineCommand,
+        reply: Arc<CommandReply>,
+    },
     Portal(PortalOutcome),
     Worker(WorkerResult),
     /// Injectable storage failure at the engine event boundary; used only by the self-test.
@@ -159,9 +164,35 @@ pub(super) enum Msg {
     },
 }
 
+pub(super) struct CommandReply {
+    sender: SyncSender<Result<(), String>>,
+    resolved: AtomicBool,
+}
+
+impl CommandReply {
+    fn new(sender: SyncSender<Result<(), String>>) -> Self {
+        Self {
+            sender,
+            resolved: AtomicBool::new(false),
+        }
+    }
+
+    pub(super) fn resolve(&self, result: Result<(), String>) {
+        if !self.resolved.swap(true, Ordering::AcqRel) {
+            let _ = self.sender.send(result);
+        }
+    }
+
+    fn resolve_after_flush(&self, flush: impl FnOnce()) {
+        flush();
+        self.resolve(Ok(()));
+    }
+}
+
 struct Inner {
     tx: mpsc::Sender<Msg>,
     previews: Previews,
+    status: Arc<Mutex<ControlStatusHub>>,
     done: Mutex<Option<bool>>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -183,6 +214,45 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
+    /// Queues a command and returns the engine's actual acceptance or rejection reason.
+    /// Unlike `send`, this waits for the engine thread to process the command.
+    pub fn request(&self, cmd: EngineCommand) -> Result<(), String> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        let reply = Arc::new(CommandReply::new(reply_tx));
+        self.inner
+            .tx
+            .send(Msg::Request {
+                command: cmd,
+                reply,
+            })
+            .map_err(|_| "engine thread is gone".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "engine thread stopped before replying".to_string())?
+    }
+
+    pub fn control_status(&self) -> ControlStatus {
+        self.inner
+            .status
+            .lock()
+            .expect("control status lock")
+            .current()
+    }
+
+    pub(crate) fn subscribe_control_status(
+        &self,
+    ) -> (ControlStatus, std::sync::mpsc::Receiver<ControlStatus>) {
+        self.inner
+            .status
+            .lock()
+            .expect("control status lock")
+            .subscribe()
+    }
+
+    pub fn control_status_json(&self) -> String {
+        self.control_status().to_json()
+    }
+
     /// Never blocks. Logs to stderr if the engine thread is gone.
     pub fn send(&self, cmd: EngineCommand) {
         if let Err(mpsc::SendError(Msg::Cmd(cmd))) = self.inner.tx.send(Msg::Cmd(cmd)) {
@@ -279,9 +349,10 @@ pub fn start(
     let (events_tx, events_rx) = async_channel::unbounded();
     let (tx, rx) = mpsc::channel();
     let previews = Previews::default();
+    let status = Arc::new(Mutex::new(ControlStatusHub::default()));
     let hub = previews.clone();
     let join = if config.fake {
-        fake::spawn(config, rx, events_tx, hub).map_err(EngineError::Spawn)?
+        fake::spawn(config, rx, events_tx, hub, status.clone()).map_err(EngineError::Spawn)?
     } else {
         let portal = if config.enable_portal {
             Some(portal::spawn(tx.clone()).map_err(EngineError::Spawn)?)
@@ -289,18 +360,69 @@ pub fn start(
             None
         };
         let engine_tx = tx.clone();
+        let engine_status = status.clone();
         std::thread::Builder::new()
             .name("chinstrap-engine".into())
-            .spawn(move || Engine::new(config, engine_tx, events_tx, portal, hub).run(rx))
+            .spawn(move || {
+                Engine::new(config, engine_tx, events_tx, portal, hub, engine_status).run(rx)
+            })
             .map_err(EngineError::Spawn)?
     };
     let inner = Arc::new(Inner {
         tx,
         previews,
+        status,
         done: Mutex::new(None),
         join: Mutex::new(Some(join)),
     });
     Ok((EngineHandle { inner }, events_rx))
+}
+
+#[cfg(test)]
+mod request_reply_tests {
+    use super::{CommandReply, ControlStatus, ControlStatusHub};
+    use crate::studio::Phase;
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Instant;
+
+    #[test]
+    fn acknowledged_command_publishes_status_before_reply() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let reply = CommandReply::new(sender);
+        let status = Arc::new(Mutex::new(ControlStatusHub::default()));
+        let status_during_reply = status.clone();
+        let started_at = Instant::now();
+
+        reply.resolve_after_flush(|| {
+            assert!(
+                matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "successful acknowledgement must wait for the status flush"
+            );
+            status
+                .lock()
+                .expect("status lock")
+                .publish(ControlStatus::from_state(
+                    &Phase::Recording {
+                        segment: 1,
+                        started_at,
+                    },
+                    false,
+                    Some(("session", Some(1))),
+                    0,
+                ));
+        });
+
+        receiver.recv().expect("accepted command reply").unwrap();
+        assert_eq!(
+            status_during_reply
+                .lock()
+                .expect("status lock")
+                .current()
+                .phase,
+            "recording",
+            "Status must be current when the command is acknowledged"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -574,6 +696,8 @@ struct Engine {
     phase: Phase,
     portal_busy: bool,
     session: Option<Session>,
+    control_status: Arc<Mutex<ControlStatusHub>>,
+    marker_count: u32,
     portal: Option<(async_channel::Sender<PortalCmd>, JoinHandle<()>)>,
     clock: gst::Clock,
     pipes: Vec<Pipe>,
@@ -611,6 +735,8 @@ struct Engine {
     /// Record was accepted while previews ran: the segment starts from tick() once every
     /// preview pipeline is Null (break-before-make, D4: one consumer per node).
     record_pending: bool,
+    /// Synchronous result slot for the command currently being handled from D-Bus.
+    active_reply: Option<Arc<CommandReply>>,
 }
 
 fn kind_name(kind: SourceKind) -> &'static str {
@@ -759,6 +885,7 @@ impl Engine {
         events: async_channel::Sender<EngineEvent>,
         portal: Option<(async_channel::Sender<PortalCmd>, JoinHandle<()>)>,
         previews: Previews,
+        control_status: Arc<Mutex<ControlStatusHub>>,
     ) -> Self {
         let clock = gst::SystemClock::obtain();
         clock.set_property("clock-type", gst::ClockType::Monotonic);
@@ -921,6 +1048,8 @@ impl Engine {
             phase: Phase::Idle,
             portal_busy: false,
             session: None,
+            control_status,
+            marker_count: 0,
             portal,
             clock,
             pipes: Vec::new(),
@@ -948,6 +1077,7 @@ impl Engine {
             preview_seen: HashMap::new(),
             preview_retry: HashMap::new(),
             record_pending: false,
+            active_reply: None,
         }
     }
 
@@ -1048,6 +1178,9 @@ impl Engine {
 
     fn reject(&self, cmd: &EngineCommand, why: &str) {
         self.notice(Severity::Warning, None, format!("Rejected {cmd:?}: {why}"));
+        if let Some(reply) = &self.active_reply {
+            reply.resolve(Err(why.to_string()));
+        }
     }
 
     fn snapshot(&mut self) {
@@ -1071,6 +1204,7 @@ impl Engine {
             selected_microphone: self.selected_microphone,
             output_root: self.output_root.clone(),
             phase: self.phase.clone(),
+            record_pending: self.record_pending,
             portal_busy: self.portal_busy,
             session: self.session.as_ref().map(|s| SessionSummary {
                 name: s.name.clone(),
@@ -1112,9 +1246,30 @@ impl Engine {
                 .filter_map(|k| self.preview_state.get(&k).map(|s| (k, s.clone())))
                 .collect(),
         };
+        self.publish_control_status();
         let _ = self
             .events
             .send_blocking(EngineEvent::Snapshot(Box::new(snap)));
+    }
+
+    fn set_phase(&mut self, phase: Phase) {
+        self.phase = phase;
+        self.publish_control_status();
+    }
+
+    fn publish_control_status(&self) {
+        let session = self.session.as_ref().map(|session| {
+            (
+                session.name.as_str(),
+                session.segs.last().map(|segment| segment.index),
+            )
+        });
+        let status =
+            ControlStatus::from_state(&self.phase, self.record_pending, session, self.marker_count);
+        self.control_status
+            .lock()
+            .expect("control status lock")
+            .publish(status);
     }
 
     fn flush(&mut self) {
@@ -1342,6 +1497,7 @@ impl Engine {
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::Cmd(cmd) => self.command(cmd),
+            Msg::Request { command, reply } => self.command_with_reply(command, reply),
             Msg::Portal(outcome) => self.portal_outcome(outcome),
             Msg::Worker(w) => self.worker_result(w),
             Msg::SelftestNoSpace { key } => {
@@ -1378,6 +1534,13 @@ impl Engine {
             Msg::RecoveryDone { name, dir, result } => self.recovery_done(name, dir, result),
             Msg::Shutdown { deadline, ack } => self.begin_shutdown(deadline, Some(ack)),
         }
+    }
+
+    fn command_with_reply(&mut self, cmd: EngineCommand, reply: Arc<CommandReply>) {
+        self.active_reply = Some(reply.clone());
+        self.command(cmd);
+        self.active_reply = None;
+        reply.resolve_after_flush(|| self.flush());
     }
 
     fn command(&mut self, cmd: EngineCommand) {
@@ -1577,6 +1740,8 @@ impl Engine {
                     }
                     self.release_session_reserve(Severity::Warning);
                     self.session = None;
+                    self.marker_count = 0;
+                    self.publish_control_status();
                     // Its transcription jobs keep running (§12.3 policy 11).
                     self.transcription.set_session(None);
                     self.dirty = true;
@@ -1594,6 +1759,15 @@ impl Engine {
                 _ => self.reject(&cmd, "the engine is busy"),
             },
             EngineCommand::Cut => self.cut(&cmd),
+            EngineCommand::AddMarker(_label) => {
+                if matches!(self.phase, Phase::Recording { .. }) {
+                    self.marker_count = self.marker_count.saturating_add(1);
+                    self.publish_control_status();
+                    self.dirty = true;
+                } else {
+                    self.reject(&cmd, "not recording");
+                }
+            }
             EngineCommand::DownloadModel
             | EngineCommand::CancelModelDownload
             | EngineCommand::SetAutoTranscribe(_)
@@ -1833,26 +2007,23 @@ impl Engine {
         // the segment once they are all Null.
         if self.pipes.iter().any(|p| p.is_preview() && !p.abandoned) {
             self.record_pending = true;
+            self.publish_control_status();
             self.stop_previews();
             self.dirty = true;
             return;
         }
-        self.begin_recording();
+        if let Err(why) = self.begin_recording() {
+            self.reject(cmd, &why);
+        }
     }
 
     /// Record, once nothing else uses the inputs: opens the session if needed and starts a
     /// segment with the frozen input set.
-    fn begin_recording(&mut self) {
+    fn begin_recording(&mut self) -> Result<(), String> {
         self.refresh_storage();
         if let Some(why) = self.storage.record_blocked_reason.clone() {
             self.record_pending = false;
-            self.notice(
-                Severity::Error,
-                None,
-                format!("Recording did not start: {why}"),
-            );
-            self.dirty = true;
-            return;
+            return Err(why);
         }
         if self.session.is_none() {
             match session::create_session_dir(&self.output_root, &session::session_name_now()) {
@@ -1861,12 +2032,7 @@ impl Engine {
                         Ok(lock) => lock,
                         Err(e) => {
                             let _ = std::fs::remove_dir(&dir);
-                            self.notice(
-                                Severity::Error,
-                                None,
-                                format!("Cannot lock the new recording session: {e}"),
-                            );
-                            return;
+                            return Err(format!("Cannot lock the new recording session: {e}"));
                         }
                     };
                     let reserve = match storage::create_emergency_reserve(
@@ -1877,14 +2043,10 @@ impl Engine {
                         Err(e) => {
                             drop(lock);
                             let _ = std::fs::remove_dir_all(&dir);
-                            self.notice(
-                                Severity::Error,
-                                None,
-                                format!("Cannot reserve emergency stop space: {e}"),
-                            );
-                            return;
+                            return Err(format!("Cannot reserve emergency stop space: {e}"));
                         }
                     };
+                    self.marker_count = 0;
                     self.transcription.set_session(Some(dir.clone()));
                     self.session = Some(Session {
                         name,
@@ -1895,18 +2057,14 @@ impl Engine {
                         segs: Vec::new(),
                     });
                     self.storage_warning_level = 0;
+                    self.publish_control_status();
                     self.write_manifest();
                 }
                 Err(e) => {
-                    self.notice(
-                        Severity::Error,
-                        None,
-                        format!(
-                            "Cannot create a session in {}: {e}",
-                            self.output_root.display()
-                        ),
-                    );
-                    return;
+                    return Err(format!(
+                        "Cannot create a session in {}: {e}",
+                        self.output_root.display()
+                    ));
                 }
             }
         }
@@ -1917,12 +2075,7 @@ impl Engine {
             {
                 Ok(path) => session.reserve_path = Some(path),
                 Err(e) => {
-                    self.notice(
-                        Severity::Error,
-                        None,
-                        format!("Cannot reserve emergency stop space: {e}"),
-                    );
-                    return;
+                    return Err(format!("Cannot reserve emergency stop space: {e}"));
                 }
             }
         }
@@ -1938,12 +2091,9 @@ impl Engine {
             );
         }
         if inputs.is_empty() {
-            self.notice(
-                Severity::Error,
-                None,
-                "Recording did not start: every input is still held by a preview that did not stop",
+            return Err(
+                "every input is still held by a preview that did not stop".to_string(),
             );
-            return;
         }
         if self.selected_camera.is_some() && !inputs.contains(&InputKey::Camera) {
             self.notice(
@@ -1959,7 +2109,7 @@ impl Engine {
                 "The selected microphone cannot record; recording without it",
             );
         }
-        self.start_segment(inputs, None);
+        self.start_segment(inputs, None)
     }
 
     fn stop(&mut self, cmd: &EngineCommand) {
@@ -1972,7 +2122,7 @@ impl Engine {
             return;
         };
         self.finalize_segment(segment);
-        self.phase = Phase::Stopping { segment };
+        self.set_phase(Phase::Stopping { segment });
         self.dirty = true;
     }
 
@@ -1988,7 +2138,7 @@ impl Engine {
         };
         self.finalize_segment(segment);
         self.cut_pending = true;
-        self.phase = Phase::Cutting { from: segment };
+        self.set_phase(Phase::Cutting { from: segment });
         self.dirty = true;
     }
 
@@ -1999,25 +2149,23 @@ impl Engine {
         }
     }
 
-    /// Builds the pipelines of a new segment and starts them (§5.1). Returns false if nothing
-    /// could be started (the engine is then Idle).
-    fn start_segment(&mut self, inputs: Vec<InputKey>, gap_from: Option<u64>) {
+    /// Builds the pipelines of a new segment and starts them (§5.1).
+    fn start_segment(
+        &mut self,
+        inputs: Vec<InputKey>,
+        gap_from: Option<u64>,
+    ) -> Result<(), String> {
         let Some(sess) = &self.session else {
-            return;
+            return Err("no recording session is open".into());
         };
         let index = sess.segs.len() as u32 + 1;
         let session_lock = sess._lock.clone();
         let dir = match session::create_segment_dir(&sess.dir, index) {
             Ok(d) => d,
             Err(e) => {
-                self.notice(
-                    Severity::Error,
-                    None,
-                    format!("Cannot create segment directory: {e}"),
-                );
-                self.phase = Phase::Idle;
+                self.set_phase(Phase::Idle);
                 self.dirty = true;
-                return;
+                return Err(format!("Cannot create segment directory: {e}"));
             }
         };
         let enc = self.caps.h264_encoder;
@@ -2176,7 +2324,7 @@ impl Engine {
         if let Some(s) = self.session.as_mut() {
             s.segs.push(seg);
         }
-        self.phase = Phase::Starting { segment: index };
+        self.set_phase(Phase::Starting { segment: index });
         self.dirty = true;
         self.manifest_dirty = true;
         let pending_gap = gap_from;
@@ -2208,6 +2356,7 @@ impl Engine {
             self.spawn_state(id, pipeline, gst::State::Paused);
         }
         self.gap_from = pending_gap;
+        Ok(())
     }
 
     /// What each video input among `inputs` needs (the capacity plan's input).
@@ -3001,10 +3150,10 @@ impl Engine {
                                     .and_then(|s| s.segs.iter().find(|g| g.index == seg))
                                     .and_then(|g| g.started_at)
                                     .unwrap_or_else(Instant::now);
-                                self.phase = Phase::Recording {
+                                self.set_phase(Phase::Recording {
                                     segment,
                                     started_at,
-                                };
+                                });
                                 self.dirty = true;
                             }
                         }
@@ -3662,6 +3811,7 @@ impl Engine {
     /// idle previews come back.
     fn cancel_pending_record(&mut self) {
         self.record_pending = false;
+        self.publish_control_status();
         self.dirty = true;
     }
 
@@ -3679,9 +3829,16 @@ impl Engine {
             return;
         }
         self.record_pending = false;
+        self.publish_control_status();
         self.dirty = true;
         if self.can_record() {
-            self.begin_recording();
+            if let Err(why) = self.begin_recording() {
+                self.notice(
+                    Severity::Error,
+                    None,
+                    format!("Recording did not start: {why}"),
+                );
+            }
         } else {
             self.notice(
                 Severity::Warning,
@@ -4039,7 +4196,7 @@ impl Engine {
                     });
                 if all_failed {
                     self.finalize_segment(segment);
-                    self.phase = Phase::Stopping { segment };
+                    self.set_phase(Phase::Stopping { segment });
                     self.dirty = true;
                 }
             }
@@ -4142,13 +4299,20 @@ impl Engine {
         if !continue_cut {
             self.release_session_reserve(Severity::Warning);
         }
-        self.phase = Phase::Idle;
+        self.set_phase(Phase::Idle);
         if cut && self.shutdown.is_none() {
             if next.is_empty() {
                 self.notice(Severity::Warning, None, "Cut: no inputs left to record");
             } else {
                 self.write_manifest();
-                self.start_segment(next, stop_ns);
+                if let Err(why) = self.start_segment(next, stop_ns) {
+                    self.notice(
+                        Severity::Error,
+                        None,
+                        format!("Recording did not start: {why}"),
+                    );
+                    self.dirty = true;
+                }
             }
         }
     }
@@ -4321,6 +4485,7 @@ impl Engine {
         }
         // Stop probes and previews; their results no longer matter.
         self.record_pending = false;
+        self.publish_control_status();
         let probes: Vec<u64> = self
             .pipes
             .iter()
@@ -4335,12 +4500,12 @@ impl Engine {
             Phase::Idle => {}
             Phase::Recording { segment, .. } => {
                 self.finalize_segment(segment);
-                self.phase = Phase::Stopping { segment };
+                self.set_phase(Phase::Stopping { segment });
             }
             Phase::Starting { segment } => {
                 // Abandon what has not started; finalize what has.
                 self.finalize_segment(segment);
-                self.phase = Phase::Stopping { segment };
+                self.set_phase(Phase::Stopping { segment });
             }
             Phase::Cutting { .. } | Phase::Stopping { .. } => {
                 // Shorten every wait to the shutdown deadline.
@@ -4454,7 +4619,7 @@ impl Engine {
         for lock in live_session_locks {
             retain_session_lock_until_process_exit(lock);
         }
-        self.phase = Phase::Idle;
+        self.set_phase(Phase::Idle);
         self.release_session_reserve(Severity::Warning);
         self.write_manifest();
         self.snapshot();
@@ -4781,6 +4946,8 @@ mod tests {
             },
             portal_busy: false,
             session: Some(session),
+            control_status: Arc::new(Mutex::new(ControlStatusHub::default())),
+            marker_count: 0,
             portal: None,
             clock: gst::SystemClock::obtain(),
             pipes: vec![camera, microphone],
@@ -4808,6 +4975,7 @@ mod tests {
             preview_seen: HashMap::new(),
             preview_retry: HashMap::new(),
             record_pending: false,
+            active_reply: None,
         };
         (engine, camera_path)
     }
@@ -4823,6 +4991,82 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    fn add_recordable_test_source(engine: &mut Engine) {
+        engine.caps.h264_encoder = Some(VideoEncoder::X264);
+        engine.sources.push(Source {
+            info: SourceInfo {
+                id: SourceId(999),
+                capture: None,
+                kind: SourceKind::TestPattern,
+                label: "Test pattern 999".into(),
+                logical_size: Some((1280, 720)),
+                state: SourceState::Ready,
+                frame_rate: FrameRateMode::Cfr30,
+                refresh: Some((30, 1)),
+                size: Some((1280, 720)),
+            },
+            node: None,
+            convert: None,
+            gl_retry: false,
+        });
+    }
+
+    #[test]
+    fn record_reply_rejects_session_directory_creation_failure() {
+        let root = storage_test_root("record-session-dir-error");
+        let blocker = root.join("not-a-directory");
+        std::fs::write(&blocker, b"file blocks output directory").unwrap();
+        let (mut engine, _) = storage_test_engine(&root, false);
+        engine.pipes.clear();
+        engine.session.take();
+        engine.phase = Phase::Idle;
+        engine.output_root = blocker;
+        add_recordable_test_source(&mut engine);
+        let (sender, receiver) = mpsc::sync_channel(1);
+
+        engine.command_with_reply(
+            EngineCommand::Record,
+            Arc::new(CommandReply::new(sender)),
+        );
+
+        let result = receiver.recv().expect("record command reply");
+        assert!(
+            matches!(result, Err(ref why) if why.contains("Cannot create a session")),
+            "failed session creation must reject Record, got {result:?}"
+        );
+        engine.devices.stop();
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn record_reply_rejects_segment_directory_creation_failure() {
+        let root = storage_test_root("record-segment-dir-error");
+        let session_dir = root.join("session");
+        let blocker = session_dir.join("segment-002");
+        let (mut engine, _) = storage_test_engine(&root, false);
+        std::fs::write(&blocker, b"file blocks segment directory").unwrap();
+        engine.pipes.clear();
+        engine.phase = Phase::Idle;
+        engine.session.as_mut().unwrap().reserve_path = Some(root.join("stop-reserve"));
+        add_recordable_test_source(&mut engine);
+        let (sender, receiver) = mpsc::sync_channel(1);
+
+        engine.command_with_reply(
+            EngineCommand::Record,
+            Arc::new(CommandReply::new(sender)),
+        );
+
+        let result = receiver.recv().expect("record command reply");
+        assert!(
+            matches!(result, Err(ref why) if why.contains("Cannot create segment directory")),
+            "failed segment creation must reject Record, got {result:?}"
+        );
+        engine.devices.stop();
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

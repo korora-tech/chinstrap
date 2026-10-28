@@ -267,6 +267,8 @@ pub struct Snapshot {
     pub selected_microphone: Option<DeviceId>,
     pub output_root: PathBuf,
     pub phase: Phase,
+    /// Record was accepted, but idle preview pipelines are still stopping.
+    pub record_pending: bool,
     pub portal_busy: bool,              // picker open
     pub session: Option<SessionSummary>,
     /// Computed by the engine: Idle && !portal_busy && no source Checking && >=1 selected input
@@ -388,6 +390,7 @@ pub enum EngineCommand {
     Stop,
     ToggleRecord,         // Record if Idle, Stop if Recording, else rejected
     Cut,
+    AddMarker(String),    // In-memory issue #9 control path; persistence belongs to issue #10
     EndSession,           // Idle only
     RecoverSession { name: String },
     ShowSessionFolder { name: String },

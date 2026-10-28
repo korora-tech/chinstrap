@@ -19,16 +19,18 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use gstreamer as gst;
 use gstreamer_pbutils as pbutils;
 use gstreamer_pbutils::prelude::*;
 
+use crate::control::{Acquisition, ControlOwner, PortalStatus};
 use crate::studio::{
-    self, EngineCommand, EngineEvent, FrameRateMode, InputKey, InputStatus, ModelState, Phase,
-    PreviewOrigin, Previews, SegmentStatus, Severity, Snapshot, SourceId, SourceKind, SourceState,
-    TestBehaviour, TranscriptStatus,
+    self, EngineCommand, EngineEvent, EngineHandle, FrameRateMode, InputKey, InputStatus,
+    ModelState, Phase, PreviewOrigin, Previews, SegmentStatus, Severity, Snapshot, SourceId,
+    SourceKind, SourceState, TestBehaviour, TranscriptStatus,
 };
 
 const DURATION_TOLERANCE: Duration = Duration::from_millis(600);
@@ -428,6 +430,67 @@ fn check_vfr(frames: &[(u64, bool)], end_ns: u64) -> Result<serde_json::Value, S
     Ok(json)
 }
 
+fn ctl_process(args: &[&str]) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let status = Command::new(executable)
+        .arg("ctl")
+        .args(args)
+        .status()
+        .map_err(|error| format!("cannot start chinstrap ctl: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "chinstrap ctl exited with status {}",
+            status.code().unwrap_or(-1)
+        ))
+    }
+}
+
+fn ctl_or_engine_command(
+    owner: Option<&ControlOwner>,
+    args: &[&str],
+    command: EngineCommand,
+    engine: &EngineHandle,
+    harness: &mut Harness,
+) {
+    if owner.is_some() {
+        if let Err(error) = ctl_process(args) {
+            harness.fail(format!("ctl {}: {error}", args.join(" ")));
+            engine.send(command);
+        }
+    } else {
+        engine.send(command);
+    }
+}
+
+fn portal_check_skip(owner: &ControlOwner) -> Option<String> {
+    let control = owner.handle();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match control.portal_status() {
+            PortalStatus::Checking => {
+                if Instant::now() >= deadline {
+                    return Some(
+                        "skipped: GlobalShortcuts portal check (discovery timed out)".into(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            PortalStatus::Available => {
+                return Some(
+                    "skipped: GlobalShortcuts binding check (desktop confirmation is interactive)"
+                        .into(),
+                );
+            }
+            PortalStatus::Unavailable { reason } | PortalStatus::Failed { reason } => {
+                return Some(format!("skipped: GlobalShortcuts portal check ({reason})"));
+            }
+            PortalStatus::Configuring | PortalStatus::Enabled { .. } => return None,
+        }
+    }
+}
+
 pub fn run(dir: &Path) -> i32 {
     match run_inner(dir) {
         Ok(ok) => i32::from(!ok),
@@ -549,7 +612,29 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     ];
     let load_config = config.clone();
     let preview_on = config.preview;
+    let mut warnings: Vec<String> = Vec::new();
+    let (mut control_owner, control_skip) = match ControlOwner::acquire_for_selftest() {
+        Ok(Acquisition::Owner(owner)) => (Some(owner), None),
+        Ok(Acquisition::AlreadyRunning) => {
+            return Err("cannot run --selftest while another Chinstrap instance is running".into());
+        }
+        Err(error) => (None, Some(error)),
+    };
+    if let Some(reason) = &control_skip {
+        warnings.push(format!(
+            "skipped: chinstrap ctl checks (session bus unavailable: {reason})"
+        ));
+        warnings.push(format!(
+            "skipped: GlobalShortcuts portal check (session bus unavailable: {reason})"
+        ));
+    }
     let (engine, rx) = studio::start(config).map_err(|e: studio::EngineError| e.to_string())?;
+    if let Some(owner) = &mut control_owner {
+        owner.attach_engine(engine.clone())?;
+        if let Some(skip) = portal_check_skip(owner) {
+            warnings.push(skip);
+        }
+    }
     let previews = engine.previews();
     let mut h = Harness {
         rx,
@@ -558,7 +643,6 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         errors: Vec::new(),
         notices: Vec::new(),
     };
-    let mut warnings: Vec<String> = Vec::new();
 
     // 1. Capabilities.
     let first = h
@@ -712,8 +796,15 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         );
         previews_json = serde_json::json!({ "idle": idle });
     }
-    // P1-6: a recording window with no frame yet says so.
-    engine.send(EngineCommand::Record);
+    // P1-6: a recording window with no frame yet says so. Use the real ctl path when the session
+    // bus is available so this also exercises control from outside the GUI process.
+    ctl_or_engine_command(
+        control_owner.as_ref(),
+        &["toggle"],
+        EngineCommand::Record,
+        &engine,
+        &mut h,
+    );
     let waiting = h.wait_for(Duration::from_secs(15), |s| {
         s.session.as_ref().is_some_and(|x| {
             x.segments.iter().any(|g| {
@@ -757,7 +848,13 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     }
 
     // 4. Cut.
-    engine.send(EngineCommand::Cut);
+    ctl_or_engine_command(
+        control_owner.as_ref(),
+        &["cut"],
+        EngineCommand::Cut,
+        &engine,
+        &mut h,
+    );
     h.wait_for(Duration::from_secs(20), |s| {
         matches!(s.phase, Phase::Recording { segment: 2, .. })
     })
@@ -765,7 +862,13 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     h.sleep(Duration::from_secs(3));
 
     // 5. Stop.
-    engine.send(EngineCommand::Stop);
+    ctl_or_engine_command(
+        control_owner.as_ref(),
+        &["stop"],
+        EngineCommand::Stop,
+        &engine,
+        &mut h,
+    );
     let done = h
         .wait_for(Duration::from_secs(20), |s| s.phase == Phase::Idle)
         .ok_or("Stop never reached Idle")?;

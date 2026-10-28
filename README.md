@@ -28,6 +28,53 @@ The dev shell provides the Rust toolchain, GPUI's native dependencies and the GS
 
 Use the panel to pick a camera and a microphone. **Add windows/screens…** opens the portal picker, and **Add test pattern** adds a synthetic source.
 
+## Control from outside
+
+The GUI owns `tech.korora.Chinstrap` on the session D-Bus. `chinstrap ctl` talks to the running instance; it never starts the GUI:
+
+```sh
+chinstrap ctl toggle          # start recording, or stop it if recording
+chinstrap ctl record
+chinstrap ctl cut
+chinstrap ctl stop
+chinstrap ctl marker "Chapter 1"
+chinstrap ctl end             # close the current session
+chinstrap ctl status
+chinstrap ctl status --json   # one-line JSON: phase, session, segment, elapsed_ms, markers
+```
+
+Commands exit 0 when accepted, 1 when the engine rejects them (the reason is printed to stderr), and 2 when Chinstrap is not running. A second plain `chinstrap` launch asks the desktop to activate the existing window instead of starting another capture engine. On Wayland, the compositor may show attention rather than transfer focus.
+
+Use any compositor binding to call `chinstrap ctl`, for example:
+
+```text
+# niri
+Mod+Shift+R { spawn "chinstrap" "ctl" "toggle"; }
+Mod+Shift+C { spawn "chinstrap" "ctl" "cut"; }
+Mod+Shift+S { spawn "chinstrap" "ctl" "stop"; }
+
+# Sway
+bindsym $mod+Shift+r exec chinstrap ctl toggle
+bindsym $mod+Shift+c exec chinstrap ctl cut
+bindsym $mod+Shift+s exec chinstrap ctl stop
+
+# Hyprland
+bind = $mainMod SHIFT, R, exec, chinstrap ctl toggle
+bind = $mainMod SHIFT, C, exec, chinstrap ctl cut
+bind = $mainMod SHIFT, S, exec, chinstrap ctl stop
+```
+
+The Studio header's **Global hotkeys** control opens the desktop's GlobalShortcuts dialog when supported. The desktop reports the triggers it bound; on desktops without the portal the header says: “Not available on this desktop. Use `chinstrap ctl` with a compositor keybinding.” Portal shortcuts are Toggle recording, Cut, Add marker and Stop. They are off until explicitly enabled, because enabling them opens a system dialog.
+
+D-Bus interface: bus name `tech.korora.Chinstrap`, object `/tech/korora/Chinstrap`, interface `tech.korora.Chinstrap.Control1`. Methods are `ToggleRecord()`, `Record()`, `Stop()`, `Cut()`, `AddMarker(s label)`, `EndSession()`, `Status() -> s` (JSON), `Raise()`, and `EnableGlobalShortcuts() -> s`. `StatusChanged(s status_json)` is emitted when the phase, session, segment or marker count changes. For example:
+
+```sh
+busctl --user call tech.korora.Chinstrap /tech/korora/Chinstrap \
+  tech.korora.Chinstrap.Control1 ToggleRecord
+busctl --user call tech.korora.Chinstrap /tech/korora/Chinstrap \
+  tech.korora.Chinstrap.Control1 AddMarker s "Chapter 1"
+```
+
 ### Studio panels
 
 - **Preview.** A live tile (about 15 fps, at most 480×300) for the selected camera and every window, screen and test pattern, so you can see what each file will show. While idle each input has its own small preview pipeline; pressing **Record** stops those first (only one reader per PipeWire node), and while recording the frames come from a branch of the recording pipeline itself, framed in red. A preview that fails says why on its tile and is retried; it never stops or fails a recording, and the recording branch accepts whatever format the recording negotiates (a format it cannot show only stops the tile). Because the camera's idle preview closes the camera before Record reopens it, a camera that sends damaged frames just after it is opened (the ILCE-7CM2 does, see below) starts each camera file with a few dropped and repeated frames; this has not been measured with previews on. Pressing **Stop** (or the shortcut again) while the previews are stopping cancels the Record. `CHINSTRAP_PREVIEW=0` turns previews off.
@@ -195,6 +242,8 @@ The self-test runs the real engine without the portal: a test pattern, the first
 - Storage safety checks include injected ENOSPC during startup and after media has been written. The latter verifies each preserved peer with Discoverer, Matroska Cues/Duration checks and video decoding; microphone audio is checked for Opus discovery, decoding, and indexing when a usable microphone is present. Startup files that cannot be finalized must remain listed as recovery candidates.
 - The SIGKILL/recovery check measures last persisted video frame to kill (must be no more than 2 s in this test), remuxes the file, and verifies playback/indexing. If a microphone is selected, it also checks the recovered audio stream. Handled `SIGINT`, `SIGTERM` and `SIGHUP` checks require terminal manifest states and playable/indexed files for every input.
 - The injected ENOSPC scenarios exercise the engine event seam only: they do not fill a filesystem, mount a constrained volume, or verify behavior of real storage hardware.
+- When a session bus is available, `chinstrap ctl toggle`, `cut` and `stop` drive the test recording through the same D-Bus service as the GUI. If there is no session bus, this control check is reported as skipped.
+- The GlobalShortcuts portal is checked without opening its confirmation dialog; the portal check reports `skipped: …` when the portal is unavailable (binding shortcuts requires an interactive desktop).
 - Previews: test patterns 1-3 deliver at least 5 opaque, non-blank frames within 480×300 in 3 s while idle, and from the recording pipelines (at least 8 fps) while recording; the pattern that never draws delivers none; idle previews come back after Stop. Skipped with `CHINSTRAP_PREVIEW=0`, which also lets you compare the dropped and repeated frame counts with and without previews.
 
 When the Whisper model is already downloaded, the self-test also transcribes segment 1's microphone file through the worker process and checks `transcript.json`, the SRT and VTT files, and the manifest status. A quiet room should give 0 words; anything else is reported as a warning. Without the model this check is skipped with a warning, unless `CHINSTRAP_SELFTEST_REQUIRE_MODEL=1`. `CHINSTRAP_SELFTEST_SPEECH=<file.mkv>:<reference.txt>` also transcribes a known recording and fails if the word error rate is above 10%.
