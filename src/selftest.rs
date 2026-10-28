@@ -702,9 +702,23 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         targeting_json = check_targeting(&mut h, &mut warnings, want_camera.as_deref());
     }
     engine.send(EngineCommand::SelectCamera(camera));
-    let mic = first.microphones.first().map(|m| m.id);
+    let mic = if let Some(want) = std::env::var("CHINSTRAP_SELFTEST_MICROPHONE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let found = first.microphones.iter().find(|m| {
+            m.unsupported.is_none() && m.name.to_lowercase().contains(&want.to_lowercase())
+        });
+        let Some(found) = found else {
+            engine.shutdown_blocking(Duration::from_secs(5));
+            return Err(format!("no usable microphone matching {want:?}"));
+        };
+        Some(found.id)
+    } else {
+        first.microphones.first().map(|m| m.id)
+    };
     engine.send(EngineCommand::SelectMicrophone(mic));
-    let system_audio_source = system_audio_selftest_source(
+    let mut system_audio_source = system_audio_selftest_source(
         first
             .system_audio_devices
             .iter()
@@ -719,6 +733,21 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
         ),
         gst::ElementFactory::find("audiotestsrc").is_some(),
     );
+    if let Some(want) = std::env::var("CHINSTRAP_SELFTEST_SYSTEM_OUTPUT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        let selected = first.system_audio_devices.iter().find(|d| {
+            d.id != DEFAULT_SYSTEM_AUDIO_ID
+                && d.unsupported.is_none()
+                && d.name.to_lowercase().contains(&want.to_lowercase())
+        });
+        let Some(selected) = selected else {
+            engine.shutdown_blocking(Duration::from_secs(5));
+            return Err(format!("no usable system-audio output matching {want:?}"));
+        };
+        system_audio_source = SystemAudioSelfTestSource::Monitor(selected.id);
+    }
     match system_audio_source {
         SystemAudioSelfTestSource::Monitor(id) => {
             engine.send(EngineCommand::SelectSystemAudio(Some(id)));
@@ -1175,12 +1204,14 @@ fn run_inner(dir: &Path) -> Result<bool, String> {
     let system_audio_check = match system_audio_source {
         SystemAudioSelfTestSource::Monitor(id) => serde_json::json!({
             "status": "checked",
-            "source": "PipeWire default-output monitor",
+            "source": if id == DEFAULT_SYSTEM_AUDIO_ID { "PipeWire default-output monitor" } else { "PipeWire selected-output monitor" },
             "device_id": id.0,
+            "content_sync": "skipped: no shared reference signal",
         }),
         SystemAudioSelfTestSource::SyntheticTone => serde_json::json!({
             "status": "checked",
             "source": "synthetic 440 Hz test tone",
+            "content_sync": "skipped: no shared reference signal",
         }),
         SystemAudioSelfTestSource::Skipped(reason) => serde_json::json!({
             "status": "skipped",
@@ -2933,19 +2964,11 @@ fn check_manifest(
             if mic {
                 match (first("mic"), first("system")) {
                     (Some(mic_pts), Some(system_pts)) => {
-                        let skew = mic_pts.abs_diff(system_pts);
                         eprintln!(
-                            "selftest: segment {idx} first_pts mic={:.3}s system={:.3}s skew={:.1}ms",
+                            "selftest: segment {idx} first_pts mic={:.3}s system={:.3}s (startup offsets; content synchronization not measured)",
                             mic_pts as f64 / 1e9,
-                            system_pts as f64 / 1e9,
-                            skew as f64 / 1e6
+                            system_pts as f64 / 1e9
                         );
-                        if skew > 20_000_000 {
-                            h.fail(format!(
-                                "segment {idx}: system/mic first_pts skew {:.1} ms > 20 ms",
-                                skew as f64 / 1e6
-                            ));
-                        }
                     }
                     (mic_pts, system_pts) => h.fail(format!(
                         "segment {idx}: system/mic first_pts missing (mic={mic_pts:?}, system={system_pts:?})"

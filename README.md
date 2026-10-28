@@ -191,7 +191,7 @@ The self-test runs the real engine without the portal: a test pattern, the first
 - The test file keeps the size of its first frame, even after the selftest renegotiates it to a different size.
 - File durations are within 0.6 s of the segment's duration.
 - The microphone and test pattern start within 100 ms of each other.
-- System audio is a complete `system.mkv` Opus track at 48 kHz stereo in both segments, with a manifest entry and `first_pts_ns` within 20 ms of the microphone when a mic is available.
+- System audio is a complete `system.mkv` Opus track at 48 kHz stereo in both segments, with a manifest entry. The microphone and system-audio first timestamps are reported as startup offsets, not as a measurement of content synchronization.
 - The gap between segments is under 1.5 s.
 - The manifest matches the files on disk.
 - Files are finalized on quit.
@@ -206,6 +206,8 @@ These variables change the test:
 
 - `CHINSTRAP_TEST_SIZE=WxH` sets the test pattern's size.
 - `CHINSTRAP_SELFTEST_CAMERA=<name substring>` picks a specific camera. Its file must then be H.264 at the camera's native size and rate. The test also checks that PipeWire links that camera's node rather than the default source. A second run then records that camera next to two 4K test windows for `CHINSTRAP_SELFTEST_LOAD_SECS` (default 60) and fails if 1% or more of the camera's frames are repeats, counted over the whole recording both by the quality counters and by comparing consecutive frames. The windows are Native with a 144 Hz refresh, the app's default; `CHINSTRAP_SELFTEST_LOAD_MODE=30` or `60` records them at a constant rate instead. The plan the engine chose is in the JSON output.
+- `CHINSTRAP_SELFTEST_SYSTEM_OUTPUT=<name substring>` records a specific output instead of the default output. An unknown or unsupported output fails the self-test instead of silently falling back.
+- `CHINSTRAP_SELFTEST_MICROPHONE=<name substring>` selects a specific microphone for the self-test. An unknown or unsupported microphone fails the test.
 - `CHINSTRAP_SELFTEST_LOAD=standin` runs the same load test without a camera, with a third 4K test pattern at 30 fps in its place. It also fails when a Native window's bytes per frame are not within 2× of that constant-rate pattern's.
 
 The self-test also checks PipeWire targeting whenever PipeWire is reachable:
@@ -226,6 +228,8 @@ These have been checked on one machine: NixOS, niri, PipeWire 1.6.9 and WirePlum
 - The original three self-tests above passed in an earlier run.
 - The synthetic system-audio pipeline test writes a stereo 48 kHz Opus Matroska file and checks its first PTS.
 - A PipeWire 1.6.9 `pipewiresrc` probe: an explicit sink `object.serial` and an unset target both linked to the selected sink's live `monitor_FL`/`monitor_FR` ports; this verified routing, not captured audio content.
+- A 997 Hz tone played into a temporary PipeWire virtual output was present in `system.mkv` on both sides of a Cut and absent from the microphone file at that frequency. Both system tracks decoded as stereo 48 kHz Opus.
+- In a separate test, the same pulses reached `system.mkv` through that output's monitor and `mic.mkv` through a remapped virtual source. After the manifest offsets, pulse onsets in the microphone file were 42 ms later in both segments. The extra routing hop may contribute latency, so this is not a measurement of physical microphone synchronization.
 - The PipeWire targeting checks, against a Sony ILCE-7CM2 recording 3840×2160 at 25 fps, H.264 High at level 5.1.
 
 These have not been checked:
@@ -237,10 +241,11 @@ These have not been checked:
 - MJPEG and DMA-BUF cameras at 4K, and camera frame rates above 30 fps.
 - Long recordings.
 - A hard upper bound on actual frame loss during SIGKILL, power loss, filesystem failure or device-cache failure; the 2 s assertion is limited to the test source and successful recovery path.
-- Real output-device recording with a known tone, microphone isolation beyond acoustic pickup, and silent real-device takes; the routing probe sent audio to `fakesink` and produced no recording.
+- Known-tone recording from a physical output and microphone isolation beyond acoustic pickup; the known-tone check used a virtual output. A default-output monitor recorded successfully without a test tone, but silence was not independently verified.
+- The 20 ms synchronization target for microphone and system audio on physical devices. First timestamps alone do not measure synchronization; the virtual loopback result above exceeds that target and has not been attributed to a cause.
 - Default-sink switching and output hotplug/disconnect during an active recording.
 - Byte-for-byte unchanged production recordings when system audio is off, apart from the manifest; a fake-engine regression test covers the disabled default and separate-file behavior.
-- The updated safety checks and full `--selftest`, including its new system-audio assertions, have not been run in this follow-up; a previous full self-test attempt aborted after an AMDGPU context loss.
+- A full `--selftest` on the setup above completed but failed: the no-frame video test left a file and was not selected after Cut, and the injected startup ENOSPC test found no opened peer files to inspect. The two system-audio files were produced and decoded; this does not make the overall self-test a pass.
 
 The ILCE-7CM2 delivers truncated frames for a short time after it is reopened. Chinstrap drops frames that PipeWire marks as corrupted and fills the gap by repeating frames, so the first second or two of a camera file can contain a few repeats; they are counted in the quality numbers (`dropped_corrupt`, `duplicated`).
 
