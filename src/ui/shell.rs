@@ -3,13 +3,14 @@
 use std::time::Duration;
 
 use gpui::{
-    ClickEvent, Context, Entity, FocusHandle, Focusable, FontWeight, Subscription, Window, div,
-    prelude::*, px, rgb,
+    AnyWindowHandle, App, ClickEvent, Context, Entity, FocusHandle, Focusable, FontWeight,
+    Subscription, Task, Window, div, prelude::*, px, rgb,
 };
 
 use super::studio_view::{CloseIntent, CloseWindowNow, StudioView};
 use super::theme::*;
 use super::{Quit, ShowExplorer, ShowStudio};
+use crate::control::{ControlHandle, PortalStatus};
 use crate::explorer::FeatureExplorer;
 use crate::studio::{EngineEvent, EngineHandle};
 
@@ -19,12 +20,23 @@ pub enum Screen {
     Explorer,
 }
 
+fn request_window_activation(app: &mut App, handle: AnyWindowHandle) -> bool {
+    handle
+        .update(app, |_, window, _| window.activate_window())
+        .is_ok()
+}
+
 pub struct AppShell {
     engine: EngineHandle,
+    control: ControlHandle,
+    portal_status: PortalStatus,
+    portal_feedback: Option<String>,
     studio: Entity<StudioView>,
     explorer: Entity<FeatureExplorer>,
     screen: Screen,
     focus_handle: FocusHandle,
+    _raise_events: Task<()>,
+    _portal_status: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -32,6 +44,7 @@ impl AppShell {
     pub fn new(
         engine: EngineHandle,
         events: async_channel::Receiver<EngineEvent>,
+        control: ControlHandle,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -42,12 +55,49 @@ impl AppShell {
             window,
             |_, _, _: &CloseWindowNow, window: &mut Window, _| window.remove_window(),
         );
+        let raise_events = control.raise_events();
+        let window_handle = window.window_handle();
+        let raise_task = cx.spawn(async move |this, cx| {
+            while raise_events.recv().await.is_ok() {
+                if !this
+                    .update(cx, |_, cx| request_window_activation(cx, window_handle))
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+            }
+        });
+        let status_control = control.clone();
+        let status_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let status = status_control.portal_status();
+                if this
+                    .update(cx, |shell, cx| {
+                        if shell.portal_status != status {
+                            shell.portal_status = status;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Self {
             engine,
+            portal_status: control.portal_status(),
+            control,
+            portal_feedback: None,
             studio,
             explorer,
             screen: Screen::Studio,
             focus_handle: cx.focus_handle(),
+            _raise_events: raise_task,
+            _portal_status: status_task,
             _subscriptions: vec![close_sub],
         }
     }
@@ -93,6 +143,20 @@ impl AppShell {
             self.engine.shutdown_blocking(Duration::from_secs(3));
             cx.quit();
         }
+    }
+
+    fn enable_global_shortcuts(&mut self, cx: &mut Context<Self>) {
+        let control = self.control.clone();
+        cx.spawn(async move |this, cx| {
+            let result = control.enable_global_shortcuts().await;
+            let status = control.portal_status();
+            let _ = this.update(cx, |shell, cx| {
+                shell.portal_status = status;
+                shell.portal_feedback = result.err();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn tab(
@@ -141,6 +205,10 @@ impl AppShell {
 
 impl Render for AppShell {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let shortcuts_label = self
+            .portal_feedback
+            .clone()
+            .unwrap_or_else(|| self.portal_status.display_text());
         let content: gpui::AnyView = match self.screen {
             Screen::Studio => self.studio.clone().into(),
             Screen::Explorer => self.explorer.clone().into(),
@@ -228,18 +296,47 @@ impl Render for AppShell {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .rounded_full()
-                            .border_1()
-                            .border_color(rgb(BORDER))
-                            .bg(rgb(PANEL))
-                            .px_3()
-                            .py(px(5.0))
-                            .child(div().size(px(6.0)).rounded_full().bg(rgb(GREEN)))
                             .child(
                                 div()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(0xb5bdc9))
-                                    .child("Local by design"),
+                                    .id("global-shortcuts")
+                                    .flex()
+                                    .items_center()
+                                    .max_w(px(460.0))
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(BORDER))
+                                    .bg(rgb(PANEL))
+                                    .px_2()
+                                    .py(px(5.0))
+                                    .hover(|style| style.bg(rgb(HOVER)).cursor_pointer())
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.enable_global_shortcuts(cx)
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.0))
+                                            .text_color(rgb(0xb5bdc9))
+                                            .child(shortcuts_label),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(rgb(BORDER))
+                                    .bg(rgb(PANEL))
+                                    .px_3()
+                                    .py(px(5.0))
+                                    .child(div().size(px(6.0)).rounded_full().bg(rgb(GREEN)))
+                                    .child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(0xb5bdc9))
+                                            .child("Local by design"),
+                                    ),
                             ),
                     ),
             )
@@ -250,5 +347,29 @@ impl Render for AppShell {
                     .overflow_hidden()
                     .child(content),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_window_activation;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    fn raising_existing_window_activates_it(cx: &mut TestAppContext) {
+        let window = cx.add_empty_window();
+        let handle = window.update(|window, _| window.window_handle());
+        window.deactivate_window();
+        let initially_active = window.update(|window, _| window.is_window_active());
+        assert!(!initially_active, "test window should begin inactive");
+
+        let activation_requested = window
+            .cx
+            .update(|app| request_window_activation(app, handle));
+        assert!(activation_requested, "raise request should find the window");
+        window.run_until_parked();
+
+        let active = window.update(|window, _| window.is_window_active());
+        assert!(active, "raise request should activate the existing window");
     }
 }

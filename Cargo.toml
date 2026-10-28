@@ -10,7 +10,7 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "28d0a3547f16b9609
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "28d0a3547f16b9609b301b48ab363bfca649c864", default-features = false, features = ["wayland", "x11"] }
 gstreamer = { version = "0.25.4", features = ["v1_26"] }
 gstreamer-pbutils = { version = "0.25", features = ["v1_26"] } # Discoverer for --selftest
-ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "screencast"] }
+ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "screencast", "global_shortcuts"] }
 async-channel = "2"
 smol = "2"
 futures = "0.3"
@@ -28,6 +28,10 @@ whisper-rs = { version = "=0.16.0", features = ["vulkan", "raw-api"] }
 ureq = { version = "=3.4.2", default-features = false, features = ["rustls"] }
 sha2 = "0.10.9"
 libc = "0.2" # setpriority, prctl, getppid, kill, flock
+zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
+
+[dev-dependencies]
+gpui = { git = "https://github.com/zed-industries/zed", rev = "28d0a3547f16b9609b301b48ab363bfca649c864", default-features = false, features = ["test-support"] }
 
 [profile.release]
 lto = "thin"

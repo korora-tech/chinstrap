@@ -16,17 +16,19 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use gstreamer as gst;
 
 use super::encoders::EncoderCap;
-use super::engine::{EngineConfig, Msg};
+use super::engine::{CommandReply, EngineConfig, Msg};
 use super::plan::{self, Demand};
 use super::preview::{self, Previews};
 use super::transcribe::vocab;
 use super::types::*;
+use crate::control::{ControlStatus, ControlStatusHub};
 
 const TICK: Duration = Duration::from_millis(50);
 const STEP: Duration = Duration::from_millis(300);
@@ -52,10 +54,11 @@ pub(super) fn spawn(
     rx: Receiver<Msg>,
     events: async_channel::Sender<EngineEvent>,
     previews: Previews,
+    control_status: Arc<Mutex<ControlStatusHub>>,
 ) -> std::io::Result<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("chinstrap-engine".into())
-        .spawn(move || FakeEngine::new(config, events, previews).run(rx))
+        .spawn(move || FakeEngine::new(config, events, previews, control_status).run(rx))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +110,10 @@ struct FakeEngine {
     born: Instant,
     /// The preview states last sent (a change sends a Snapshot).
     preview_sent: Vec<(InputKey, PreviewState)>,
+    /// Synchronous result slot for the command currently being handled from D-Bus.
+    active_reply: Option<Arc<CommandReply>>,
+    control_status: Arc<Mutex<ControlStatusHub>>,
+    marker_count: u32,
 }
 
 fn fake_mode(w: i32, h: i32, fps: i32, format: &str, auto: bool) -> CameraModeInfo {
@@ -126,6 +133,7 @@ impl FakeEngine {
         config: EngineConfig,
         events: async_channel::Sender<EngineEvent>,
         previews: Previews,
+        control_status: Arc<Mutex<ControlStatusHub>>,
     ) -> Self {
         let portal = if config.enable_portal {
             PortalAvailability::Available { version: 5 }
@@ -228,6 +236,9 @@ impl FakeEngine {
             last_preview: now,
             born: now,
             preview_sent: Vec::new(),
+            active_reply: None,
+            control_status,
+            marker_count: 0,
         }
     }
 
@@ -323,6 +334,7 @@ impl FakeEngine {
         loop {
             match rx.recv_timeout(TICK) {
                 Ok(Msg::Cmd(cmd)) => self.command(cmd),
+                Ok(Msg::Request { command, reply }) => self.command_with_reply(command, reply),
                 Ok(Msg::Shutdown { deadline: _, ack }) => {
                     self.shutdown();
                     let _ = ack.send(true);
@@ -353,6 +365,7 @@ impl FakeEngine {
             selected_microphone: self.selected_microphone,
             output_root: self.output_root.clone(),
             phase: self.phase.clone(),
+            record_pending: false,
             portal_busy: self.portal_busy,
             session: self.session.clone(),
             can_record: self.can_record(),
@@ -382,6 +395,10 @@ impl FakeEngine {
             vocabulary: self.vocabulary.clone(),
             previews: self.preview_sent.clone(),
         };
+        self.control_status
+            .lock()
+            .expect("control status lock")
+            .publish(ControlStatus::from_snapshot(&snap, self.marker_count));
         let _ = self
             .events
             .send_blocking(EngineEvent::Snapshot(Box::new(snap)));
@@ -398,6 +415,9 @@ impl FakeEngine {
 
     fn reject(&self, cmd: &EngineCommand, why: &str) {
         self.notice(Severity::Warning, None, format!("Rejected {cmd:?}: {why}"));
+        if let Some(reply) = &self.active_reply {
+            reply.resolve(Err(why.to_string()));
+        }
     }
 
     // ---- derived state ---------------------------------------------------------------------
@@ -527,6 +547,13 @@ impl FakeEngine {
     }
 
     // ---- commands -------------------------------------------------------------------------
+
+    fn command_with_reply(&mut self, cmd: EngineCommand, reply: Arc<CommandReply>) {
+        self.active_reply = Some(reply.clone());
+        self.command(cmd);
+        self.active_reply = None;
+        reply.resolve(Ok(()));
+    }
 
     fn command(&mut self, cmd: EngineCommand) {
         let busy = self.phase.is_busy();
@@ -710,6 +737,7 @@ impl FakeEngine {
                 if self.session.take().is_none() {
                     self.reject(&cmd, "no open session");
                 } else {
+                    self.marker_count = 0;
                     self.snapshot();
                 }
             }
@@ -721,6 +749,14 @@ impl FakeEngine {
                 _ => self.reject(&cmd, "engine is busy"),
             },
             EngineCommand::Cut => self.cut(&cmd),
+            EngineCommand::AddMarker(_label) => {
+                if matches!(self.phase, Phase::Recording { .. }) {
+                    self.marker_count = self.marker_count.saturating_add(1);
+                    self.snapshot();
+                } else {
+                    self.reject(&cmd, "not recording");
+                }
+            }
             EngineCommand::DownloadModel => match self.model {
                 ModelState::Missing { download_bytes }
                 | ModelState::Failed { download_bytes, .. } => {
@@ -916,6 +952,7 @@ impl FakeEngine {
             return;
         }
         if self.session.is_none() {
+            self.marker_count = 0;
             let name = gst::glib::DateTime::now_local()
                 .ok()
                 .and_then(|now| now.format("%Y-%m-%dT%H-%M-%S").ok())
@@ -1645,6 +1682,34 @@ mod tests {
             .filter(|f| matches!(f.status, InputStatus::Failed { .. }))
             .count();
         assert_eq!(failed, 2);
+        assert!(engine.shutdown_blocking(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn marker_commands_are_accepted_only_while_recording_and_count_in_status() {
+        let (engine, rx) = start(config()).expect("start fake engine");
+        assert_eq!(
+            engine.request(EngineCommand::AddMarker("opening".into())),
+            Err("not recording".into())
+        );
+        engine
+            .request(EngineCommand::Record)
+            .expect("record accepted");
+        wait_for(&rx, Duration::from_secs(2), |s| {
+            matches!(s.phase, Phase::Recording { .. })
+        });
+        engine
+            .request(EngineCommand::AddMarker("opening".into()))
+            .expect("marker accepted while recording");
+        assert_eq!(engine.control_status().markers, 1);
+        assert!(engine.shutdown_blocking(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn request_reports_engine_rejections_to_its_caller() {
+        let (engine, _rx) = start(config()).expect("start fake engine");
+        let result = engine.request(EngineCommand::Cut);
+        assert_eq!(result, Err("not recording".into()));
         assert!(engine.shutdown_blocking(Duration::from_secs(2)));
     }
 }

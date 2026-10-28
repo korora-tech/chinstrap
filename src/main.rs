@@ -1,4 +1,5 @@
 // Moved verbatim from the old main.rs; the lint predates the move (SPEC §2: explorer unchanged).
+mod control;
 #[allow(clippy::too_many_arguments)]
 mod explorer;
 mod selftest;
@@ -13,6 +14,14 @@ use gpui::{App, Bounds, KeyBinding, WindowBounds, WindowOptions, prelude::*, px,
 use gpui_platform::application;
 
 use ui::{Cut, Quit, ShowExplorer, ShowStudio, ToggleRecord};
+
+fn control_window_options(window_bounds: Option<WindowBounds>) -> WindowOptions {
+    WindowOptions {
+        window_bounds,
+        app_id: Some(crate::control::APP_ID.to_string()),
+        ..Default::default()
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -32,6 +41,7 @@ fn main() {
             };
             std::process::exit(result);
         }
+        Some("ctl") => std::process::exit(control::run_ctl(&args[2..])),
         Some("--download-model") => {
             let name = args.get(2).map(String::as_str);
             if args.len() > 3 || name.is_some_and(|n| n.starts_with('-')) {
@@ -62,6 +72,18 @@ fn main() {
         };
         config.output_root = std::path::absolute(dir).expect("absolute output path");
     }
+    // Acquire the session-bus name before starting any capture or portal engine threads.
+    let mut control_owner = match control::ControlOwner::acquire() {
+        Ok(control::Acquisition::Owner(owner)) => owner,
+        Ok(control::Acquisition::AlreadyRunning) => {
+            eprintln!("chinstrap: already running; asked it to activate its window");
+            return;
+        }
+        Err(error) => {
+            eprintln!("chinstrap: {error}");
+            std::process::exit(1)
+        }
+    };
     let (engine, events) = studio::start(config).unwrap_or_else(|e| {
         eprintln!("chinstrap: {e}");
         std::process::exit(1)
@@ -73,8 +95,16 @@ fn main() {
         let _ = engine.shutdown_blocking(Duration::from_secs(8));
         std::process::exit(1);
     }
+    control_owner
+        .attach_engine(engine.clone())
+        .unwrap_or_else(|error| {
+            eprintln!("chinstrap: {error}");
+            std::process::exit(1)
+        });
+    let control_handle = control_owner.handle();
 
     application().run(move |cx: &mut App| {
+        let _control_owner = &control_owner;
         cx.bind_keys([
             KeyBinding::new("r", ToggleRecord, Some("Studio && !TextField")),
             KeyBinding::new("c", Cut, Some("Studio && !TextField")),
@@ -102,13 +132,16 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         let window = cx
             .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    ..Default::default()
-                },
+                control_window_options(Some(WindowBounds::Windowed(bounds))),
                 |window, cx| {
                     cx.new(|cx| {
-                        ui::shell::AppShell::new(engine.clone(), events.clone(), window, cx)
+                        ui::shell::AppShell::new(
+                            engine.clone(),
+                            events.clone(),
+                            control_handle.clone(),
+                            window,
+                            cx,
+                        )
                     })
                 },
             )
@@ -121,4 +154,19 @@ fn main() {
             .ok();
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod window_options_tests {
+    use super::control_window_options;
+
+    #[test]
+    fn control_window_sets_the_stable_wayland_application_id() {
+        let options = control_window_options(None);
+        assert_eq!(
+            options.app_id.as_deref(),
+            Some(crate::control::APP_ID),
+            "Wayland activation tokens require Chinstrap's stable app_id"
+        );
+    }
 }
