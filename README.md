@@ -30,6 +30,7 @@ Use the panel to pick a camera and a microphone. **Add windows/screens…** open
 
 ### Studio panels
 
+- **Video.** Each video is one folder of segments, named after the video. **New video…** (idle only) asks for a name, such as `Kubernetes Services 101`, and creates `<output>/Kubernetes Services 101/`; `Enter` creates it and `Esc` cancels. The name is kept as typed, except that `/` becomes `-` and leading dots and control characters are dropped; an existing folder of that name gets `-2`, `-3`, … instead of being reused. The toolbar shows the open video. Every **Record** and **Cut** adds the next `segment-NNN` to it, and quitting and starting Chinstrap again reopens the same video, continuing after its last segment (the Segments panel lists this run's segments and counts the earlier ones). The open video is remembered in `<output>/.chinstrap-current`. A video with interrupted segments is not reopened until they are recovered or dismissed. Before any video has been named, Record creates a date-named one.
 - **Preview.** A live tile (about 15 fps, at most 480×300) for the selected camera and every window, screen and test pattern, so you can see what each file will show. While idle each input has its own small preview pipeline; pressing **Record** stops those first (only one reader per PipeWire node), and while recording the frames come from a branch of the recording pipeline itself, framed in red. A preview that fails says why on its tile and is retried; it never stops or fails a recording, and the recording branch accepts whatever format the recording negotiates (a format it cannot show only stops the tile). Because the camera's idle preview closes the camera before Record reopens it, a camera that sends damaged frames just after it is opened (the ILCE-7CM2 does, see below) starts each camera file with a few dropped and repeated frames; this has not been measured with previews on. Pressing **Stop** (or the shortcut again) while the previews are stopping cancels the Record. `CHINSTRAP_PREVIEW=0` turns previews off.
 - **Camera mode.** Under the camera list, the selected camera's advertised modes (size, rate, format) are listed with **Automatic** (the mode Chinstrap would pick, shown underneath) as the default. Pick one to override it; the choice is locked while recording.
 - **Frame rate.** Each window, screen and test pattern has a **Native · 60 · 30** picker, and **Frame rate for all windows/screens** sets the default for new ones and applies it to the current ones. See [Frame rate of windows and screens](#frame-rate-of-windows-and-screens).
@@ -42,7 +43,8 @@ Use the panel to pick a camera and a microphone. **Add windows/screens…** open
 
 ```
 <output>/                          default: $XDG_VIDEOS_DIR/Chinstrap (or $CHINSTRAP_OUTPUT_DIR)
-  2026-10-21T18-31-02/             one folder per session
+  .chinstrap-current               name of the video the next Record (and the next start) continues
+  Kubernetes Services 101/         one folder per video (date-named, e.g. 2026-10-21T18-31-02, if unnamed)
     session.json                   manifest: segments, base times, per-input size, rate, encoder, status
     segment-001/
       camera.mkv                   H.264 or HEVC (or x264), camera's native size and frame rate

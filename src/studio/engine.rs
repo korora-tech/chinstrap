@@ -538,6 +538,8 @@ struct Session {
     created: String,
     _lock: session::SessionLock,
     reserve_path: Option<PathBuf>,
+    /// Segments recorded before this run, as the reopened manifest listed them.
+    prior: Vec<ManifestSegment>,
     segs: Vec<Seg>,
 }
 
@@ -987,6 +989,18 @@ impl Engine {
                 detail: None,
             }),
         }
+        // Open on the video the last run was recording, unless it is waiting for recovery.
+        if let Some(dir) = session::read_current_video(&self.output_root)
+            && !self.recoveries.iter().any(|item| item.dir == dir)
+            && let Err(message) = self.reopen_session(&dir)
+        {
+            self.pending_notices.push(Notice {
+                severity: Severity::Warning,
+                input: None,
+                message,
+                detail: None,
+            });
+        }
         self.refresh_storage();
         self.snapshot();
         for n in std::mem::take(&mut self.pending_notices) {
@@ -1076,6 +1090,7 @@ impl Engine {
                 name: s.name.clone(),
                 dir: s.dir.clone(),
                 manifest: s.dir.join(session::MANIFEST_NAME),
+                earlier_segments: s.prior.len() as u32,
                 segments: s
                     .segs
                     .iter()
@@ -1146,6 +1161,7 @@ impl Engine {
             return;
         };
         let mut m = Manifest::new(&s.name, s.created.clone());
+        m.segments = s.prior.clone();
         for g in &s.segs {
             let (status, reason) = match &g.status {
                 SegmentStatus::Recording => ("recording", None),
@@ -1397,7 +1413,7 @@ impl Engine {
             | EngineCommand::AddTestSource
             | EngineCommand::RemoveSource(_)
             | EngineCommand::SetOutputRoot(_)
-            | EngineCommand::EndSession
+            | EngineCommand::NewVideo { .. }
             | EngineCommand::RecoverSession { .. }
             | EngineCommand::SetFrameRateMode { .. }
             | EngineCommand::SelectCameraMode(_)
@@ -1563,25 +1579,15 @@ impl Engine {
                     self.dirty = true;
                 }
             }
-            EngineCommand::EndSession => {
-                if self.session.is_none() {
-                    self.reject(&cmd, "no open session");
-                } else {
-                    // Changes handled earlier in this batch (a transcription Done, cancel or
-                    // failure) are only marked dirty; write them while the session is open.
-                    if self.transcription.take_manifest_dirty() {
-                        self.manifest_dirty = true;
+            EngineCommand::NewVideo { name } => match session::video_dir_name(name) {
+                Err(why) => self.reject(&cmd, why),
+                Ok(name) => {
+                    self.close_session();
+                    if let Err(e) = self.create_session(&name) {
+                        self.notice(Severity::Error, None, e);
                     }
-                    if self.manifest_dirty {
-                        self.write_manifest();
-                    }
-                    self.release_session_reserve(Severity::Warning);
-                    self.session = None;
-                    // Its transcription jobs keep running (§12.3 policy 11).
-                    self.transcription.set_session(None);
-                    self.dirty = true;
                 }
-            }
+            },
             EngineCommand::RecoverSession { name } => self.start_recovery(name),
             EngineCommand::ShowSessionFolder { name } => self.show_session_folder(name),
             EngineCommand::DismissRecovery { name } => self.dismiss_recovery(name),
@@ -1855,59 +1861,13 @@ impl Engine {
             return;
         }
         if self.session.is_none() {
-            match session::create_session_dir(&self.output_root, &session::session_name_now()) {
-                Ok((name, dir)) => {
-                    let lock = match session::SessionLock::acquire(&dir) {
-                        Ok(lock) => lock,
-                        Err(e) => {
-                            let _ = std::fs::remove_dir(&dir);
-                            self.notice(
-                                Severity::Error,
-                                None,
-                                format!("Cannot lock the new recording session: {e}"),
-                            );
-                            return;
-                        }
-                    };
-                    let reserve = match storage::create_emergency_reserve(
-                        &dir,
-                        storage::EMERGENCY_RESERVE_BYTES,
-                    ) {
-                        Ok(path) => path,
-                        Err(e) => {
-                            drop(lock);
-                            let _ = std::fs::remove_dir_all(&dir);
-                            self.notice(
-                                Severity::Error,
-                                None,
-                                format!("Cannot reserve emergency stop space: {e}"),
-                            );
-                            return;
-                        }
-                    };
-                    self.transcription.set_session(Some(dir.clone()));
-                    self.session = Some(Session {
-                        name,
-                        dir,
-                        created: session::wall_now(),
-                        _lock: lock,
-                        reserve_path: Some(reserve),
-                        segs: Vec::new(),
-                    });
-                    self.storage_warning_level = 0;
-                    self.write_manifest();
-                }
-                Err(e) => {
-                    self.notice(
-                        Severity::Error,
-                        None,
-                        format!(
-                            "Cannot create a session in {}: {e}",
-                            self.output_root.display()
-                        ),
-                    );
-                    return;
-                }
+            let opened = match session::read_current_video(&self.output_root) {
+                Some(dir) => self.reopen_session(&dir),
+                None => self.create_session(&session::session_name_now()),
+            };
+            if let Err(e) = opened {
+                self.notice(Severity::Error, None, e);
+                return;
             }
         }
         if let Some(session) = self.session.as_mut()
@@ -1962,6 +1922,102 @@ impl Engine {
         self.start_segment(inputs, None);
     }
 
+    /// Writes the open session's pending changes and closes it, releasing its lock and reserve.
+    fn close_session(&mut self) {
+        if self.session.is_none() {
+            return;
+        }
+        // Changes handled earlier in this batch (a transcription Done, cancel or failure) are
+        // only marked dirty; write them while the session is open.
+        if self.transcription.take_manifest_dirty() {
+            self.manifest_dirty = true;
+        }
+        if self.manifest_dirty {
+            self.write_manifest();
+        }
+        self.release_session_reserve(Severity::Warning);
+        self.session = None;
+        // Its transcription jobs keep running (§12.3 policy 11).
+        self.transcription.set_session(None);
+        self.dirty = true;
+    }
+
+    /// Records which video the next launch (and a Record with no open session) continues.
+    fn set_current_video(&self, name: &str) {
+        if let Err(e) = session::write_current_video(&self.output_root, name) {
+            self.notice(
+                Severity::Warning,
+                None,
+                format!("Cannot remember the current video: {e}"),
+            );
+        }
+    }
+
+    /// Creates `<output_root>/<name>` (suffixed on collision), opens it and makes it current.
+    fn create_session(&mut self, name: &str) -> Result<(), String> {
+        let (name, dir) = session::create_session_dir(&self.output_root, name).map_err(|e| {
+            format!(
+                "Cannot create a session in {}: {e}",
+                self.output_root.display()
+            )
+        })?;
+        let lock = session::SessionLock::acquire(&dir).map_err(|e| {
+            let _ = std::fs::remove_dir(&dir);
+            format!("Cannot lock the new recording session: {e}")
+        })?;
+        self.open_session(name.clone(), dir, session::wall_now(), lock, Vec::new());
+        self.write_manifest();
+        self.set_current_video(&name);
+        Ok(())
+    }
+
+    /// Reopens an existing video so new segments continue after the ones its manifest lists.
+    fn reopen_session(&mut self, dir: &Path) -> Result<(), String> {
+        let title = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if self.recoveries.iter().any(|item| item.dir == dir) {
+            return Err(format!(
+                "{title} has interrupted segments: recover or dismiss them first, or start a new video"
+            ));
+        }
+        let lock = session::SessionLock::acquire(dir)
+            .map_err(|e| format!("Cannot reopen {title}: it is locked or cannot be locked: {e}"))?;
+        let manifest = session::read_manifest(&dir.join(session::MANIFEST_NAME))
+            .map_err(|e| format!("Cannot reopen {title}: {e}"))?;
+        self.open_session(
+            manifest.name,
+            dir.to_path_buf(),
+            manifest.created,
+            lock,
+            manifest.segments,
+        );
+        Ok(())
+    }
+
+    fn open_session(
+        &mut self,
+        name: String,
+        dir: PathBuf,
+        created: String,
+        lock: session::SessionLock,
+        prior: Vec<ManifestSegment>,
+    ) {
+        self.transcription.set_session(Some(dir.clone()));
+        self.session = Some(Session {
+            name,
+            dir,
+            created,
+            _lock: lock,
+            reserve_path: None,
+            prior,
+            segs: Vec::new(),
+        });
+        self.storage_warning_level = 0;
+        self.dirty = true;
+    }
+
     fn stop(&mut self, cmd: &EngineCommand) {
         if self.record_pending {
             self.cancel_pending_record();
@@ -2005,9 +2061,16 @@ impl Engine {
         let Some(sess) = &self.session else {
             return;
         };
-        let index = sess.segs.len() as u32 + 1;
+        let from = sess
+            .prior
+            .iter()
+            .map(|g| g.index)
+            .chain(sess.segs.iter().map(|g| g.index))
+            .max()
+            .unwrap_or(0)
+            + 1;
         let session_lock = sess._lock.clone();
-        let dir = match session::create_segment_dir(&sess.dir, index) {
+        let (index, dir) = match session::create_next_segment_dir(&sess.dir, from) {
             Ok(d) => d,
             Err(e) => {
                 self.notice(
@@ -4701,6 +4764,7 @@ mod tests {
             created: "test".into(),
             _lock: session_lock.clone(),
             reserve_path: None,
+            prior: Vec::new(),
             segs: vec![Seg {
                 index: 1,
                 dir: segment_dir,
@@ -4944,6 +5008,64 @@ mod tests {
             engine.session.as_ref().unwrap().segs[0].files[0].file.status,
             InputStatus::Failed { ref reason } if reason == "early failure"
         ));
+        engine.devices.stop();
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_video_is_reopened_with_its_earlier_segments() {
+        let root = storage_test_root("new-video-reopen");
+        let (mut engine, _) = storage_test_engine(&root, false);
+        engine.pipes.clear();
+        engine.phase = Phase::Idle;
+        engine.close_session();
+
+        engine.create_session("Kubernetes Services 101").unwrap();
+        let dir = root.join("Kubernetes Services 101");
+        assert_eq!(session::read_current_video(&root), Some(dir.clone()));
+
+        // Two segments from an earlier run, as its manifest recorded them.
+        let segment = |index: u32| -> ManifestSegment {
+            serde_json::from_value(serde_json::json!({
+                "index": index,
+                "dir": session::segment_dir_name(index),
+                "status": "complete",
+                "inputs": [],
+            }))
+            .unwrap()
+        };
+        engine.session.as_mut().unwrap().prior = vec![segment(1), segment(2)];
+        engine.write_manifest();
+        engine.close_session();
+        assert!(engine.session.is_none());
+
+        engine.reopen_session(&dir).unwrap();
+        let open = engine.session.as_ref().unwrap();
+        assert_eq!(open.name, "Kubernetes Services 101");
+        assert_eq!(open.prior.len(), 2);
+        // A later write keeps the earlier segments.
+        engine.write_manifest();
+        let manifest = session::read_manifest(&dir.join(session::MANIFEST_NAME)).unwrap();
+        let indexes: Vec<u32> = manifest.segments.iter().map(|g| g.index).collect();
+        assert_eq!(indexes, [1, 2]);
+        // Numbering continues after them, skipping a directory the manifest does not list.
+        std::fs::create_dir(dir.join("segment-003")).unwrap();
+        let (index, _) = session::create_next_segment_dir(&dir, 3).unwrap();
+        assert_eq!(index, 4);
+
+        // A video waiting for recovery is not reopened.
+        engine.close_session();
+        engine.recoveries.push(RecoveryCandidate {
+            name: "Kubernetes Services 101".into(),
+            dir: dir.clone(),
+            segments: vec![2],
+            recovering: false,
+            error: None,
+        });
+        assert!(engine.reopen_session(&dir).is_err());
+        assert!(engine.session.is_none());
+
         engine.devices.stop();
         drop(engine);
         std::fs::remove_dir_all(root).unwrap();

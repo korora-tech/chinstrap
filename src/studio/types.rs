@@ -254,6 +254,8 @@ pub struct SessionSummary {
     pub name: String,
     pub dir: PathBuf,
     pub manifest: PathBuf,              // <dir>/session.json
+    /// Segments recorded in earlier runs (a reopened video); `segments` lists this run's only.
+    pub earlier_segments: u32,
     pub segments: Vec<SegmentSummary>,
 }
 
@@ -388,7 +390,9 @@ pub enum EngineCommand {
     Stop,
     ToggleRecord,         // Record if Idle, Stop if Recording, else rejected
     Cut,
-    EndSession,           // Idle only
+    /// Idle only. Closes the open session and opens `<output_root>/<name>` (sanitized,
+    /// suffixed on collision), which later launches reopen until the next NewVideo.
+    NewVideo { name: String },
     RecoverSession { name: String },
     ShowSessionFolder { name: String },
     DismissRecovery { name: String },

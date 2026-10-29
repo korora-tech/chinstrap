@@ -541,7 +541,7 @@ impl FakeEngine {
             | EngineCommand::AddTestSource
             | EngineCommand::RemoveSource(_)
             | EngineCommand::SetOutputRoot(_)
-            | EngineCommand::EndSession
+            | EngineCommand::NewVideo { .. }
             | EngineCommand::SetFrameRateMode { .. }
             | EngineCommand::SelectCameraMode(_)
                 if busy =>
@@ -706,13 +706,13 @@ impl FakeEngine {
                     self.snapshot();
                 }
             }
-            EngineCommand::EndSession => {
-                if self.session.take().is_none() {
-                    self.reject(&cmd, "no open session");
-                } else {
+            EngineCommand::NewVideo { name } => match super::session::video_dir_name(name) {
+                Err(why) => self.reject(&cmd, why),
+                Ok(name) => {
+                    self.open_session(name);
                     self.snapshot();
                 }
-            }
+            },
             EngineCommand::Record => self.record(&cmd),
             EngineCommand::Stop => self.stop(&cmd),
             EngineCommand::ToggleRecord => match self.phase {
@@ -921,13 +921,7 @@ impl FakeEngine {
                 .and_then(|now| now.format("%Y-%m-%dT%H-%M-%S").ok())
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "fake-session".into());
-            let dir = self.output_root.join(&name);
-            self.session = Some(SessionSummary {
-                manifest: dir.join("session.json"),
-                name,
-                dir,
-                segments: Vec::new(),
-            });
+            self.open_session(name);
         }
         self.inputs = self.frozen_inputs();
         let segment = self.begin_segment(None);
@@ -990,6 +984,17 @@ impl FakeEngine {
             waiting_for_frame: false,
             quality: None,
         }
+    }
+
+    fn open_session(&mut self, name: String) {
+        let dir = self.output_root.join(&name);
+        self.session = Some(SessionSummary {
+            manifest: dir.join("session.json"),
+            name,
+            dir,
+            earlier_segments: 0,
+            segments: Vec::new(),
+        });
     }
 
     /// Appends a new segment row for the frozen input set and returns its index.

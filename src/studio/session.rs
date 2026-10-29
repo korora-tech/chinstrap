@@ -186,6 +186,50 @@ pub fn segment_dir_name(index: u32) -> String {
     format!("segment-{index:03}")
 }
 
+/// `<root>/.chinstrap-current`: the directory name of the video Record continues.
+const CURRENT_VIDEO: &str = ".chinstrap-current";
+/// Leaves room for the `-NNN` collision suffix within the 255-byte name limit.
+const VIDEO_NAME_MAX_BYTES: usize = 200;
+
+/// The directory name for a video title: kept as typed apart from `/` (becomes `-`), control
+/// characters (dropped) and leading dots (dropped, so it is never hidden or `..`).
+pub fn video_dir_name(title: &str) -> Result<String, &'static str> {
+    let cleaned: String = title
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if c == '/' { '-' } else { c })
+        .collect();
+    let mut name = cleaned
+        .trim()
+        .trim_start_matches('.')
+        .trim_start()
+        .to_string();
+    if name.is_empty() {
+        return Err("a video needs a name");
+    }
+    while name.len() > VIDEO_NAME_MAX_BYTES {
+        name.pop();
+    }
+    Ok(name.trim_end().to_string())
+}
+
+/// The current video's directory under `root`, if one was recorded and still has a manifest.
+pub fn read_current_video(root: &Path) -> Option<PathBuf> {
+    let name = fs::read_to_string(root.join(CURRENT_VIDEO)).ok()?;
+    let name = name.trim_end_matches('\n');
+    // Only a single, visible path component: the pointer never leaves the root.
+    if name.is_empty() || name.starts_with('.') || name.contains('/') {
+        return None;
+    }
+    let dir = root.join(name);
+    dir.join(MANIFEST_NAME).is_file().then_some(dir)
+}
+
+/// Points `<root>/.chinstrap-current` at the video directory `name` (atomic).
+pub fn write_current_video(root: &Path, name: &str) -> io::Result<()> {
+    write_atomic(&root.join(CURRENT_VIDEO), format!("{name}\n").as_bytes())
+}
+
 fn create_dir_all_durable(path: &Path) -> io::Result<()> {
     create_dir_all_durable_with_sync(path, &super::storage::sync_directory)
 }
@@ -264,6 +308,22 @@ pub fn create_segment_dir(session_dir: &Path, index: u32) -> io::Result<PathBuf>
     let dir = session_dir.join(segment_dir_name(index));
     mkdir_0700(&dir)?;
     Ok(dir)
+}
+
+/// Creates the first free `segment-NNN` at or after `from`, never reusing a directory a
+/// manifest does not list (for example one left by a crash before its checkpoint).
+pub fn create_next_segment_dir(session_dir: &Path, from: u32) -> io::Result<(u32, PathBuf)> {
+    for index in from..from.saturating_add(1000) {
+        match create_segment_dir(session_dir, index) {
+            Ok(dir) => return Ok((index, dir)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "too many segment directories",
+    ))
 }
 
 /// The hidden temporary name `write_atomic` uses for `path` in process `pid`.
@@ -450,6 +510,39 @@ mod tests {
         assert_eq!(segment_dir_name(3), "segment-003");
         let w = wall_now();
         assert!(w.contains('T') && w.contains('.'), "{w}");
+    }
+
+    #[test]
+    fn video_names_keep_the_title_and_stay_one_visible_component() {
+        assert_eq!(
+            video_dir_name("  Kubernetes Services 101 ").unwrap(),
+            "Kubernetes Services 101"
+        );
+        assert_eq!(video_dir_name("CI/CD basics").unwrap(), "CI-CD basics");
+        assert_eq!(video_dir_name("../etc").unwrap(), "-etc");
+        assert_eq!(video_dir_name(".hidden").unwrap(), "hidden");
+        assert_eq!(video_dir_name("tab\there").unwrap(), "tabhere");
+        assert!(video_dir_name("  ").is_err());
+        assert!(video_dir_name("..").is_err());
+        let long = video_dir_name(&"é".repeat(300)).unwrap();
+        assert!(long.len() <= VIDEO_NAME_MAX_BYTES, "{}", long.len());
+    }
+
+    #[test]
+    fn current_video_pointer_round_trips_and_rejects_escapes() {
+        let root = scratch("current-video");
+        assert_eq!(read_current_video(&root), None);
+        let (name, dir) = create_session_dir(&root, "Kubernetes Services 101").unwrap();
+        write_current_video(&root, &name).unwrap();
+        // No manifest yet: nothing to reopen.
+        assert_eq!(read_current_video(&root), None);
+        write_manifest(&dir, &Manifest::new(&name, wall_now())).unwrap();
+        assert_eq!(read_current_video(&root), Some(dir));
+        for bad in ["../outside", ".hidden", ""] {
+            fs::write(root.join(CURRENT_VIDEO), format!("{bad}\n")).unwrap();
+            assert_eq!(read_current_video(&root), None, "{bad:?}");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

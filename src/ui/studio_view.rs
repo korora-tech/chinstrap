@@ -72,12 +72,13 @@ pub enum CloseIntent {
 /// Emitted when a pending `CloseWindow` may proceed; `AppShell` removes the window.
 pub struct CloseWindowNow;
 
-/// The vocabulary panel's text fields.
+/// The vocabulary panel's text fields, and the toolbar's new-video name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Field {
     Term,
     RuleFrom,
     RuleTo,
+    VideoName,
 }
 
 impl Field {
@@ -86,6 +87,7 @@ impl Field {
             Self::Term => Self::RuleFrom,
             Self::RuleFrom => Self::RuleTo,
             Self::RuleTo => Self::Term,
+            Self::VideoName => Self::VideoName,
         }
     }
     fn prev(self) -> Self {
@@ -121,6 +123,9 @@ pub struct StudioView {
     term: Draft,
     rule_from: Draft,
     rule_to: Draft,
+    video_name: Draft,
+    /// The toolbar shows the new-video name field instead of the New video button.
+    naming_video: bool,
     previews: Previews,
     shown: HashMap<InputKey, Shown>,
     _events: Task<()>,
@@ -178,6 +183,8 @@ impl StudioView {
             term: Draft::new(cx),
             rule_from: Draft::new(cx),
             rule_to: Draft::new(cx),
+            video_name: Draft::new(cx),
+            naming_video: false,
             previews,
             shown: HashMap::new(),
             _events,
@@ -304,6 +311,7 @@ impl StudioView {
             Field::Term => &mut self.term,
             Field::RuleFrom => &mut self.rule_from,
             Field::RuleTo => &mut self.rule_to,
+            Field::VideoName => &mut self.video_name,
         }
     }
 
@@ -312,9 +320,28 @@ impl StudioView {
         window.focus(&handle, cx);
     }
 
+    fn start_naming_video(&mut self, window: &mut Window, cx: &mut App) {
+        self.naming_video = true;
+        self.video_name.text.clear();
+        self.focus_field(Field::VideoName, window, cx);
+    }
+
+    fn stop_naming_video(&mut self, window: &mut Window, cx: &mut App) {
+        self.naming_video = false;
+        self.video_name.text.clear();
+        window.focus(&self.focus_handle, cx);
+    }
+
     /// Sends what the field holds. Rules need both halves; Enter in "from" moves to "to".
     fn submit(&mut self, field: Field, window: &mut Window, cx: &mut App) {
         match field {
+            Field::VideoName => {
+                let name = self.video_name.text.trim().to_string();
+                if !name.is_empty() {
+                    self.engine.send(EngineCommand::NewVideo { name });
+                    self.stop_naming_video(window, cx);
+                }
+            }
             Field::Term => {
                 let term = self.term.text.trim().to_string();
                 if !term.is_empty() {
@@ -352,6 +379,7 @@ impl StudioView {
         let m = ks.modifiers;
         match ks.key.as_str() {
             "enter" => self.submit(field, window, cx),
+            "escape" if field == Field::VideoName => self.stop_naming_video(window, cx),
             "escape" => window.focus(&self.focus_handle, cx),
             "tab" => {
                 let to = if m.shift { field.prev() } else { field.next() };
@@ -394,11 +422,13 @@ impl StudioView {
             Field::Term => &self.term,
             Field::RuleFrom => &self.rule_from,
             Field::RuleTo => &self.rule_to,
+            Field::VideoName => &self.video_name,
         };
         let id = match field {
             Field::Term => "vocab-term",
             Field::RuleFrom => "vocab-from",
             Field::RuleTo => "vocab-to",
+            Field::VideoName => "video-name",
         };
         text_field(
             id,
@@ -532,7 +562,7 @@ impl StudioView {
         )
     }
 
-    fn transport(&self, snap: &Snapshot, cx: &mut Context<Self>) -> Div {
+    fn transport(&self, snap: &Snapshot, window: &Window, cx: &mut Context<Self>) -> Div {
         let (dot, label, elapsed, segment) = match &snap.phase {
             Phase::Idle => (0x4f5661, "IDLE", None, None),
             Phase::Starting { segment } => (AMBER, "STARTING", None, Some(*segment)),
@@ -576,14 +606,56 @@ impl StudioView {
             ButtonStyle::Secondary,
             recording.then(|| self.send_on_click(EngineCommand::Cut, cx)),
         );
-        let new_session = button(
-            "new-session",
-            "New session",
-            None,
-            ButtonStyle::Secondary,
-            (idle && snap.session.is_some())
-                .then(|| self.send_on_click(EngineCommand::EndSession, cx)),
-        );
+        // New video: a name field with Create/Cancel replaces the button until Enter or Esc.
+        let new_video =
+            if self.naming_video {
+                let create: OnClick = Box::new(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.submit(Field::VideoName, window, cx)
+                }));
+                let cancel: OnClick = Box::new(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.stop_naming_video(window, cx)
+                }));
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .w(px(360.0))
+                    .child(self.field(
+                        Field::VideoName,
+                        "Video name, e.g. Kubernetes Services 101",
+                        window,
+                        cx,
+                    ))
+                    .child(button(
+                        "new-video-create",
+                        "Create",
+                        None,
+                        ButtonStyle::Primary,
+                        (idle && !self.video_name.text.trim().is_empty()).then_some(create),
+                    ))
+                    .child(button(
+                        "new-video-cancel",
+                        "Cancel",
+                        None,
+                        ButtonStyle::Secondary,
+                        Some(cancel),
+                    ))
+            } else {
+                let start: OnClick = Box::new(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.start_naming_video(window, cx)
+                }));
+                div().child(button(
+                    "new-video",
+                    "New video…",
+                    None,
+                    ButtonStyle::Secondary,
+                    idle.then_some(start),
+                ))
+            };
+        let video_title = match &snap.session {
+            Some(session) => session.name.clone(),
+            None => "New video on Record".to_string(),
+        };
 
         let record_hint: SharedString = if idle && !snap.can_record {
             if let Some(reason) = &snap.storage.record_blocked_reason {
@@ -671,6 +743,17 @@ impl StudioView {
                                 Some(n) => format!("Segment {n}"),
                                 None => "No active segment".to_string(),
                             }),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(320.0))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(if snap.session.is_some() { TEXT } else { MUTED }))
+                            .child(video_title),
                     ),
             )
             .child(
@@ -689,7 +772,7 @@ impl StudioView {
                             )))
                             .child(record_hint),
                     )
-                    .child(new_session)
+                    .child(new_video)
                     .child(cut_button)
                     .child(record_button),
             )
@@ -1587,10 +1670,7 @@ impl StudioView {
     fn output_section(&self, snap: &Snapshot) -> Div {
         let (path, pending) = match &snap.session {
             Some(session) => (format!("{}/", session.dir.display()), false),
-            None => (
-                format!("{}/<new session>/", snap.output_root.display()),
-                true,
-            ),
+            None => (format!("{}/<new video>/", snap.output_root.display()), true),
         };
         div()
             .flex()
@@ -1620,8 +1700,8 @@ impl StudioView {
                             .child(path),
                     )
                     .child(match &snap.session {
-                        Some(_) => badge("Session open", GREEN),
-                        None => badge("New session on Record", 0x737b89),
+                        Some(_) => badge("Video open", GREEN),
+                        None => badge("New video on Record", 0x737b89),
                     }),
             )
     }
@@ -1846,12 +1926,13 @@ impl StudioView {
                 .justify_between()
                 .child(caption("SEGMENTS"))
                 .when_some(snap.session.as_ref(), |d, s| {
-                    d.child(
-                        div()
-                            .text_size(px(10.0))
-                            .text_color(rgb(MUTED))
-                            .child(format!("Session {}", s.name)),
-                    )
+                    d.child(div().text_size(px(10.0)).text_color(rgb(MUTED)).child(
+                        match s.earlier_segments {
+                            0 => format!("Video {}", s.name),
+                            1 => format!("Video {} · 1 earlier segment", s.name),
+                            n => format!("Video {} · {n} earlier segments", s.name),
+                        },
+                    ))
                 }),
         );
         match &snap.session {
@@ -1869,7 +1950,7 @@ impl StudioView {
                     div()
                         .text_size(px(11.0))
                         .text_color(rgb(MUTED))
-                        .child("Nothing recorded in this session yet."),
+                        .child("Nothing recorded in this run yet."),
                 );
             }
         }
@@ -2006,7 +2087,7 @@ impl Render for StudioView {
             .child(self.vocabulary_section(&snap, window, cx));
 
         root.when_some(self.banner(&snap), |d, b| d.child(b))
-            .child(self.transport(&snap, cx))
+            .child(self.transport(&snap, window, cx))
             .child(
                 div()
                     .flex_1()
