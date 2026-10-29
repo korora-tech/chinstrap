@@ -1,0 +1,379 @@
+---
+import Base from '../layouts/Base.astro';
+import Timeline from '../components/Timeline.astro';
+
+const REPO = 'https://github.com/korora-tech/chinstrap';
+
+const features = [
+  {
+    title: 'One file per input',
+    body: 'Camera, microphone and any number of screens and windows record at the same time, each to its own Matroska file. No compositing, no re-encoding later to pull them apart.',
+  },
+  {
+    title: 'One shared clock',
+    body: 'Every file in a segment is timestamped against the same base time and every video starts at zero. Drop them into an editor at the same position and they line up.',
+  },
+  {
+    title: 'Cut without stopping',
+    body: 'Press c to close the current segment and start the next one. Inputs keep running; the gap between segments is checked to stay under 1.5 s.',
+  },
+  {
+    title: '4K at native rates',
+    body: 'Cameras record at their own resolution and frame rate, up to 4096×2160 at 60 fps. Screens and windows lock to the size of their first frame, up to 3840×2160.',
+  },
+  {
+    title: 'Variable frame rate screens',
+    body: 'Native mode records a window only when it changes, up to the monitor’s refresh (144 fps on a 144 Hz panel). Switch to constant 60 or 30 fps for editors that dislike VFR.',
+  },
+  {
+    title: 'A plan before you press Record',
+    body: 'Each encoder is timed at startup. A planner assigns H.264, HEVC or x264 per input and warns before recording when the selection exceeds what the hardware measured, instead of dropping frames silently.',
+  },
+  {
+    title: 'On-device transcription',
+    body: 'Each finished segment’s mic file is transcribed locally with whisper.cpp on Vulkan, with CPU fallback. Word-level timings, SRT and VTT. Nothing leaves the machine.',
+  },
+  {
+    title: 'Crash recovery and disk safety',
+    body: 'A stale session is found at the next start and its files remuxed and verified before the originals are replaced. A 64 MiB reserve and measured write rates stop recording cleanly before the disk fills.',
+  },
+];
+---
+
+<Base>
+  <section class="hero wrap">
+    <div class="copy">
+      <p class="eyebrow">Recording studio for Linux</p>
+      <h1>Every input in its own file. One clock for all of them.</h1>
+      <p class="lede">
+        Chinstrap records a camera, a microphone and any number of screens and windows at once. Each goes to
+        its own file, all of them line up in your editor, and you can cut segments without stopping.
+        Built with <a href="https://github.com/zed-industries/zed/tree/main/crates/gpui">GPUI</a> and <a href="https://gstreamer.freedesktop.org">GStreamer</a>.
+      </p>
+      <div class="actions">
+        <a class="btn btn-primary" href="#install">Install with Nix</a>
+        <a class="btn" href="/docs">Read the docs</a>
+        <a class="btn" href={REPO}>GitHub</a>
+      </div>
+      <p class="meta">Wayland and X11 · PipeWire · xdg-desktop-portal · Apache-2.0</p>
+    </div>
+    <div class="visual">
+      <Timeline />
+    </div>
+  </section>
+
+  <section id="features" class="wrap section">
+    <p class="eyebrow">Features</p>
+    <h2>Built for people who edit what they record</h2>
+    <div class="cards">
+      {
+        features.map((f) => (
+          <article class="card">
+            <h3>{f.title}</h3>
+            <p>{f.body}</p>
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="wrap section split">
+    <div>
+      <p class="eyebrow">Output</p>
+      <h2>Plain files, a manifest, and nothing proprietary</h2>
+      <p>
+        A session is a folder. Each segment holds one Matroska file per input plus the transcript. <code>session.json</code> records base times, the first and last timestamp of each file, the encoder,
+        size and rate, and per-input frame accounting: frames dropped, repeated and padded, effective fps and
+        bitrate.
+      </p>
+      <p>
+        The same numbers are shown live in the Studio view. A video line turns amber when more than 1% of
+        frames are repeats or any frame was dropped.
+      </p>
+      <p><a href="/docs#output">How output is laid out →</a></p>
+    </div>
+    <pre><code>{`~/Videos/Chinstrap/
+  2026-10-21T18-31-02/
+    session.json
+    segment-001/
+      camera.mkv        H.264/HEVC, native size and rate
+      mic.mkv           Opus, 48 kHz
+      screen-3.mkv      one file per portal stream
+      window-4.mkv      VFR in Native mode
+      transcript.json   segments + word timings
+      mic.srt  mic.vtt
+    segment-002/ …`}</code></pre>
+  </section>
+
+  <section class="wrap section split reverse">
+    <pre><code>{`# ~/.config/chinstrap/glossary.txt
+Rawkode
+Kubernetes
+
+# ~/.config/chinstrap/replacements.txt
+raw code => Rawkode
+cube control => kubectl`}</code></pre>
+    <div>
+      <p class="eyebrow">Transcription</p>
+      <h2>Whisper on your GPU, spelled your way</h2>
+      <p>
+        The default model is Whisper large-v3-turbo (q8_0, 834.5 MiB) with Silero VAD to stop it inventing
+        text in silence. It is never downloaded silently: you click <strong>Download model</strong> or run <code>--download-model</code>, and every file is checked against a pinned SHA-256.
+      </p>
+      <p>
+        A glossary steers spelling of names and jargon; replacement rules fix what the glossary misses.
+        GPU jobs keep running while you record. There is a headless mode too: <code>chinstrap --transcribe recording.mkv</code>.
+      </p>
+      <p><a href="/docs#transcription">Transcription and vocabulary →</a></p>
+    </div>
+  </section>
+
+  <section id="install" class="wrap section">
+    <p class="eyebrow">Install</p>
+    <h2>Run it with Nix</h2>
+    <p class="narrow">
+      Chinstrap is packaged as a Nix flake for x86_64 and aarch64 Linux, with binaries on the <code>korora-tech</code> Cachix cache. Screen and window capture need an xdg-desktop-portal backend for
+      your compositor (GNOME, KDE, wlroots, niri, …).
+    </p>
+    <div class="install">
+      <div>
+        <h3>Try it</h3>
+        <pre><code>nix run github:korora-tech/chinstrap</code></pre>
+        <h3>Build from source</h3>
+        <pre><code>{`git clone ${REPO}
+cd chinstrap
+nix develop -c cargo run --release`}</code></pre>
+      </div>
+      <div>
+        <h3>Home Manager</h3>
+        <pre><code>{`{
+  imports = [ inputs.chinstrap.homeModules.default ];
+
+  programs.chinstrap = {
+    enable = true;
+    settings.whisper_lang = "en";
+    glossary = [ "Rawkode" "Kubernetes" ];
+    replacements."raw code" = "Rawkode";
+  };
+}`}</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <section class="wrap section">
+    <p class="eyebrow">Status</p>
+    <h2>What has been verified, and what has not</h2>
+    <p class="narrow">
+      Chinstrap is early (0.1.0). It has been tested on one machine. If yours differs, expect rough edges and
+      please <a href={`${REPO}/issues`}>report them</a>.
+    </p>
+    <div class="status">
+      <div class="card ok">
+        <h3>Checked</h3>
+        <ul>
+          <li>NixOS, niri, PipeWire 1.6.9, WirePlumber 0.5.18</li>
+          <li>AMD GPUs with <code>vah264enc</code></li>
+          <li>Sony ILCE-7CM2 at 3840×2160, 25 fps</li>
+          <li>Unit tests and the original engine self-tests</li>
+        </ul>
+      </div>
+      <div class="card todo">
+        <h3>Not yet checked</h3>
+        <ul>
+          <li>NVIDIA and Intel hardware</li>
+          <li>Other compositors and portal backends</li>
+          <li>Portal capture in an automated test</li>
+          <li>Long recordings; VFR and HEVC files in editors</li>
+        </ul>
+      </div>
+    </div>
+    <p><a href="/docs#what-is-verified-and-what-is-not">Full list in the docs →</a></p>
+  </section>
+</Base>
+
+<style>
+  .hero {
+    display: grid;
+    gap: 3rem;
+    padding-block: clamp(3rem, 8vw, 6rem) 2rem;
+    align-items: center;
+  }
+
+  @media (min-width: 60rem) {
+    .hero {
+      grid-template-columns: 1fr 1.1fr;
+    }
+  }
+
+  .copy,
+  .visual {
+    min-width: 0;
+  }
+
+  h1 {
+    font-size: clamp(2.1rem, 5.5vw, 3.4rem);
+    line-height: 1.08;
+    letter-spacing: -0.025em;
+    margin: 0 0 1.25rem;
+    text-wrap: balance;
+  }
+
+  h2 {
+    font-size: clamp(1.6rem, 3.5vw, 2.1rem);
+    line-height: 1.15;
+    letter-spacing: -0.015em;
+    margin: 0 0 1rem;
+    text-wrap: balance;
+  }
+
+  h3 {
+    font-size: 1.05rem;
+    margin: 0 0 0.5rem;
+  }
+
+  .lede {
+    font-size: 1.125rem;
+    color: var(--text-muted);
+    max-width: 36rem;
+    margin: 0 0 2rem;
+  }
+
+  .lede a {
+    color: var(--text);
+  }
+
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+
+  .meta {
+    margin-top: 1.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+
+  .section {
+    padding-top: clamp(3.5rem, 8vw, 6rem);
+  }
+
+  .narrow {
+    max-width: 44rem;
+    color: var(--text-muted);
+  }
+
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(min(100%, 16rem), 1fr));
+    gap: 1rem;
+    margin-top: 2rem;
+  }
+
+  .card {
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 1.25rem;
+  }
+
+  .card p {
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 0.95rem;
+  }
+
+  .split {
+    display: grid;
+    gap: 2rem;
+    align-items: center;
+  }
+
+  .split > * {
+    min-width: 0;
+  }
+
+  .split p {
+    color: var(--text-muted);
+  }
+
+  @media (min-width: 56rem) {
+    .split {
+      grid-template-columns: 1fr 1fr;
+      gap: 4rem;
+    }
+  }
+
+  @media (max-width: 55.99rem) {
+    .reverse > pre {
+      order: 2;
+    }
+  }
+
+  .install {
+    display: grid;
+    gap: 1.5rem;
+    margin-top: 2rem;
+  }
+
+  .install > * {
+    min-width: 0;
+  }
+
+  .install h3 {
+    margin-top: 0;
+  }
+
+  .install pre {
+    margin: 0 0 1.5rem;
+  }
+
+  @media (min-width: 56rem) {
+    .install {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+
+  .status {
+    display: grid;
+    gap: 1rem;
+    margin-block: 2rem 1.5rem;
+  }
+
+  @media (min-width: 40rem) {
+    .status {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+
+  .status ul {
+    margin: 0;
+    padding-left: 1.1rem;
+    color: var(--text-muted);
+    font-size: 0.95rem;
+  }
+
+  .status li + li {
+    margin-top: 0.35rem;
+  }
+
+  .ok h3::before,
+  .todo h3::before {
+    content: '';
+    display: inline-block;
+    width: 0.55rem;
+    height: 0.55rem;
+    border-radius: 50%;
+    margin-right: 0.5rem;
+    vertical-align: 0.1em;
+  }
+
+  .ok h3::before {
+    background: #5ec58f;
+  }
+
+  .todo h3::before {
+    background: #f0b44c;
+  }
+</style>

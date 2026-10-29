@@ -1,0 +1,169 @@
+---
+import '../styles/global.css';
+import logo from '../components/logo.svg?raw';
+
+interface Props {
+  title?: string;
+  description?: string;
+}
+
+const REPO = 'https://github.com/korora-tech/chinstrap';
+const {
+  title,
+  description = 'A native recording studio for Linux. Camera, microphone, screens and windows, each in its own file on one shared clock, with on-device transcription.',
+} = Astro.props;
+const fullTitle = title ? `${title} · Chinstrap` : 'Chinstrap: a native recording studio for Linux';
+const canonical = new URL(Astro.url.pathname, Astro.site);
+const path = Astro.url.pathname.replace(/\/$/, '') || '/';
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{fullTitle}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="theme-color" content="#0d0f12" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#fbfaf7" media="(prefers-color-scheme: light)" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Chinstrap" />
+    <meta property="og:title" content={fullTitle} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta name="twitter:card" content="summary" />
+    <meta name="generator" content={Astro.generator} />
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <header class="site-header">
+      <div class="wrap bar">
+        <a class="brand" href="/" aria-label="Chinstrap home">
+          <span class="logo" set:html={logo} />
+          <span>Chinstrap</span>
+        </a>
+        <nav aria-label="Main">
+          <a href="/#features">Features</a>
+          <a href="/#install">Install</a>
+          <a href="/docs" aria-current={path === '/docs' ? 'page' : undefined}>Docs</a>
+          <a href={REPO}>GitHub</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <slot />
+    </main>
+
+    <footer class="site-footer">
+      <div class="wrap foot">
+        <p>
+          Chinstrap is open source (Apache-2.0), by <a href="https://github.com/korora-tech">korora-tech</a>.
+        </p>
+        <p>
+          <a href={REPO}>Source</a> · <a href={`${REPO}/issues`}>Issues</a> · <a href="/docs">Docs</a>
+        </p>
+      </div>
+    </footer>
+  </body>
+</html>
+
+<style>
+  .skip {
+    position: absolute;
+    left: -999px;
+    top: 0.5rem;
+    z-index: 100;
+    padding: 0.5rem 0.75rem;
+    background: var(--bg-raised);
+    border-radius: 6px;
+  }
+
+  .skip:focus {
+    left: 0.5rem;
+  }
+
+  .site-header {
+    position: sticky;
+    top: 0;
+    z-index: 50;
+    background: color-mix(in srgb, var(--bg) 85%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    height: 3.75rem;
+  }
+
+  .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    font-weight: 700;
+    font-size: 1.05rem;
+    color: var(--text);
+    text-decoration: none;
+    flex-shrink: 0;
+  }
+
+  .logo {
+    display: inline-flex;
+    width: 1.75rem;
+    height: 1.75rem;
+  }
+
+  .logo :global(svg) {
+    width: 100%;
+    height: 100%;
+  }
+
+  nav {
+    display: flex;
+    gap: clamp(0.75rem, 3vw, 1.5rem);
+    font-size: 0.925rem;
+    min-width: 0;
+  }
+
+  nav a {
+    color: var(--text-muted);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+
+  nav a:hover,
+  nav a[aria-current='page'] {
+    color: var(--text);
+  }
+
+  @media (max-width: 30rem) {
+    nav a[href='/#features'] {
+      display: none;
+    }
+  }
+
+  .site-footer {
+    border-top: 1px solid var(--border);
+    margin-top: 5rem;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+  }
+
+  .foot {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 0.5rem 2rem;
+    padding-block: 2rem;
+  }
+
+  .foot p {
+    margin: 0;
+  }
+</style>

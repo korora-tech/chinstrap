@@ -1,0 +1,174 @@
+---
+import Base from '../layouts/Base.astro';
+// The README is the single source of truth for the docs; this page renders it at build time.
+import { Content, getHeadings } from '../../../README.md';
+
+const REPO = 'https://github.com/korora-tech/chinstrap';
+const toc = getHeadings().filter((h) => h.depth === 2 || h.depth === 3);
+---
+
+<Base title="Docs" description="Running Chinstrap, its output layout, 4K recording, frame rates, transcription, configuration and self-test.">
+  <div class="wrap docs">
+    <aside class="toc">
+      <details open>
+        <summary>On this page</summary>
+        <ol>
+          {
+            toc.map((h) => (
+              <li class={`d${h.depth}`}>
+                <a href={`#${h.slug}`}>{h.text}</a>
+              </li>
+            ))
+          }
+        </ol>
+      </details>
+    </aside>
+
+    <article class="prose">
+      <Content />
+      <p class="edit">
+        This page is the project’s <a href={`${REPO}/blob/main/README.md`}>README</a>. Corrections go there.
+      </p>
+    </article>
+  </div>
+</Base>
+
+<style>
+  .docs {
+    display: grid;
+    gap: 2rem;
+    padding-top: 2.5rem;
+  }
+
+  .docs > * {
+    min-width: 0;
+  }
+
+  @media (min-width: 60rem) {
+    .docs {
+      grid-template-columns: 15rem minmax(0, 1fr);
+      gap: 3.5rem;
+    }
+
+    .toc {
+      position: sticky;
+      top: 5rem;
+      align-self: start;
+      max-height: calc(100vh - 6rem);
+      overflow-y: auto;
+    }
+  }
+
+  .toc details {
+    font-size: 0.875rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0.85rem 1rem;
+    background: var(--bg-raised);
+  }
+
+  @media (min-width: 60rem) {
+    .toc details {
+      border: 0;
+      padding: 0;
+      background: none;
+    }
+
+    .toc summary {
+      pointer-events: none;
+      list-style: none;
+    }
+
+    .toc summary::-webkit-details-marker {
+      display: none;
+    }
+  }
+
+  .toc summary {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .toc ol {
+    list-style: none;
+    margin: 0.75rem 0 0;
+    padding: 0;
+  }
+
+  .toc li {
+    margin: 0.3rem 0;
+  }
+
+  .toc .d3 {
+    padding-left: 0.9rem;
+  }
+
+  .toc a {
+    color: var(--text-muted);
+    text-decoration: none;
+  }
+
+  .toc a:hover {
+    color: var(--text);
+  }
+
+  .prose {
+    max-width: 50rem;
+    overflow-wrap: break-word;
+  }
+
+  .prose :global(h1) {
+    font-size: clamp(2rem, 5vw, 2.75rem);
+    letter-spacing: -0.02em;
+    line-height: 1.1;
+    margin: 0 0 1.25rem;
+  }
+
+  .prose :global(h2) {
+    font-size: 1.6rem;
+    letter-spacing: -0.01em;
+    margin: 3.5rem 0 1rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+  }
+
+  .prose :global(h3) {
+    font-size: 1.2rem;
+    margin: 2.25rem 0 0.75rem;
+  }
+
+  .prose :global(p),
+  .prose :global(li) {
+    color: color-mix(in srgb, var(--text) 88%, var(--text-muted));
+  }
+
+  .prose :global(li + li) {
+    margin-top: 0.4rem;
+  }
+
+  .prose :global(table) {
+    display: block;
+    overflow-x: auto;
+    margin: 1.25rem 0;
+  }
+
+  .prose :global(td code) {
+    white-space: nowrap;
+  }
+
+  .prose :global(pre) {
+    margin: 1.25rem 0;
+  }
+
+  .edit {
+    margin-top: 4rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.9rem;
+    color: var(--text-muted) !important;
+  }
+</style>
