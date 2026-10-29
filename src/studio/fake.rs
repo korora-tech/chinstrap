@@ -73,9 +73,12 @@ struct FakeEngine {
     caps: Capabilities,
     cameras: Vec<DeviceInfo>,
     microphones: Vec<DeviceInfo>,
+    system_audio_devices: Vec<DeviceInfo>,
     sources: Vec<SourceInfo>,
     selected_camera: Option<DeviceId>,
     selected_microphone: Option<DeviceId>,
+    selected_system_audio: Option<DeviceId>,
+    system_audio_test_tone: bool,
     output_root: PathBuf,
     phase: Phase,
     portal_busy: bool,
@@ -91,6 +94,7 @@ struct FakeEngine {
     /// (segment, Instant it reached Recording).
     segment_started: Option<(u32, Instant)>,
     last_level: Instant,
+    last_system_level: Instant,
     last_bytes: Instant,
     level_phase: f32,
     model: ModelState,
@@ -182,13 +186,42 @@ impl FakeEngine {
                 modes: Vec::new(),
             },
         ];
+        let system_audio_devices = vec![
+            DeviceInfo {
+                id: DEFAULT_SYSTEM_AUDIO_ID,
+                kind: DeviceKind::SystemAudio,
+                name: "Default output".into(),
+                detail: "Follows the current PipeWire output".into(),
+                unsupported: None,
+                modes: Vec::new(),
+            },
+            DeviceInfo {
+                id: DeviceId(5),
+                kind: DeviceKind::SystemAudio,
+                name: "Fake HDMI Output".into(),
+                detail: "fake #70 · current default".into(),
+                unsupported: None,
+                modes: Vec::new(),
+            },
+            DeviceInfo {
+                id: DeviceId(6),
+                kind: DeviceKind::SystemAudio,
+                name: "Fake USB Output".into(),
+                detail: "fake #71".into(),
+                unsupported: None,
+                modes: Vec::new(),
+            },
+        ];
         let now = Instant::now();
         Self {
             events,
             caps,
             selected_microphone: microphones.first().map(|m| m.id),
+            selected_system_audio: None,
+            system_audio_test_tone: false,
             cameras,
             microphones,
+            system_audio_devices,
             sources: Vec::new(),
             selected_camera: None,
             output_root: config.output_root,
@@ -203,6 +236,7 @@ impl FakeEngine {
             stop_clock: None,
             segment_started: None,
             last_level: now,
+            last_system_level: now,
             last_bytes: now,
             level_phase: 0.0,
             model: ModelState::Missing {
@@ -255,7 +289,7 @@ impl FakeEngine {
         let mut demands = Vec::new();
         for key in self.frozen_inputs() {
             match key {
-                InputKey::Microphone => {}
+                InputKey::Microphone | InputKey::SystemAudio => {}
                 InputKey::Camera => {
                     if let Some(m) = self.camera_mode_info() {
                         demands.push(Demand {
@@ -348,9 +382,12 @@ impl FakeEngine {
             capabilities: self.caps.clone(),
             cameras: self.cameras.clone(),
             microphones: self.microphones.clone(),
+            system_audio_devices: self.system_audio_devices.clone(),
             sources: self.sources.clone(),
             selected_camera: self.selected_camera,
             selected_microphone: self.selected_microphone,
+            selected_system_audio: self.selected_system_audio,
+            system_audio_test_tone: self.system_audio_test_tone,
             output_root: self.output_root.clone(),
             phase: self.phase.clone(),
             portal_busy: self.portal_busy,
@@ -416,6 +453,9 @@ impl FakeEngine {
         if self.selected_microphone.is_some() {
             inputs.push(InputKey::Microphone);
         }
+        if self.selected_system_audio.is_some() || self.system_audio_test_tone {
+            inputs.push(InputKey::SystemAudio);
+        }
         inputs.extend(
             self.sources
                 .iter()
@@ -454,7 +494,7 @@ impl FakeEngine {
     fn previewed(&self) -> Vec<InputKey> {
         let ready = |k: &InputKey| match k {
             InputKey::Camera => self.camera_ok(),
-            InputKey::Microphone => false,
+            InputKey::Microphone | InputKey::SystemAudio => false,
             InputKey::Source(id) => self
                 .sources
                 .iter()
@@ -537,6 +577,8 @@ impl FakeEngine {
             }
             EngineCommand::SelectCamera(_)
             | EngineCommand::SelectMicrophone(_)
+            | EngineCommand::SelectSystemAudio(_)
+            | EngineCommand::SelectSystemAudioTestTone
             | EngineCommand::AddPortalSources
             | EngineCommand::AddTestSource
             | EngineCommand::RemoveSource(_)
@@ -661,6 +703,24 @@ impl FakeEngine {
                 }
                 Some(_) => self.reject(&cmd, "unknown microphone"),
             },
+            EngineCommand::SelectSystemAudio(id) => match id {
+                None => {
+                    self.selected_system_audio = None;
+                    self.system_audio_test_tone = false;
+                    self.snapshot();
+                }
+                Some(id) if self.system_audio_devices.iter().any(|d| d.id == *id) => {
+                    self.selected_system_audio = Some(*id);
+                    self.system_audio_test_tone = false;
+                    self.snapshot();
+                }
+                Some(_) => self.reject(&cmd, "unknown system-audio output"),
+            },
+            EngineCommand::SelectSystemAudioTestTone => {
+                self.selected_system_audio = None;
+                self.system_audio_test_tone = true;
+                self.snapshot();
+            }
             EngineCommand::AddPortalSources => {
                 if self.portal_busy {
                     self.reject(&cmd, "the picker is already open");
@@ -964,6 +1024,7 @@ impl FakeEngine {
         let (label, file) = match input {
             InputKey::Camera => ("Camera".to_string(), "camera.mkv".to_string()),
             InputKey::Microphone => ("Microphone".to_string(), "mic.mkv".to_string()),
+            InputKey::SystemAudio => ("System audio".to_string(), "system.mkv".to_string()),
             InputKey::Source(id) => {
                 let src = self.sources.iter().find(|s| s.id == id);
                 let label = src.map_or_else(|| format!("Source {}", id.0), |s| s.label.clone());
@@ -1115,6 +1176,15 @@ impl FakeEngine {
                         peak_db: peak,
                     });
                 }
+                if self.inputs.contains(&InputKey::SystemAudio)
+                    && now.duration_since(self.last_system_level) >= LEVEL_EVERY
+                {
+                    self.last_system_level = now;
+                    let _ = self.events.send_blocking(EngineEvent::SystemAudioLevel {
+                        rms_db: -24.0,
+                        peak_db: -12.0,
+                    });
+                }
             }
             if now.duration_since(self.last_bytes) >= BYTES_EVERY {
                 self.last_bytes = now;
@@ -1126,7 +1196,7 @@ impl FakeEngine {
                     for file in &mut seg.files {
                         if file.status == InputStatus::Recording {
                             file.bytes += match file.input {
-                                InputKey::Microphone => 24_000,
+                                InputKey::Microphone | InputKey::SystemAudio => 24_000,
                                 _ => 1_500_000,
                             };
                             fake_quality(file, since, &plan);
@@ -1317,6 +1387,7 @@ fn fake_frame(key: InputKey, origin: PreviewOrigin, t: f64) -> PreviewFrame {
     let hue = match key {
         InputKey::Camera => 200.0,
         InputKey::Microphone => 0.0,
+        InputKey::SystemAudio => 120.0,
         InputKey::Source(id) => (id.0 as f64 * 67.0) % 360.0,
     };
     let bar = ((t / 2.0).fract() * w as f64) as usize;
@@ -1364,7 +1435,7 @@ fn hsv(h: f64, s: f64, v: f64) -> (u8, u8, u8) {
 /// Plausible live counters: windows wait for their first frame, then run near their planned
 /// rate; the camera repeats a few frames; quality is a pure function of elapsed time.
 fn fake_quality(file: &mut InputFile, since: Duration, plan: &CapacityPlan) {
-    if file.input == InputKey::Microphone {
+    if matches!(file.input, InputKey::Microphone | InputKey::SystemAudio) {
         return;
     }
     let window = matches!(file.input, InputKey::Source(_));
@@ -1512,6 +1583,61 @@ mod tests {
             last.session.unwrap().segments[2].status,
             SegmentStatus::Complete
         );
+    }
+
+    #[test]
+    fn system_audio_is_opt_in_and_uses_a_separate_file() {
+        let (engine, rx) = start(config()).expect("start fake engine");
+        let first = wait_for(&rx, Duration::from_secs(1), |_| true);
+        assert_eq!(first.selected_system_audio, None);
+        assert_eq!(first.system_audio_devices.len(), 3);
+        assert_eq!(first.system_audio_devices[0].id, DEFAULT_SYSTEM_AUDIO_ID);
+        assert_eq!(first.system_audio_devices[0].name, "Default output");
+
+        engine.send(EngineCommand::Record);
+        wait_for(&rx, Duration::from_secs(2), |s| {
+            matches!(s.phase, Phase::Recording { segment: 1, .. })
+        });
+        engine.send(EngineCommand::Stop);
+        let first_done = wait_for(&rx, Duration::from_secs(2), |s| {
+            s.phase == Phase::Idle
+                && s.session
+                    .as_ref()
+                    .is_some_and(|session| session.segments.len() == 1)
+        });
+        assert!(
+            first_done.session.as_ref().unwrap().segments[0]
+                .files
+                .iter()
+                .all(|file| file.input != InputKey::SystemAudio)
+        );
+
+        engine.send(EngineCommand::SelectSystemAudio(Some(
+            DEFAULT_SYSTEM_AUDIO_ID,
+        )));
+        let selected = wait_for(&rx, Duration::from_secs(1), |s| {
+            s.selected_system_audio == Some(DEFAULT_SYSTEM_AUDIO_ID)
+        });
+        assert!(selected.can_record);
+        engine.send(EngineCommand::Record);
+        wait_for(&rx, Duration::from_secs(2), |s| {
+            matches!(s.phase, Phase::Recording { segment: 2, .. })
+        });
+        engine.send(EngineCommand::Stop);
+        let done = wait_for(&rx, Duration::from_secs(2), |s| {
+            s.phase == Phase::Idle
+                && s.session
+                    .as_ref()
+                    .is_some_and(|session| session.segments.len() == 2)
+        });
+        let system = done.session.as_ref().unwrap().segments[1]
+            .files
+            .iter()
+            .find(|file| file.input == InputKey::SystemAudio)
+            .expect("separate system-audio input");
+        assert_eq!(system.path.file_name().unwrap(), "system.mkv");
+        assert_eq!(system.status, InputStatus::Complete);
+        assert!(engine.shutdown_blocking(Duration::from_secs(2)));
     }
 
     #[test]

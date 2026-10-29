@@ -564,6 +564,9 @@ struct Engine {
     devices: Devices,
     selected_camera: Option<DeviceId>,
     selected_microphone: Option<DeviceId>,
+    selected_system_audio: Option<DeviceId>,
+    /// Only set by the self-test fallback; normal system audio is always a selected PipeWire sink.
+    system_audio_test_tone: bool,
     sources: Vec<Source>,
     captures: HashMap<CaptureId, Capture>,
     output_root: PathBuf,
@@ -595,6 +598,7 @@ struct Engine {
     checkpoint: CheckpointWriteState,
     manifest_retry_at: Option<Instant>,
     last_level: Instant,
+    last_system_level: Instant,
     dirty: bool,
     manifest_dirty: bool,
     warned: HashSet<String>,
@@ -636,6 +640,7 @@ fn key_string(key: InputKey) -> String {
     match key {
         InputKey::Camera => "camera".into(),
         InputKey::Microphone => "mic".into(),
+        InputKey::SystemAudio => "system".into(),
         InputKey::Source(id) => format!("source:{}", id.0),
     }
 }
@@ -752,6 +757,17 @@ fn level_max(s: &gst::StructureRef, field: &str) -> Option<f32> {
         return None;
     };
     vals.into_iter().reduce(f64::max).map(|x| x as f32)
+}
+
+fn system_audio_selection_after_refresh(
+    selected: Option<DeviceId>,
+    available: bool,
+    busy: bool,
+) -> (Option<DeviceId>, bool) {
+    match selected {
+        Some(id) if !available => (busy.then_some(id), true),
+        _ => (selected, false),
+    }
 }
 
 impl Engine {
@@ -908,6 +924,8 @@ impl Engine {
             devices,
             selected_camera: None,
             selected_microphone,
+            selected_system_audio: None,
+            system_audio_test_tone: false,
             sources: Vec::new(),
             captures: HashMap::new(),
             min_free_mb: cfg.selftest_min_free_mb.unwrap_or_else(|| {
@@ -939,6 +957,7 @@ impl Engine {
             checkpoint: CheckpointWriteState::new(now),
             manifest_retry_at: None,
             last_level: now,
+            last_system_level: now,
             dirty: true,
             manifest_dirty: false,
             warned: HashSet::new(),
@@ -1080,9 +1099,12 @@ impl Engine {
                 .iter()
                 .map(|e| e.info.clone())
                 .collect(),
+            system_audio_devices: self.devices.system_audio_infos(),
             sources: self.sources.iter().map(|s| s.info.clone()).collect(),
             selected_camera: self.selected_camera,
             selected_microphone: self.selected_microphone,
+            selected_system_audio: self.selected_system_audio,
+            system_audio_test_tone: self.system_audio_test_tone,
             output_root: self.output_root.clone(),
             phase: self.phase.clone(),
             portal_busy: self.portal_busy,
@@ -1274,6 +1296,30 @@ impl Engine {
                     .is_some()
                     && encoders::class_ok(missing, InputClass::Mic)
             }
+            InputKey::SystemAudio => {
+                if !encoders::class_ok(missing, InputClass::Mic) {
+                    return false;
+                }
+                if self.system_audio_test_tone {
+                    return encoders::has_element("audiotestsrc");
+                }
+                match self.selected_system_audio {
+                    Some(id) if id == DEFAULT_SYSTEM_AUDIO_ID => {
+                        self.devices
+                            .system_audio_infos()
+                            .iter()
+                            .any(|d| d.id == DEFAULT_SYSTEM_AUDIO_ID)
+                            && encoders::class_ok(missing, InputClass::PipeWire)
+                    }
+                    Some(id) => {
+                        self.devices
+                            .system_audio(id)
+                            .is_some_and(|e| e.serial.is_some() && e.info.unsupported.is_none())
+                            && encoders::class_ok(missing, InputClass::PipeWire)
+                    }
+                    None => false,
+                }
+            }
             InputKey::Source(id) => {
                 let Some(s) = self.sources.iter().find(|s| s.info.id == id) else {
                     return false;
@@ -1293,6 +1339,7 @@ impl Engine {
 
     fn frozen_inputs(&self) -> Vec<InputKey> {
         let mut keys = vec![InputKey::Camera, InputKey::Microphone];
+        keys.push(InputKey::SystemAudio);
         keys.extend(self.sources.iter().map(|s| InputKey::Source(s.info.id)));
         keys.into_iter()
             .filter(|k| self.input_recordable(*k))
@@ -1409,6 +1456,8 @@ impl Engine {
             }
             EngineCommand::SelectCamera(_)
             | EngineCommand::SelectMicrophone(_)
+            | EngineCommand::SelectSystemAudio(_)
+            | EngineCommand::SelectSystemAudioTestTone
             | EngineCommand::AddPortalSources
             | EngineCommand::AddTestSource
             | EngineCommand::RemoveSource(_)
@@ -1499,6 +1548,41 @@ impl Engine {
                 }
                 Some(_) => self.reject(&cmd, "unknown microphone"),
             },
+            EngineCommand::SelectSystemAudio(id) => match id {
+                None => {
+                    self.selected_system_audio = None;
+                    self.system_audio_test_tone = false;
+                    self.dirty = true;
+                }
+                Some(id)
+                    if *id == DEFAULT_SYSTEM_AUDIO_ID
+                        && self
+                            .devices
+                            .system_audio_infos()
+                            .iter()
+                            .any(|d| d.id == DEFAULT_SYSTEM_AUDIO_ID) =>
+                {
+                    self.selected_system_audio = Some(*id);
+                    self.system_audio_test_tone = false;
+                    self.dirty = true;
+                }
+                Some(id)
+                    if self
+                        .devices
+                        .system_audio(*id)
+                        .is_some_and(|e| e.info.unsupported.is_none()) =>
+                {
+                    self.selected_system_audio = Some(*id);
+                    self.system_audio_test_tone = false;
+                    self.dirty = true;
+                }
+                Some(_) => self.reject(&cmd, "unknown or unsupported system-audio output"),
+            },
+            EngineCommand::SelectSystemAudioTestTone => {
+                self.selected_system_audio = None;
+                self.system_audio_test_tone = true;
+                self.dirty = true;
+            }
             EngineCommand::AddPortalSources => {
                 if self.portal_busy {
                     self.reject(&cmd, "the picker is already open");
@@ -1784,8 +1868,36 @@ impl Engine {
         self.validate_selection();
     }
 
+    fn system_audio_available(&self, id: DeviceId) -> bool {
+        if id == DEFAULT_SYSTEM_AUDIO_ID {
+            self.devices
+                .system_audio_infos()
+                .iter()
+                .any(|device| device.id == DEFAULT_SYSTEM_AUDIO_ID)
+        } else {
+            self.devices.system_audio(id).is_some()
+        }
+    }
+
     fn validate_selection(&mut self) {
-        if self.phase.is_busy() {
+        let busy = self.phase.is_busy() || self.record_pending;
+        if let Some(id) = self.selected_system_audio {
+            let available = self.system_audio_available(id);
+            let (selection, disconnected) =
+                system_audio_selection_after_refresh(Some(id), available, busy);
+            self.selected_system_audio = selection;
+            let warning_key = format!("system-audio-disconnected-{}", id.0);
+            if available {
+                self.warned.remove(&warning_key);
+            } else if disconnected && self.warned.insert(warning_key) {
+                self.notice(
+                    Severity::Warning,
+                    Some(InputKey::SystemAudio),
+                    "System audio output disconnected",
+                );
+            }
+        }
+        if busy {
             return;
         }
         if let Some(id) = self.selected_camera
@@ -1917,6 +2029,13 @@ impl Engine {
                 Severity::Warning,
                 Some(InputKey::Microphone),
                 "The selected microphone cannot record; recording without it",
+            );
+        }
+        if self.selected_system_audio.is_some() && !inputs.contains(&InputKey::SystemAudio) {
+            self.notice(
+                Severity::Warning,
+                Some(InputKey::SystemAudio),
+                "The selected system audio cannot record; recording without it",
             );
         }
         self.start_segment(inputs, None);
@@ -2124,6 +2243,28 @@ impl Engine {
                         name,
                     )
                 }
+                InputKey::SystemAudio => {
+                    let info = self.selected_system_audio.and_then(|id| {
+                        self.devices
+                            .system_audio_infos()
+                            .into_iter()
+                            .find(|d| d.id == id)
+                    });
+                    let label = info
+                        .as_ref()
+                        .map(|d| format!("System audio · {}", d.name))
+                        .unwrap_or_else(|| "System audio · self-test tone".into());
+                    (
+                        label,
+                        "system-audio",
+                        "system.mkv".to_string(),
+                        None,
+                        info.map(|d| d.name).or_else(|| {
+                            self.system_audio_test_tone
+                                .then(|| "synthetic 440 Hz test tone".into())
+                        }),
+                    )
+                }
                 InputKey::Source(id) => {
                     let s = self.sources.iter().find(|s| s.info.id == id);
                     let kind = s.map_or(SourceKind::Monitor, |s| s.info.kind);
@@ -2137,7 +2278,7 @@ impl Engine {
                 }
             };
             let path = dir.join(&file_name);
-            let codec = if key == InputKey::Microphone {
+            let codec = if matches!(key, InputKey::Microphone | InputKey::SystemAudio) {
                 "opus"
             } else {
                 plan.get(key).map_or("h264", |a| a.enc.codec().name())
@@ -2278,7 +2419,7 @@ impl Engine {
         let mut out = Vec::new();
         for &key in inputs {
             match key {
-                InputKey::Microphone => {}
+                InputKey::Microphone | InputKey::SystemAudio => {}
                 InputKey::Camera => {
                     let Some(e) = self.selected_camera.and_then(|id| self.devices.camera(id))
                     else {
@@ -2432,8 +2573,11 @@ impl Engine {
                 (fps, 1),
             ));
         }
-        let planned_rate =
-            storage::estimate_bytes_per_second(&video_kbps, inputs.contains(&InputKey::Microphone));
+        let planned_rate = storage::estimate_bytes_per_second(
+            &video_kbps,
+            inputs.contains(&InputKey::Microphone),
+            inputs.contains(&InputKey::SystemAudio),
+        );
         let measured_rate = self.measured_storage_rate();
         let rate = measured_rate.unwrap_or(planned_rate);
         let free = match self.storage_free_bytes_override {
@@ -2602,6 +2746,25 @@ impl Engine {
                     .and_then(|id| self.devices.microphone(id))
                     .ok_or("the microphone is gone")?;
                 recorder::build_mic(&name, e, &self.clock, path)
+            }
+            InputKey::SystemAudio => {
+                if self.system_audio_test_tone {
+                    return recorder::build_system_audio_test_tone(&name, &self.clock, path);
+                }
+                let id = self
+                    .selected_system_audio
+                    .ok_or("system audio is not selected")?;
+                let serial = if id == DEFAULT_SYSTEM_AUDIO_ID {
+                    None
+                } else {
+                    Some(
+                        self.devices
+                            .system_audio(id)
+                            .and_then(|e| e.serial.as_deref())
+                            .ok_or("the selected output is gone")?,
+                    )
+                };
+                recorder::build_system_audio(&name, serial, &self.clock, path)
             }
             InputKey::Camera => {
                 let e = self
@@ -3191,6 +3354,7 @@ impl Engine {
         };
         let is_probe = matches!(p.kind, PipeKind::Probe { .. });
         let is_preview = p.is_preview();
+        let input_key = p.input().map(|(_, key)| key);
         match msg.view() {
             gst::MessageView::Eos(_) => {
                 if is_preview {
@@ -3263,15 +3427,28 @@ impl Engine {
             gst::MessageView::Element(el) => {
                 if let Some(s) = el.structure()
                     && s.name() == "level"
-                    && self.last_level.elapsed() >= LEVEL_EVERY
                     && matches!(self.phase, Phase::Recording { .. })
                     && let (Some(rms), Some(peak)) = (level_max(s, "rms"), level_max(s, "peak"))
                 {
-                    self.last_level = Instant::now();
-                    let _ = self.events.send_blocking(EngineEvent::Level {
-                        rms_db: rms,
-                        peak_db: peak,
-                    });
+                    match input_key {
+                        Some(InputKey::Microphone) if self.last_level.elapsed() >= LEVEL_EVERY => {
+                            self.last_level = Instant::now();
+                            let _ = self.events.send_blocking(EngineEvent::Level {
+                                rms_db: rms,
+                                peak_db: peak,
+                            });
+                        }
+                        Some(InputKey::SystemAudio)
+                            if self.last_system_level.elapsed() >= LEVEL_EVERY =>
+                        {
+                            self.last_system_level = Instant::now();
+                            let _ = self.events.send_blocking(EngineEvent::SystemAudioLevel {
+                                rms_db: rms,
+                                peak_db: peak,
+                            });
+                        }
+                        _ => {}
+                    }
                 }
             }
             _ => {}
@@ -3643,7 +3820,7 @@ impl Engine {
         let name = format!("preview-{}", key_string(key).replace(':', "-"));
         let mut capture = None;
         let built = match key {
-            InputKey::Microphone => return,
+            InputKey::Microphone | InputKey::SystemAudio => return,
             InputKey::Camera => match self.selected_camera.and_then(|id| self.devices.camera(id)) {
                 Some(entry) => match entry.mode(self.camera_mode.as_deref()) {
                     Some(mode) => recorder::build_preview(
@@ -4724,6 +4901,7 @@ mod tests {
             let (kind, codec) = match key {
                 InputKey::Camera => ("camera", "h264"),
                 InputKey::Microphone => ("microphone", "opus"),
+                InputKey::SystemAudio => ("system audio", "opus"),
                 InputKey::Source(_) => ("test", "h264"),
             };
             let label = format!("{kind} test");
@@ -4830,6 +5008,8 @@ mod tests {
             devices,
             selected_camera: None,
             selected_microphone: None,
+            selected_system_audio: None,
+            system_audio_test_tone: false,
             sources: Vec::new(),
             captures: HashMap::new(),
             output_root: root.to_path_buf(),
@@ -4861,6 +5041,7 @@ mod tests {
             checkpoint: CheckpointWriteState::new(now),
             manifest_retry_at: None,
             last_level: now,
+            last_system_level: now,
             dirty: false,
             manifest_dirty: false,
             warned: HashSet::new(),
@@ -4887,6 +5068,59 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn selected_unrecordable_system_audio_is_reported() {
+        let root = storage_test_root("system-audio-unrecordable-warning");
+        let (mut engine, _) = storage_test_engine(&root, false);
+        let (events, event_rx) = async_channel::unbounded();
+        engine.events = events;
+        engine.pipes.clear();
+        engine.phase = Phase::Idle;
+        engine.selected_system_audio = Some(DeviceId(u32::MAX));
+        engine.caps.h264_encoder = Some(VideoEncoder::X264);
+        engine.sources.push(Source {
+            info: SourceInfo {
+                id: SourceId(999),
+                capture: None,
+                kind: SourceKind::TestPattern,
+                label: "Test pattern 999".into(),
+                logical_size: Some((1280, 720)),
+                state: SourceState::Ready,
+                frame_rate: FrameRateMode::Cfr30,
+                refresh: Some((30, 1)),
+                size: Some((1280, 720)),
+            },
+            node: None,
+            convert: None,
+            gl_retry: false,
+        });
+        engine.session.as_mut().unwrap().reserve_path = Some(root.join("stop-reserve"));
+        let blocker = root.join("session").join("segment-002");
+        std::fs::write(
+            &blocker,
+            b"force segment creation to stop before pipelines start",
+        )
+        .unwrap();
+
+        engine.begin_recording();
+
+        let mut warning_found = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let EngineEvent::Notice(notice) = event
+                && notice.message == "The selected system audio cannot record; recording without it"
+            {
+                warning_found = true;
+            }
+        }
+        assert!(
+            warning_found,
+            "selected but unrecordable system audio must not be silently omitted"
+        );
+        engine.devices.stop();
+        drop(engine);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -5093,5 +5327,31 @@ mod tests {
         assert!(!state.pending);
         assert!(!state.request_if_due(true, retry + Duration::from_secs(4), &mut manifest_dirty));
         assert!(state.request_if_due(true, retry + Duration::from_secs(5), &mut manifest_dirty));
+    }
+
+    #[test]
+    fn disconnected_system_output_is_retained_while_busy_and_cleared_when_idle() {
+        let id = DeviceId(42);
+        assert_eq!(
+            system_audio_selection_after_refresh(Some(id), false, true),
+            (Some(id), true)
+        );
+        assert_eq!(
+            system_audio_selection_after_refresh(Some(id), false, false),
+            (None, true)
+        );
+    }
+
+    #[test]
+    fn connected_or_unselected_system_audio_does_not_report_disconnect() {
+        let id = DeviceId(42);
+        assert_eq!(
+            system_audio_selection_after_refresh(Some(id), true, true),
+            (Some(id), false)
+        );
+        assert_eq!(
+            system_audio_selection_after_refresh(None, false, false),
+            (None, false)
+        );
     }
 }
