@@ -91,6 +91,7 @@
               ./Cargo.toml
               ./Cargo.lock
               ./src
+              ./data/chinstrap.desktop
               # Integration tests (worker orphan protection) run in checkPhase too.
               (pkgs.lib.fileset.maybeMissing ./tests)
             ];
@@ -113,6 +114,11 @@
           dontUseCmakeConfigure = true;
           env = ggmlEnv pkgs;
           buildInputs = buildInputs pkgs ++ gstPlugins pkgs;
+
+          # Launchers list the app from this entry; StartupWMClass matches the window's app_id.
+          postInstall = ''
+            install -Dm644 data/chinstrap.desktop $out/share/applications/chinstrap.desktop
+          '';
 
           postFixup = ''
             wrapProgram $out/bin/chinstrap \
