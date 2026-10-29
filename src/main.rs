@@ -104,6 +104,8 @@ fn main() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    // Must match StartupWMClass in data/chinstrap.desktop.
+                    app_id: Some("chinstrap".into()),
                     ..Default::default()
                 },
                 |window, cx| {

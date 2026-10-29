@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Chinstrap
+GenericName=Recording Studio
+Comment=Record a camera, microphone, screens and windows on one shared clock
+Exec=chinstrap
+Icon=camera-video
+Terminal=false
+Categories=AudioVideo;Video;Recorder;
+Keywords=record;screen;camera;microphone;studio;
+StartupWMClass=chinstrap
