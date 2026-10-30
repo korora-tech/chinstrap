@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   website:
-    name: Build and deploy
+    name: Build
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -34,8 +34,36 @@ jobs:
           cache-dependency-path: website/package-lock.json
       - run: npm ci
       - run: npm run build
+
+  deploy:
+    name: Deploy
+    needs: website
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Only this environment's OIDC token can log in to Infisical as the
+    # website's identity, which reads the Korora Tech Cloudflare token.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: website/.node-version
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - run: npm ci
+      - name: Read the Cloudflare token from Infisical
+        uses: Infisical/secrets-action@d2e351f16c6ca20d17c85e6c992e04bdeb64e87d # v1.0.18
+        with:
+          method: oidc
+          identity-id: ${{ secrets.INFISICAL_MACHINE_IDENTITY_ID }}
+          project-id: 7c237571-6f1c-409d-b5e4-ea814d434217
+          env-slug: production
+          secret-name: CLOUDFLARE_API_TOKEN
       - name: Deploy to Cloudflare
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: npx wrangler deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDLFLARE_API_TOKEN }}
+        run: npx cf deploy
