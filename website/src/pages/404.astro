@@ -1,0 +1,22 @@
+---
+import Base from '../layouts/Base.astro';
+---
+
+<Base title="Not found">
+  <section class="wrap nf">
+    <p class="eyebrow">404</p>
+    <h1>Nothing recorded here.</h1>
+    <p>That page does not exist. Try the <a href="/">home page</a> or the <a href="/docs">docs</a>.</p>
+  </section>
+</Base>
+
+<style>
+  .nf {
+    padding-block: 6rem 2rem;
+  }
+
+  h1 {
+    font-size: clamp(2rem, 6vw, 3rem);
+    margin: 0 0 1rem;
+  }
+</style>

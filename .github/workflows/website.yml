@@ -1,0 +1,41 @@
+name: Website
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - website/**
+      - README.md
+      - .github/workflows/website.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - website/**
+      - README.md
+      - .github/workflows/website.yml
+
+concurrency:
+  group: website-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  website:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: website/.node-version
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - name: Deploy to Cloudflare
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: npx cf deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDLFLARE_API_TOKEN }}

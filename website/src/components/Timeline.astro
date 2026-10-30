@@ -1,0 +1,218 @@
+---
+// A schematic of one session: every input in its own file, all on one clock, cut into segments.
+const segments = ['segment-001', 'segment-002', 'segment-003'];
+
+// Deterministic pseudo-random values so the build output is stable.
+const rand = (seed: number) => {
+  const x = Math.sin(seed * 9301 + 49297) * 233280;
+  return x - Math.floor(x);
+};
+
+const micBars = Array.from({ length: 96 }, (_, i) => {
+  const speech = Math.sin(i / 5) * 0.5 + 0.5;
+  return Math.round(12 + speech * 60 * rand(i + 1) + 8 * rand(i + 300));
+});
+
+// Native (VFR) window: frames only when content changes.
+const windowFrames = Array.from({ length: 34 }, (_, i) => Math.round(rand(i + 77) * 1000) / 10).sort(
+  (a, b) => a - b,
+);
+---
+
+<figure class="timeline" aria-labelledby="timeline-caption">
+  <div class="head">
+    <span class="rec"><span class="rec-dot" aria-hidden="true"></span> REC</span>
+    <span class="clock">00:12:47.208</span>
+  </div>
+
+  <div class="grid" role="img" aria-label="Four tracks (camera, mic, screen, window) aligned on one clock and split by two cuts into three segments.">
+    <div class="labels" aria-hidden="true">
+      <span></span>
+      <span>camera.mkv</span>
+      <span>mic.mkv</span>
+      <span>screen-3.mkv</span>
+      <span>window-4.mkv</span>
+    </div>
+
+    <div class="lanes" aria-hidden="true">
+      <div class="seg-names">
+        {segments.map((s) => <span>{s}</span>)}
+      </div>
+
+      <div class="lane cfr cam"></div>
+      <div class="lane mic">
+        {micBars.map((h) => <i style={`height:${h}%`}></i>)}
+      </div>
+      <div class="lane cfr screen"></div>
+      <div class="lane vfr">
+        {windowFrames.map((x) => <i style={`left:${x}%`}></i>)}
+      </div>
+
+      <span class="cut" style="left:33.333%"></span>
+      <span class="cut" style="left:66.666%"></span>
+      <span class="playhead"></span>
+    </div>
+  </div>
+
+  <figcaption id="timeline-caption">
+    One clock, one file per input. Press <kbd>c</kbd> to cut a new segment without stopping.
+    Windows in <strong>Native</strong> mode record a frame only when their content changes.
+  </figcaption>
+</figure>
+
+<style>
+  .timeline {
+    margin: 0;
+    background: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 1rem;
+    box-shadow: 0 30px 80px -40px rgb(0 0 0 / 0.6);
+  }
+
+  .head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    margin-bottom: 0.85rem;
+  }
+
+  .rec {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--accent);
+    font-weight: 700;
+    letter-spacing: 0.08em;
+  }
+
+  .grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0 0.75rem;
+  }
+
+  .labels {
+    display: grid;
+    grid-template-rows: 1.4rem repeat(4, 2.25rem);
+    row-gap: 0.4rem;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-muted);
+  }
+
+  .labels span {
+    display: flex;
+    align-items: center;
+  }
+
+  .lanes {
+    position: relative;
+    display: grid;
+    grid-template-rows: 1.4rem repeat(4, 2.25rem);
+    row-gap: 0.4rem;
+    min-width: 0;
+  }
+
+  .seg-names {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    color: var(--text-muted);
+  }
+
+  .seg-names span {
+    padding-left: 0.4rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .lane {
+    position: relative;
+    border-radius: 5px;
+    overflow: hidden;
+    background: var(--bg-code);
+    border: 1px solid var(--border);
+  }
+
+  .cfr {
+    --c: var(--ice);
+    background-image: repeating-linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--c) 55%, transparent) 0 2px,
+      transparent 2px 5px
+    );
+  }
+
+  .screen {
+    --c: #b48cf0;
+  }
+
+  .mic {
+    display: flex;
+    align-items: center;
+    gap: 1px;
+    padding-inline: 2px;
+  }
+
+  .mic i {
+    flex: 1;
+    min-width: 1px;
+    background: color-mix(in srgb, #5ec58f 80%, transparent);
+    border-radius: 1px;
+  }
+
+  .vfr i {
+    position: absolute;
+    top: 18%;
+    bottom: 18%;
+    width: 2px;
+    background: #f0b44c;
+  }
+
+  .cut {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 0;
+    border-left: 2px dashed var(--accent);
+  }
+
+  .playhead {
+    position: absolute;
+    top: 1.4rem;
+    bottom: 0;
+    right: 6%;
+    width: 2px;
+    background: var(--text);
+    opacity: 0.75;
+  }
+
+  figcaption {
+    margin-top: 0.9rem;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+  }
+
+  kbd {
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    padding: 0 0.3rem;
+    background: var(--bg-code);
+  }
+
+  @media (max-width: 30rem) {
+    .labels {
+      font-size: 0.6rem;
+    }
+    .seg-names span {
+      font-size: 0.55rem;
+    }
+  }
+</style>
