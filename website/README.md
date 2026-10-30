@@ -17,7 +17,7 @@ npm run preview   # serve the site locally with cf dev (same headers and 404 han
 
 ## Deploy
 
-Pushes to `main` that touch `website/` or `README.md` are built and deployed by `.github/workflows/website.yml`. It runs `cf deploy`. The deploy job runs in the `production` environment and logs in to Infisical over OIDC as this repository's identity, which reads the Korora Tech Cloudflare token (`CLOUDFLARE_API_TOKEN`). The identity, its environment and its `INFISICAL_MACHINE_IDENTITY_ID` secret are managed in [korora-tech/korora-tech](https://github.com/korora-tech/korora-tech).
+Pushes to `main` that touch `website/` or `README.md` are built and deployed by `.github/workflows/website.yml`. It runs `cf deploy`. The deploy job runs in the `production` environment and logs in to Infisical over OIDC as the Korora Tech CI identity, which reads the Korora Tech Cloudflare token (`CLOUDFLARE_API_TOKEN`). The identity, this repository's `production` environment and its `INFISICAL_MACHINE_IDENTITY_ID` secret are managed in [korora-tech/korora-tech](https://github.com/korora-tech/korora-tech).
 
 `cloudflare.config.ts` names the account and binds the Worker to `chinstrap.korora.tech` as a custom domain; the first deploy creates the DNS record and certificate, which requires `korora.tech` to be a zone on the same Cloudflare account.
 
