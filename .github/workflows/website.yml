@@ -36,9 +36,7 @@ jobs:
       - run: npm run build
       - name: Deploy to Cloudflare
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: cloudflare/wrangler-action@v4
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          workingDirectory: website
-          command: deploy
+        run: npx --yes cf@1.0.0-beta.26 deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDLFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: 0aeb879de8e3cdde5fb3d413025222ce
