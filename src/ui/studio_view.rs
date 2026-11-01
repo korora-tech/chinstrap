@@ -115,6 +115,7 @@ pub struct StudioView {
     snap: Option<Snapshot>,
     notices: Vec<Notice>,
     level: Option<(f32, f32)>,
+    system_audio_level: Option<(f32, f32)>,
     focus_handle: FocusHandle,
     scroll: ScrollHandle,
     close_pending: Option<CloseIntent>,
@@ -176,6 +177,7 @@ impl StudioView {
             snap: None,
             notices: vec![],
             level: None,
+            system_audio_level: None,
             focus_handle: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             close_pending: None,
@@ -262,6 +264,7 @@ impl StudioView {
                 } else {
                     self._ticker = None;
                     self.level = None;
+                    self.system_audio_level = None;
                 }
                 let idle = snap.phase == Phase::Idle;
                 self.snap = Some(snap);
@@ -283,6 +286,9 @@ impl StudioView {
             }
             EngineEvent::Level { rms_db, peak_db } => {
                 self.level = Some((rms_db, peak_db));
+            }
+            EngineEvent::SystemAudioLevel { rms_db, peak_db } => {
+                self.system_audio_level = Some((rms_db, peak_db));
             }
         }
     }
@@ -451,6 +457,7 @@ impl StudioView {
                 .and_then(|id| snap.cameras.iter().find(|c| c.id == id))
                 .map_or_else(|| "Camera".to_string(), |c| c.name.clone()),
             InputKey::Microphone => "Microphone".to_string(),
+            InputKey::SystemAudio => "System audio".to_string(),
             InputKey::Source(id) => snap
                 .sources
                 .iter()
@@ -783,6 +790,7 @@ impl StudioView {
         let make_cmd: fn(Option<DeviceId>) -> EngineCommand = match kind {
             DeviceKind::Camera => EngineCommand::SelectCamera,
             DeviceKind::Microphone => EngineCommand::SelectMicrophone,
+            DeviceKind::SystemAudio => EngineCommand::SelectSystemAudio,
         };
         let (title, id_prefix, devices, selected): (_, _, &[DeviceInfo], _) = match kind {
             DeviceKind::Camera => ("CAMERA", "cam", &snap.cameras, snap.selected_camera),
@@ -791,6 +799,12 @@ impl StudioView {
                 "mic",
                 &snap.microphones,
                 snap.selected_microphone,
+            ),
+            DeviceKind::SystemAudio => (
+                "SYSTEM AUDIO",
+                "system-audio",
+                &snap.system_audio_devices,
+                snap.selected_system_audio,
             ),
         };
         let none_click =
@@ -913,6 +927,7 @@ impl StudioView {
         let locked = snap.phase.is_busy();
         let recording = matches!(snap.phase, Phase::Recording { .. });
         let mic_selected = snap.selected_microphone.is_some();
+        let system_audio_selected = snap.selected_system_audio.is_some();
         div()
             .id("studio-inputs")
             .w(px(272.0))
@@ -953,6 +968,17 @@ impl StudioView {
                         d.child(div().px_2().mt_2().child(level_meter(self.level)))
                     }),
             )
+            .child(self.device_list(DeviceKind::SystemAudio, snap, cx).when(
+                recording && system_audio_selected,
+                |d| {
+                    d.child(
+                        div()
+                            .px_2()
+                            .mt_2()
+                            .child(level_meter(self.system_audio_level)),
+                    )
+                },
+            ))
             .when(locked, |d| {
                 d.child(
                     div()

@@ -1,8 +1,8 @@
 # Chinstrap
 
-A native recording studio for Linux, built with GPUI and GStreamer. Chinstrap records a camera, a microphone and any number of screens and windows at the same time. Each input goes to its own file, and all of them run on one shared clock so they can be lined up in an editor. Recordings can be cut into segments without stopping.
+A native recording studio for Linux, built with GPUI and GStreamer. Chinstrap records a camera, a microphone, optional system audio, and any number of screens and windows at the same time. Each input goes to its own file, and all of them run on one shared clock so they can be lined up in an editor. Recordings can be cut into segments without stopping.
 
-The window opens on the **Studio** view, which is the recorder. Each finished segment's microphone file can be transcribed on the device with Whisper (see [Transcription](#transcription)). The **Feature guide** tab (`ctrl-2`) is the earlier reference UI for planned features. Nothing on that tab captures, transcribes or automates anything.
+The window opens on the **Studio** view, which is the recorder. Each finished segment's microphone file can be transcribed on the device with Whisper (see [Transcription](#transcription)); automatic transcription remains microphone-only. The **Feature guide** tab (`ctrl-2`) is the earlier reference UI for planned features. Nothing on that tab captures, transcribes or automates anything.
 
 ## Run
 
@@ -26,13 +26,14 @@ The dev shell provides the Rust toolchain, GPUI's native dependencies and the GS
 
 `r` and `c` do nothing while a text field (the vocabulary panel) has focus. In a text field, `Enter` adds, `Tab`/`Shift-Tab` moves between fields, `Ctrl-V` pastes, `Ctrl-U` clears and `Esc` leaves the field.
 
-Use the panel to pick a camera and a microphone. **Add windows/screens…** opens the portal picker, and **Add test pattern** adds a synthetic source.
+Use the panel to pick a camera and a microphone. System audio is separate and off by default; select **Default output** to follow PipeWire's current sink or choose one specific output. **Add windows/screens…** opens the portal picker, and **Add test pattern** adds a synthetic source.
 
 ### Studio panels
 
 - **Video.** Each video is one folder of segments, named after the video. **New video…** (idle only) asks for a name, such as `Kubernetes Services 101`, and creates `<output>/Kubernetes Services 101/`; `Enter` creates it and `Esc` cancels. The name is kept as typed, except that `/` becomes `-` and leading dots and control characters are dropped; an existing folder of that name gets `-2`, `-3`, … instead of being reused. The toolbar shows the open video. Every **Record** and **Cut** adds the next `segment-NNN` to it, and quitting and starting Chinstrap again reopens the same video, continuing after its last segment (the Segments panel lists this run's segments and counts the earlier ones). The open video is remembered in `<output>/.chinstrap-current`. A video with interrupted segments is not reopened until they are recovered or dismissed. Before any video has been named, Record creates a date-named one.
 - **Preview.** A live tile (about 15 fps, at most 480×300) for the selected camera and every window, screen and test pattern, so you can see what each file will show. While idle each input has its own small preview pipeline; pressing **Record** stops those first (only one reader per PipeWire node), and while recording the frames come from a branch of the recording pipeline itself, framed in red. A preview that fails says why on its tile and is retried; it never stops or fails a recording, and the recording branch accepts whatever format the recording negotiates (a format it cannot show only stops the tile). Because the camera's idle preview closes the camera before Record reopens it, a camera that sends damaged frames just after it is opened (the ILCE-7CM2 does, see below) starts each camera file with a few dropped and repeated frames; this has not been measured with previews on. Pressing **Stop** (or the shortcut again) while the previews are stopping cancels the Record. `CHINSTRAP_PREVIEW=0` turns previews off.
 - **Camera mode.** Under the camera list, the selected camera's advertised modes (size, rate, format) are listed with **Automatic** (the mode Chinstrap would pick, shown underneath) as the default. Pick one to override it; the choice is locked while recording.
+- **System audio.** The separate list has **None** (the default), **Default output** (follows PipeWire's current sink) and one entry per PipeWire output. Its level meter appears while recording; output monitors do not appear in the microphone list.
 - **Frame rate.** Each window, screen and test pattern has a **Native · 60 · 30** picker, and **Frame rate for all windows/screens** sets the default for new ones and applies it to the current ones. See [Frame rate of windows and screens](#frame-rate-of-windows-and-screens).
 - **Encoding plan.** Once inputs are selected, the plan lists each video input's encoder, size, rate and share of the video engine. If the selection is beyond the measured encoder capacity, a warning appears there (and next to **Record**) *before* you record, instead of frames being dropped silently.
 - **Waiting for first frame.** While recording, a source that has not delivered a frame yet shows **Waiting for first frame** (windows only send frames when they change). If it never sends one, its input ends as **failed: no frames received** and its empty file is removed; it is never marked complete. It stays selected after a Cut, so a window that was only static in one segment is recorded again in the next.
@@ -49,6 +50,7 @@ Use the panel to pick a camera and a microphone. **Add windows/screens…** open
     segment-001/
       camera.mkv                   H.264 or HEVC (or x264), camera's native size and frame rate
       mic.mkv                      Opus, 48 kHz
+      system.mkv                   optional; Opus, stereo, 48 kHz (selected separately)
       screen-3.mkv / window-4.mkv  H.264 or HEVC, one file per portal stream (VFR in Native mode)
       test-1.mkv                   H.264 or HEVC test pattern
       transcript.json              transcript of mic.mkv: segments, word timings, model, timing
@@ -56,7 +58,7 @@ Use the panel to pick a camera and a microphone. **Add windows/screens…** open
     segment-002/ …
 ```
 
-Every file in a segment is timestamped against the same base time, and every video file starts at the segment's time zero: a source whose first frame arrives late is padded with that first frame repeated, so all video files line up when dropped into an editor at the same position. `mic.mkv` is not padded: it starts at its first sample (usually a few tens of milliseconds after time zero), recorded as `first_pts_ns` in the manifest. Editors that honour a Matroska file's start time line it up; one that starts every file at zero puts the audio that much early, so shift it by `first_pts_ns`. The manifest records the real first timestamp (`first_pts_ns`) and last timestamp of each file, so drift and start latency can still be measured. Each manifest write is atomically replaced and synced with its parent directory; quitting during a recording finalizes the files first.
+Every file in a segment is timestamped against the same base time, and every video file starts at the segment's time zero: a source whose first frame arrives late is padded with that first frame repeated, so all video files line up when dropped into an editor at the same position. `mic.mkv` and optional `system.mkv` are not padded: each starts at its first sample (usually a few tens of milliseconds after time zero), recorded as `first_pts_ns` in the manifest. Editors that honour a Matroska file's start time line it up; one that starts every file at zero puts the audio that much early, so shift it by `first_pts_ns`. The manifest records the real first timestamp (`first_pts_ns`) and last timestamp of each file, so drift and start latency can still be measured. Each manifest write is atomically replaced and synced with its parent directory; quitting during a recording finalizes the files first.
 
 ### Crash recovery and low disk space
 
@@ -208,12 +210,13 @@ CHINSTRAP_TEST_SIZE=3840x2160 nix develop -c cargo run -- --selftest /tmp/st-4k
 CHINSTRAP_SELFTEST_CAMERA=ILCE nix develop -c cargo run -- --selftest /tmp/st-cam
 ```
 
-The self-test runs the real engine without the portal: a test pattern, the first usable camera and the default microphone. It records two segments with a cut between them, then records a third and quits during it. It checks the following:
+The self-test runs the real engine without the portal: a test pattern, the first usable camera, the default microphone and (when available) the default-output monitor. With no output sink it uses a synthetic 440 Hz `audiotestsrc`; if neither source path is available, it reports the system-audio check as skipped. It records two segments with a cut between them, then records a third and quits during it. It checks the following:
 
 - Every file opens in GStreamer's Discoverer as H.264 or Opus.
 - The test file keeps the size of its first frame, even after the selftest renegotiates it to a different size.
 - File durations are within 0.6 s of the segment's duration.
 - The microphone and test pattern start within 100 ms of each other.
+- System audio is a complete `system.mkv` Opus track at 48 kHz stereo in both segments, with a manifest entry. The microphone and system-audio first timestamps are reported as startup offsets, not as a measurement of content synchronization.
 - The gap between segments is under 1.5 s.
 - The manifest matches the files on disk.
 - Files are finalized on quit.
@@ -228,6 +231,8 @@ These variables change the test:
 
 - `CHINSTRAP_TEST_SIZE=WxH` sets the test pattern's size.
 - `CHINSTRAP_SELFTEST_CAMERA=<name substring>` picks a specific camera. Its file must then be H.264 at the camera's native size and rate. The test also checks that PipeWire links that camera's node rather than the default source. A second run then records that camera next to two 4K test windows for `CHINSTRAP_SELFTEST_LOAD_SECS` (default 60) and fails if 1% or more of the camera's frames are repeats, counted over the whole recording both by the quality counters and by comparing consecutive frames. The windows are Native with a 144 Hz refresh, the app's default; `CHINSTRAP_SELFTEST_LOAD_MODE=30` or `60` records them at a constant rate instead. The plan the engine chose is in the JSON output.
+- `CHINSTRAP_SELFTEST_SYSTEM_OUTPUT=<name substring>` records a specific output instead of the default output. An unknown or unsupported output fails the self-test instead of silently falling back.
+- `CHINSTRAP_SELFTEST_MICROPHONE=<name substring>` selects a specific microphone for the self-test. An unknown or unsupported microphone fails the test.
 - `CHINSTRAP_SELFTEST_LOAD=standin` runs the same load test without a camera, with a third 4K test pattern at 30 fps in its place. It also fails when a Native window's bytes per frame are not within 2× of that constant-rate pattern's.
 
 The self-test also checks PipeWire targeting whenever PipeWire is reachable:
@@ -245,7 +250,11 @@ Checks that cannot run are reported as `skipped: …` in the JSON `targeting` ob
 These have been checked on one machine: NixOS, niri, PipeWire 1.6.9 and WirePlumber 0.5.18, AMD GPUs using `vah264enc`.
 
 - The unit tests.
-- The original three self-tests above passed in an earlier run. The new/updated safety self-test checks have not been executed in this follow-up; a prior full self-test attempt aborted after an AMDGPU context loss.
+- The original three self-tests above passed in an earlier run.
+- The synthetic system-audio pipeline test writes a stereo 48 kHz Opus Matroska file and checks its first PTS.
+- A PipeWire 1.6.9 `pipewiresrc` probe: an explicit sink `object.serial` and an unset target both linked to the selected sink's live `monitor_FL`/`monitor_FR` ports; this verified routing, not captured audio content.
+- A 997 Hz tone played into a temporary PipeWire virtual output was present in `system.mkv` on both sides of a Cut and absent from the microphone file at that frequency. Both system tracks decoded as stereo 48 kHz Opus.
+- In a separate test, the same pulses reached `system.mkv` through that output's monitor and `mic.mkv` through a remapped virtual source. After the manifest offsets, pulse onsets in the microphone file were 42 ms later in both segments. The extra routing hop may contribute latency, so this is not a measurement of physical microphone synchronization.
 - The PipeWire targeting checks, against a Sony ILCE-7CM2 recording 3840×2160 at 25 fps, H.264 High at level 5.1.
 
 These have not been checked:
@@ -257,6 +266,11 @@ These have not been checked:
 - MJPEG and DMA-BUF cameras at 4K, and camera frame rates above 30 fps.
 - Long recordings.
 - A hard upper bound on actual frame loss during SIGKILL, power loss, filesystem failure or device-cache failure; the 2 s assertion is limited to the test source and successful recovery path.
+- Known-tone recording from a physical output and microphone isolation beyond acoustic pickup; the known-tone check used a virtual output. A default-output monitor recorded successfully without a test tone, but silence was not independently verified.
+- The 20 ms synchronization target for microphone and system audio on physical devices. First timestamps alone do not measure synchronization; the virtual loopback result above exceeds that target and has not been attributed to a cause.
+- Default-sink switching and output hotplug/disconnect during an active recording.
+- Byte-for-byte unchanged production recordings when system audio is off, apart from the manifest; a fake-engine regression test covers the disabled default and separate-file behavior.
+- A full `--selftest` on the setup above completed but failed: the no-frame video test left a file and was not selected after Cut, and the injected startup ENOSPC test found no opened peer files to inspect. The two system-audio files were produced and decoded; this does not make the overall self-test a pass.
 
 The ILCE-7CM2 delivers truncated frames for a short time after it is reopened. Chinstrap drops frames that PipeWire marks as corrupted and fills the gap by repeating frames, so the first second or two of a camera file can contain a few repeats; they are counted in the quality numbers (`dropped_corrupt`, `duplicated`).
 

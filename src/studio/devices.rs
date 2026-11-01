@@ -8,7 +8,7 @@ use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::*;
 
-use super::types::{CameraModeInfo, DeviceId, DeviceInfo, DeviceKind};
+use super::types::{CameraModeInfo, DEFAULT_SYSTEM_AUDIO_ID, DeviceId, DeviceInfo, DeviceKind};
 
 /// Largest camera mode recorded without downscaling (DCI 4K width, UHD height).
 pub const CAMERA_MAX_W: i32 = 4096;
@@ -416,6 +416,8 @@ pub struct Devices {
     next_id: u32,
     pub cameras: Vec<Entry>,
     pub microphones: Vec<Entry>,
+    /// PipeWire output sinks, separately enumerated from microphone sources.
+    pub system_audio: Vec<Entry>,
     /// jpegparse/jpegdec are present (MJPEG cameras are usable).
     jpeg_ok: bool,
 }
@@ -435,6 +437,7 @@ impl Devices {
         let monitor = gst::DeviceMonitor::new();
         monitor.add_filter(Some("Video/Source"), None);
         monitor.add_filter(Some("Audio/Source"), None);
+        monitor.add_filter(Some("Audio/Sink"), None);
         if let Err(e) = monitor.start() {
             eprintln!("chinstrap: device monitor failed to start: {e}");
         }
@@ -446,6 +449,7 @@ impl Devices {
             next_id: 1,
             cameras: Vec::new(),
             microphones: Vec::new(),
+            system_audio: Vec::new(),
             jpeg_ok: true,
         }
     }
@@ -472,6 +476,7 @@ impl Devices {
     pub fn enumerate(&mut self, gpu_convert: bool) -> bool {
         let mut cameras = Vec::new();
         let mut microphones = Vec::new();
+        let mut system_audio = Vec::new();
         for device in self.monitor.devices() {
             let name = device.display_name().to_string();
             let props = device.properties();
@@ -519,6 +524,32 @@ impl Devices {
                     modes,
                     serial,
                 });
+            } else if device.has_classes("Audio/Sink") {
+                let current_default = props
+                    .as_ref()
+                    .and_then(|p| p.get::<bool>("is-default").ok())
+                    .unwrap_or(false);
+                let mut detail = origin.clone();
+                if current_default {
+                    detail.push_str(" · current default");
+                }
+                let id = self.id_for(key);
+                system_audio.push(Entry {
+                    info: DeviceInfo {
+                        id,
+                        kind: DeviceKind::SystemAudio,
+                        name,
+                        detail,
+                        unsupported: serial
+                            .is_none()
+                            .then(|| "system audio requires a PipeWire output".into()),
+                        modes: Vec::new(),
+                    },
+                    device,
+                    class: None,
+                    modes: Vec::new(),
+                    serial,
+                });
             } else if device.has_classes("Audio/Source") {
                 if is_monitor(props.as_deref(), &name) {
                     continue;
@@ -551,9 +582,13 @@ impl Devices {
         }
         cameras.sort_by_key(|e| e.info.id);
         microphones.sort_by_key(|e| e.info.id);
-        let changed = !same(&self.cameras, &cameras) || !same(&self.microphones, &microphones);
+        system_audio.sort_by_key(|e| e.info.id);
+        let changed = !same(&self.cameras, &cameras)
+            || !same(&self.microphones, &microphones)
+            || !same(&self.system_audio, &system_audio);
         self.cameras = cameras;
         self.microphones = microphones;
+        self.system_audio = system_audio;
         changed
     }
 
@@ -579,6 +614,27 @@ impl Devices {
 
     pub fn microphone(&self, id: DeviceId) -> Option<&Entry> {
         self.microphones.iter().find(|e| e.info.id == id)
+    }
+
+    pub fn system_audio(&self, id: DeviceId) -> Option<&Entry> {
+        self.system_audio.iter().find(|e| e.info.id == id)
+    }
+
+    /// Default output is a synthetic selection so it can follow a sink change while recording.
+    pub fn system_audio_infos(&self) -> Vec<DeviceInfo> {
+        let mut infos = Vec::new();
+        if self.system_audio.iter().any(|e| e.serial.is_some()) {
+            infos.push(DeviceInfo {
+                id: DEFAULT_SYSTEM_AUDIO_ID,
+                kind: DeviceKind::SystemAudio,
+                name: "Default output".into(),
+                detail: "Follows the current PipeWire output".into(),
+                unsupported: None,
+                modes: Vec::new(),
+            });
+        }
+        infos.extend(self.system_audio.iter().map(|e| e.info.clone()));
+        infos
     }
 }
 
