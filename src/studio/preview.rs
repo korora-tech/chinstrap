@@ -90,7 +90,7 @@ impl Default for Previews {
 impl Previews {
     /// The newest frame of `key` and its generation (bumped by every frame).
     pub fn latest(&self, key: InputKey) -> Option<(u64, Arc<PreviewFrame>)> {
-        let slots = self.0.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let slots = self.0.slots.lock().expect("preview slots lock poisoned");
         slots.get(&key).map(|s| (s.generation, s.frame.clone()))
     }
 
@@ -106,7 +106,7 @@ impl Previews {
 
     pub(super) fn publish(&self, key: InputKey, frame: PreviewFrame) {
         {
-            let mut slots = self.0.slots.lock().unwrap_or_else(|e| e.into_inner());
+            let mut slots = self.0.slots.lock().expect("preview slots lock poisoned");
             let generation = slots.get(&key).map_or(0, |s| s.generation) + 1;
             slots.insert(
                 key,
@@ -121,7 +121,7 @@ impl Previews {
 
     /// Forgets every input not in `keys` (a removed source, a deselected camera).
     pub(super) fn retain(&self, keys: &[InputKey]) {
-        let mut slots = self.0.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slots = self.0.slots.lock().expect("preview slots lock poisoned");
         let before = slots.len();
         slots.retain(|k, _| keys.contains(k));
         if slots.len() != before {
@@ -443,6 +443,20 @@ mod tests {
         assert!(wake.try_recv().is_err());
         hub.retain(&[]);
         assert!(hub.latest(key).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "preview slots lock poisoned")]
+    fn poisoned_preview_slots_fail_fast() {
+        let hub = Previews::default();
+        let poisoner = hub.clone();
+        let _ = std::thread::spawn(move || {
+            let _slots = poisoner.0.slots.lock().unwrap();
+            panic!("poison preview slots");
+        })
+        .join();
+
+        let _ = hub.latest(InputKey::Camera);
     }
 
     /// The branch behind a tee: frames reach the hub at the throttled rate, and a branch that

@@ -200,7 +200,9 @@ impl Running {
                         Ok(n) => n,
                     };
                     {
-                        let mut t = tail.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut t = tail
+                            .lock()
+                            .expect("transcription stderr tail lock poisoned");
                         t.extend(&buf[..n]);
                         while t.len() > STDERR_TAIL {
                             t.pop_front();
@@ -326,7 +328,10 @@ impl Running {
             remove_tmp_outputs(&self.media_dir, self.pid);
         }
         let tail = {
-            let t = self.stderr_tail.lock().unwrap_or_else(|e| e.into_inner());
+            let t = self
+                .stderr_tail
+                .lock()
+                .expect("transcription stderr tail lock poisoned");
             let (a, b) = t.as_slices();
             String::from_utf8_lossy(&[a, b].concat()).to_string()
         };
