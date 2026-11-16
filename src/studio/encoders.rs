@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
-use super::types::{GpuConvert, InputClass, REQUIRED_ELEMENTS, VideoCodec, VideoEncoder};
+use super::types::{
+    Fraction, GpuConvert, InputClass, REQUIRED_ELEMENTS, Size, VideoCodec, VideoEncoder,
+};
 
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -20,9 +22,15 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_SCREEN_FPS: i32 = 30;
 pub const MAX_FPS: i32 = 60;
 /// Size the encoder probe checks: UHD.
-pub const UHD: (i32, i32) = (3840, 2160);
+pub const UHD: Size = Size {
+    width: 3840,
+    height: 2160,
+};
 /// Size assumed when an encoder cannot do UHD.
-pub const FHD: (i32, i32) = (1920, 1080);
+pub const FHD: Size = Size {
+    width: 1920,
+    height: 1080,
+};
 
 /// Bits per pixel per frame: screens carry sharp text, cameras are noisier but smoother.
 pub const SCREEN_BPP: f64 = 0.18;
@@ -49,8 +57,8 @@ pub fn screen_fps() -> i32 {
 /// `bpp × pixels × fps` (bpp ≥ 0.1), clamped to 2..400 Mbit/s.
 /// Screen 1080p30 ≈ 11 Mbit/s, 4K30 ≈ 45 Mbit/s; camera 4K25 ≈ 25 Mbit/s.
 #[cfg(test)]
-pub fn bitrate_for(role: Role, override_kbps: Option<u32>, w: i32, h: i32, fps: (i32, i32)) -> u32 {
-    bitrate_for_codec(role, VideoCodec::H264, override_kbps, w, h, fps)
+pub fn bitrate_for(role: Role, override_kbps: Option<u32>, size: Size, fps: Fraction) -> u32 {
+    bitrate_for_codec(role, VideoCodec::H264, override_kbps, size, fps)
 }
 
 /// [`bitrate_for`] for `codec` (HEVC: [`HEVC_FACTOR`] of the H.264 rate, same floor).
@@ -58,9 +66,8 @@ pub fn bitrate_for_codec(
     role: Role,
     codec: VideoCodec,
     override_kbps: Option<u32>,
-    w: i32,
-    h: i32,
-    fps: (i32, i32),
+    size: Size,
+    fps: Fraction,
 ) -> u32 {
     if let Some(k) = override_kbps.filter(|k| *k > 0) {
         return k.min(MAX_KBPS);
@@ -74,13 +81,14 @@ pub fn bitrate_for_codec(
         Role::Camera => CAMERA_BPP,
     } * factor)
         .max(MIN_BPP);
-    let rate = fps.0.max(1) as f64 / fps.1.max(1) as f64;
-    let kbps = (w.max(1) as f64 * h.max(1) as f64 * rate * bpp / 1000.0).round() as u32;
+    let rate = fps.num.max(1) as f64 / fps.den.max(1) as f64;
+    let kbps =
+        (size.width.max(1) as f64 * size.height.max(1) as f64 * rate * bpp / 1000.0).round() as u32;
     kbps.clamp(MIN_KBPS, MAX_KBPS)
 }
 
 /// [`bitrate_for_codec`] with `CHINSTRAP_SCREEN_BITRATE_KBPS` / `CHINSTRAP_CAMERA_BITRATE_KBPS`.
-pub fn bitrate_kbps(role: Role, codec: VideoCodec, w: i32, h: i32, fps: (i32, i32)) -> u32 {
+pub fn bitrate_kbps(role: Role, codec: VideoCodec, size: Size, fps: Fraction) -> u32 {
     let key = match role {
         Role::Screen => "CHINSTRAP_SCREEN_BITRATE_KBPS",
         Role::Camera => "CHINSTRAP_CAMERA_BITRATE_KBPS",
@@ -88,7 +96,7 @@ pub fn bitrate_kbps(role: Role, codec: VideoCodec, w: i32, h: i32, fps: (i32, i3
     let over = std::env::var(key)
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok());
-    bitrate_for_codec(role, codec, over, w, h, fps)
+    bitrate_for_codec(role, codec, over, size, fps)
 }
 
 /// Sets an encoder's bitrate (`kbps` kbit/s; openh264enc takes bit/s).
@@ -182,9 +190,8 @@ pub fn coded_caps(enc: VideoEncoder) -> &'static str {
 pub fn outcaps_string(
     enc: VideoEncoder,
     convert: Option<GpuConvert>,
-    width: i32,
-    height: i32,
-    fps: Option<(i32, i32)>,
+    size: Size,
+    fps: Option<Fraction>,
 ) -> String {
     let feature = if convert == Some(GpuConvert::Va) && enc.is_gpu() {
         "(memory:VAMemory)"
@@ -192,11 +199,13 @@ pub fn outcaps_string(
         ""
     };
     let rate = fps
-        .map(|(n, d)| format!(",framerate={n}/{}", d.max(1)))
+        .map(|fraction| format!(",framerate={}/{}", fraction.num, fraction.den.max(1)))
         .unwrap_or_default();
     format!(
-        "video/x-raw{feature},format={},width={width},height={height}{rate},pixel-aspect-ratio=1/1",
-        encoder_format(enc)
+        "video/x-raw{feature},format={},width={},height={}{rate},pixel-aspect-ratio=1/1",
+        encoder_format(enc),
+        size.width,
+        size.height,
     )
 }
 
@@ -234,8 +243,8 @@ pub fn set_prop(el: &gst::Element, name: &str, value: &str) -> bool {
 /// VA: one reference frame. On radeonsi (RX 7900 XT, Mesa 26.2) vah264enc's default of 3
 /// halves throughput: one 4K stream 46 fps vs 98 fps, and the encode engine then falls behind a
 /// 4K25 camera plus two 4K30 windows (the camera's repeated frames in the 2026-10-22 recording).
-pub fn configure_encoder(el: &gst::Element, enc: VideoEncoder, role: Role, fps: (i32, i32)) {
-    let rate = fps.0.max(1) as f64 / fps.1.max(1) as f64;
+pub fn configure_encoder(el: &gst::Element, enc: VideoEncoder, role: Role, fps: Fraction) {
+    let rate = fps.num.max(1) as f64 / fps.den.max(1) as f64;
     let gop = ((rate * 2.0).round() as i64).clamp(1, 1024).to_string();
     match enc {
         VideoEncoder::Va | VideoEncoder::VaHevc => {
@@ -256,16 +265,12 @@ pub fn configure_encoder(el: &gst::Element, enc: VideoEncoder, role: Role, fps: 
     set_bitrate(
         el,
         enc,
-        bitrate_for_codec(role, enc.codec(), None, FHD.0, FHD.1, fps),
+        bitrate_for_codec(role, enc.codec(), None, FHD, fps),
     );
 }
 
 /// Creates and configures an encoder (§5.6 table).
-pub fn make_encoder(
-    enc: VideoEncoder,
-    role: Role,
-    fps: (i32, i32),
-) -> Result<gst::Element, String> {
+pub fn make_encoder(enc: VideoEncoder, role: Role, fps: Fraction) -> Result<gst::Element, String> {
     let el = gst::ElementFactory::make(enc.element_name())
         .build()
         .map_err(|e| format!("{}: {e}", enc.element_name()))?;
@@ -332,37 +337,37 @@ pub fn encoder_probe_launch(enc: VideoEncoder) -> String {
 pub struct EncoderCap {
     pub enc: VideoEncoder,
     /// Largest verified size (UHD/DCI 4K, or 1080p when 4K failed).
-    pub max: (i32, i32),
+    pub max: Size,
     /// Measured encode throughput (frames per second) at 3840×2160, or at 1920×1080 when
     /// `max` is 1080p.
     pub fps_at_max: f64,
 }
 
 impl EncoderCap {
-    pub fn fits(&self, w: i32, h: i32) -> bool {
-        w <= self.max.0 && h <= self.max.1
+    pub fn fits(&self, size: Size) -> bool {
+        size.width <= self.max.width && size.height <= self.max.height
     }
 
     /// Estimated throughput at `w`×`h` (scales with pixel count, never above 4× the measure).
-    pub fn fps_at(&self, w: i32, h: i32) -> f64 {
+    pub fn fps_at(&self, size: Size) -> f64 {
         // `fps_at_max` is measured at 3840×2160 (1920×1080 when 4K failed), even when `max`
         // is DCI 4096×2160.
         let measured = if self.max == FHD { FHD } else { UHD };
-        let ref_area = measured.0 as f64 * measured.1 as f64;
-        let max_area = self.max.0 as f64 * self.max.1 as f64;
-        let area = (w.max(1) as f64 * h.max(1) as f64).min(max_area);
+        let ref_area = measured.width as f64 * measured.height as f64;
+        let max_area = self.max.width as f64 * self.max.height as f64;
+        let area = (size.width.max(1) as f64 * size.height.max(1) as f64).min(max_area);
         self.fps_at_max * (ref_area / area).min(4.0)
     }
 }
 
 /// True when the encoder's sink template admits raw video of `w`×`h`.
-pub fn template_accepts(enc: VideoEncoder, w: i32, h: i32) -> bool {
+pub fn template_accepts(enc: VideoEncoder, size: Size) -> bool {
     let Some(factory) = gst::ElementFactory::find(enc.element_name()) else {
         return false;
     };
     let want = gst::Caps::builder("video/x-raw")
-        .field("width", w)
-        .field("height", h)
+        .field("width", size.width)
+        .field("height", size.height)
         .build();
     factory
         .static_pad_templates()
@@ -376,22 +381,19 @@ pub fn template_accepts(enc: VideoEncoder, w: i32, h: i32) -> bool {
 /// `timeout`; a timeout after at least 5 frames still yields a (low) measurement.
 /// videotestsrc renders 4K SMPTE at ~150 fps on its own thread (behind the queue), well above
 /// the encoders measured, so the source does not cap the result.
-pub fn measure_encoder(
-    enc: VideoEncoder,
-    w: i32,
-    h: i32,
-    timeout: Duration,
-) -> Result<f64, String> {
+pub fn measure_encoder(enc: VideoEncoder, size: Size, timeout: Duration) -> Result<f64, String> {
     if timeout < Duration::from_millis(200) {
         return Err("no time left to measure".into());
     }
     const FRAMES: u32 = 40;
     let desc = format!(
         "videotestsrc num-buffers={FRAMES} pattern=smpte horizontal-speed=8 ! \
-         video/x-raw,format={},width={w},height={h},framerate=60/1 ! \
+         video/x-raw,format={},width={},height={},framerate=60/1 ! \
          queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 ! {} name=enc ! \
          {} ! fakesink name=sink sync=false",
         encoder_format(enc),
+        size.width,
+        size.height,
         enc.element_name(),
         parser_name(enc)
     );
@@ -400,15 +402,30 @@ pub fn measure_encoder(
         .downcast::<gst::Pipeline>()
         .map_err(|_| "not a pipeline".to_string())?;
     let el = pipeline.by_name("enc").ok_or("no encoder")?;
-    configure_encoder(&el, enc, Role::Screen, (60, 1));
+    configure_encoder(&el, enc, Role::Screen, Fraction { num: 60, den: 1 });
     set_bitrate(
         &el,
         enc,
-        bitrate_for_codec(Role::Screen, enc.codec(), None, w, h, (30, 1)),
+        bitrate_for_codec(
+            Role::Screen,
+            enc.codec(),
+            None,
+            size,
+            Fraction { num: 30, den: 1 },
+        ),
     );
     // (frames, first, last) at the sink.
-    type Stats = (u32, Option<Instant>, Option<Instant>);
-    let stats: Arc<Mutex<Stats>> = Arc::new(Mutex::new((0, None, None)));
+    #[derive(Clone, Copy)]
+    struct Stats {
+        frames: u32,
+        first: Option<Instant>,
+        last: Option<Instant>,
+    }
+    let stats: Arc<Mutex<Stats>> = Arc::new(Mutex::new(Stats {
+        frames: 0,
+        first: None,
+        last: None,
+    }));
     let probe_stats = stats.clone();
     pipeline
         .by_name("sink")
@@ -417,22 +434,29 @@ pub fn measure_encoder(
         .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
             if let Ok(mut s) = probe_stats.lock() {
                 let now = Instant::now();
-                s.0 += 1;
-                s.1.get_or_insert(now);
-                s.2 = Some(now);
+                s.frames += 1;
+                s.first.get_or_insert(now);
+                s.last = Some(now);
             }
             gst::PadProbeReturn::Ok
         });
     let run = run_pipeline(&pipeline, timeout);
-    let (n, first, last) = *stats.lock().map_err(|_| "poisoned")?;
+    let stats = stats.lock().map_err(|_| "poisoned")?;
+    let Stats {
+        frames,
+        first,
+        last,
+    } = *stats;
     let measured = match (first, last) {
-        (Some(f), Some(l)) if n >= 5 && l > f => Some((n - 1) as f64 / (l - f).as_secs_f64()),
+        (Some(f), Some(l)) if frames >= 5 && l > f => {
+            Some((frames - 1) as f64 / (l - f).as_secs_f64())
+        }
         _ => None,
     };
     match (run, measured) {
         (Ok(()), Some(fps)) => Ok(fps),
         (Err(e), Some(fps)) if e == "timed out" => Ok(fps),
-        (Ok(()), None) => Err(format!("only {n} frames encoded")),
+        (Ok(()), None) => Err(format!("only {frames} frames encoded")),
         (Err(e), _) => Err(e),
     }
 }
@@ -464,23 +488,36 @@ pub fn select_encoders(preferred: Option<VideoEncoder>) -> (Vec<EncoderCap>, Vec
         }
         let budget = Instant::now() + PROBE_TIMEOUT;
         let left = || budget.saturating_duration_since(Instant::now());
-        let uhd = if template_accepts(enc, UHD.0, UHD.1) {
-            measure_encoder(enc, UHD.0, UHD.1, left())
+        let uhd = if template_accepts(enc, UHD) {
+            measure_encoder(enc, UHD, left())
         } else {
             Err("its caps stop below 3840×2160".into())
         };
         let cap = match uhd {
             Ok(fps) => {
-                let dci = template_accepts(enc, 4096, 2160);
+                let dci = template_accepts(
+                    enc,
+                    Size {
+                        width: 4096,
+                        height: 2160,
+                    },
+                );
                 EncoderCap {
                     enc,
-                    max: if dci { (4096, 2160) } else { UHD },
+                    max: if dci {
+                        Size {
+                            width: 4096,
+                            height: 2160,
+                        }
+                    } else {
+                        UHD
+                    },
                     fps_at_max: fps,
                 }
             }
             Err(e) => {
                 notes.push(format!("Video encoder {name} cannot encode 3840×2160: {e}"));
-                let fps = measure_encoder(enc, FHD.0, FHD.1, left()).unwrap_or(0.0);
+                let fps = measure_encoder(enc, FHD, left()).unwrap_or(0.0);
                 EncoderCap {
                     enc,
                     max: FHD,
@@ -490,8 +527,8 @@ pub fn select_encoders(preferred: Option<VideoEncoder>) -> (Vec<EncoderCap>, Vec
         };
         notes.push(format!(
             "Video encoder {name}: up to {}×{}, ~{:.0} fps measured at {}",
-            cap.max.0,
-            cap.max.1,
+            cap.max.width,
+            cap.max.height,
             cap.fps_at_max,
             if cap.max == FHD {
                 "1920×1080"
@@ -513,7 +550,15 @@ pub fn gpu_probe_launch(convert: GpuConvert, enc: VideoEncoder) -> String {
     format!(
         "videotestsrc num-buffers=5 ! video/x-raw,width=320,height=240,framerate=30/1 ! {upload} ! {} ! {} ! {} ! fakesink",
         convert_launch(Some(convert), encoder_format(enc)),
-        outcaps_string(enc, Some(convert), 640, 360, Some((30, 1))),
+        outcaps_string(
+            enc,
+            Some(convert),
+            Size {
+                width: 640,
+                height: 360
+            },
+            Some(Fraction { num: 30, den: 1 }),
+        ),
         enc.element_name()
     )
 }
@@ -584,9 +629,11 @@ mod tests {
             outcaps_string(
                 VideoEncoder::Va,
                 Some(GpuConvert::Va),
-                1280,
-                720,
-                Some((30, 1))
+                Size {
+                    width: 1280,
+                    height: 720
+                },
+                Some(Fraction { num: 30, den: 1 })
             )
             .starts_with("video/x-raw(memory:VAMemory),format=NV12,width=1280,height=720")
         );
@@ -594,26 +641,63 @@ mod tests {
             outcaps_string(
                 VideoEncoder::X264,
                 Some(GpuConvert::Va),
-                2,
-                2,
-                Some((30, 1))
+                Size {
+                    width: 2,
+                    height: 2
+                },
+                Some(Fraction { num: 30, den: 1 })
             )
             .starts_with("video/x-raw,format=I420")
         );
         assert!(
-            outcaps_string(VideoEncoder::Va, Some(GpuConvert::Gl), 2, 2, Some((30, 1)))
-                .starts_with("video/x-raw,format=NV12")
+            outcaps_string(
+                VideoEncoder::Va,
+                Some(GpuConvert::Gl),
+                Size {
+                    width: 2,
+                    height: 2
+                },
+                Some(Fraction { num: 30, den: 1 })
+            )
+            .starts_with("video/x-raw,format=NV12")
         );
     }
 
     #[test]
     fn outcaps_carry_native_rate() {
-        let c = outcaps_string(VideoEncoder::X264, None, 3840, 2160, Some((25, 1)));
+        let c = outcaps_string(
+            VideoEncoder::X264,
+            None,
+            Size {
+                width: 3840,
+                height: 2160,
+            },
+            Some(Fraction { num: 25, den: 1 }),
+        );
         assert!(c.contains("width=3840,height=2160,framerate=25/1"), "{c}");
-        let c = outcaps_string(VideoEncoder::X264, None, 1920, 1080, Some((30000, 1001)));
+        let c = outcaps_string(
+            VideoEncoder::X264,
+            None,
+            Size {
+                width: 1920,
+                height: 1080,
+            },
+            Some(Fraction {
+                num: 30_000,
+                den: 1_001,
+            }),
+        );
         assert!(c.contains("framerate=30000/1001"), "{c}");
         // Variable frame rate: no rate, HEVC on VA memory.
-        let c = outcaps_string(VideoEncoder::VaHevc, Some(GpuConvert::Va), 3840, 2160, None);
+        let c = outcaps_string(
+            VideoEncoder::VaHevc,
+            Some(GpuConvert::Va),
+            Size {
+                width: 3840,
+                height: 2160,
+            },
+            None,
+        );
         assert!(!c.contains("framerate"), "{c}");
         assert!(
             c.starts_with("video/x-raw(memory:VAMemory),format=NV12"),
@@ -633,28 +717,98 @@ mod tests {
 
     #[test]
     fn bitrate_scales_with_pixel_rate() {
-        let s1080 = bitrate_for(Role::Screen, None, 1920, 1080, (30, 1));
-        let s4k = bitrate_for(Role::Screen, None, 3840, 2160, (30, 1));
+        let s1080 = bitrate_for(
+            Role::Screen,
+            None,
+            Size {
+                width: 1920,
+                height: 1080,
+            },
+            Fraction { num: 30, den: 1 },
+        );
+        let s4k = bitrate_for(
+            Role::Screen,
+            None,
+            Size {
+                width: 3840,
+                height: 2160,
+            },
+            Fraction { num: 30, den: 1 },
+        );
         assert!((10_000..=13_000).contains(&s1080), "{s1080}");
         assert!((40_000..=50_000).contains(&s4k), "{s4k}");
         assert!(s4k.abs_diff(s1080 * 4) <= 4, "{s4k} vs 4×{s1080}");
-        let c4k25 = bitrate_for(Role::Camera, None, 3840, 2160, (25, 1));
+        let c4k25 = bitrate_for(
+            Role::Camera,
+            None,
+            Size {
+                width: 3840,
+                height: 2160,
+            },
+            Fraction { num: 25, den: 1 },
+        );
         // At least 0.1 bits per pixel.
         assert!(
             c4k25 as f64 * 1000.0 >= 3840.0 * 2160.0 * 25.0 * MIN_BPP,
             "{c4k25}"
         );
-        assert!(bitrate_for(Role::Screen, None, 3840, 2160, (60, 1)) > s4k);
-        assert_eq!(bitrate_for(Role::Camera, None, 160, 120, (5, 1)), MIN_KBPS);
+        assert!(
+            bitrate_for(
+                Role::Screen,
+                None,
+                Size {
+                    width: 3840,
+                    height: 2160
+                },
+                Fraction { num: 60, den: 1 }
+            ) > s4k
+        );
         assert_eq!(
-            bitrate_for(Role::Screen, Some(30_000), 3840, 2160, (30, 1)),
+            bitrate_for(
+                Role::Camera,
+                None,
+                Size {
+                    width: 160,
+                    height: 120
+                },
+                Fraction { num: 5, den: 1 }
+            ),
+            MIN_KBPS
+        );
+        assert_eq!(
+            bitrate_for(
+                Role::Screen,
+                Some(30_000),
+                Size {
+                    width: 3840,
+                    height: 2160
+                },
+                Fraction { num: 30, den: 1 }
+            ),
             30_000
         );
         assert_eq!(
-            bitrate_for(Role::Screen, Some(0), 1920, 1080, (30, 1)),
+            bitrate_for(
+                Role::Screen,
+                Some(0),
+                Size {
+                    width: 1920,
+                    height: 1080
+                },
+                Fraction { num: 30, den: 1 }
+            ),
             s1080
         );
-        let h4k = bitrate_for_codec(Role::Screen, VideoCodec::Hevc, None, 3840, 2160, (30, 1));
+        let h4k = bitrate_for_codec(
+            Role::Screen,
+            VideoCodec::Hevc,
+            None,
+            Size {
+                width: 3840,
+                height: 2160,
+            },
+            Fraction { num: 30, den: 1 },
+        );
         assert!(
             h4k < s4k && h4k as f64 >= s4k as f64 * 0.6,
             "{h4k} vs {s4k}"

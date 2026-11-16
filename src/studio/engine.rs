@@ -688,10 +688,7 @@ fn quality_of(rec: &InputPipeline, bytes: u64) -> Option<InputQuality> {
     let first = g(&c.first_arrival);
     Some(InputQuality {
         encoder: Some(enc),
-        nominal_fps: rec
-            .rate
-            .and_then(Rate::cfr)
-            .map(|(n, d)| n as f64 / d.max(1) as f64),
+        nominal_fps: rec.rate.and_then(Rate::cfr).map(|fps| fps.as_f64()),
         max_fps: match rec.rate {
             Some(Rate::Native { gop_fps, .. }) => Some(gop_fps as f64),
             _ => None,
@@ -891,7 +888,7 @@ impl Engine {
                 h264_encoder: h264,
                 encoders: encoder_table
                     .iter()
-                    .map(|c| (c.enc, c.fps_at(encoders::UHD.0, encoders::UHD.1)))
+                    .map(|c| (c.enc, c.fps_at(encoders::UHD)))
                     .collect(),
                 gpu_convert: gpu,
                 missing_elements: missing,
@@ -1212,11 +1209,11 @@ impl Engine {
                             start_offset_ns: q.start_offset.map(|d| d.as_nanos() as u64),
                         });
                         mi.last_pts_ns = load(&f.last).or(mi.last_pts_ns);
-                        if let Some(Some((w, h))) =
+                        if let Some(Some(size)) =
                             f.size.as_ref().and_then(|s| s.lock().ok().map(|g| *g))
                         {
-                            mi.width = Some(w);
-                            mi.height = Some(h);
+                            mi.width = Some(size.width);
+                            mi.height = Some(size.height);
                         }
                         if f.file.input == InputKey::Microphone {
                             mi.transcript = self.transcription.manifest_entry(&JobKey {
@@ -1532,7 +1529,10 @@ impl Engine {
                         capture: None,
                         kind: SourceKind::TestPattern,
                         label: format!("Test pattern {}", id.0),
-                        logical_size: Some((1280, 720)),
+                        logical_size: Some(Size {
+                            width: 1280,
+                            height: 720,
+                        }),
                         state,
                         // The test pattern is CFR at CHINSTRAP_SCREEN_FPS until set otherwise.
                         frame_rate: if self.screen_fps == 60 {
@@ -1540,7 +1540,10 @@ impl Engine {
                         } else {
                             FrameRateMode::Cfr30
                         },
-                        refresh: Some((self.test_behaviour(id).refresh_fps(), 1)),
+                        refresh: Some(Fraction {
+                            num: self.test_behaviour(id).refresh_fps(),
+                            den: 1,
+                        }),
                         size: Some(
                             self.test_behaviour(id)
                                 .size
@@ -2195,7 +2198,9 @@ impl Engine {
                         rec.meta.codec = e.codec().name().into();
                     }
                     match ip.rate {
-                        Some(Rate::Cfr((n, d))) => rec.meta.framerate = Some(format!("{n}/{d}")),
+                        Some(Rate::Cfr(fps)) => {
+                            rec.meta.framerate = Some(format!("{}/{}", fps.num, fps.den))
+                        }
                         Some(Rate::Native { cap, .. }) => {
                             rec.meta.framerate = Some("variable".into());
                             rec.meta.max_framerate = cap.map(|c| format!("{c}/1"));
@@ -2287,12 +2292,12 @@ impl Engine {
                     let Some(mode) = e.mode(self.camera_mode.as_deref()) else {
                         continue;
                     };
-                    let (n, d) = mode.output_fps();
+                    let fps = mode.output_fps();
                     out.push(Demand {
                         key,
                         label: "Camera".into(),
                         size: mode.output_size(),
-                        fps: n as f64 / d.max(1) as f64,
+                        fps: fps.as_f64(),
                         native: false,
                         gpu_path: mode.path == CameraPath::DmaBuf,
                         camera: true,
@@ -2304,13 +2309,13 @@ impl Engine {
                     };
                     let size = match (s.info.kind, s.info.size) {
                         (SourceKind::TestPattern, _) => {
-                            let (w, h) = self
+                            let size = self
                                 .test_behaviour(id)
                                 .size
                                 .unwrap_or_else(recorder::test_size);
-                            stamp::lock_size(w, h)
+                            stamp::lock_size(size)
                         }
-                        (_, Some((w, h))) => stamp::lock_size(w, h),
+                        (_, Some(size)) => stamp::lock_size(size),
                         // The physical size is only known from negotiation: plan for UHD.
                         _ => encoders::UHD,
                     };
@@ -2319,7 +2324,7 @@ impl Engine {
                         None => (
                             s.info
                                 .refresh
-                                .map(|(n, d)| n as f64 / d.max(1) as f64)
+                                .map(|rate| rate.as_f64())
                                 .unwrap_or(DEFAULT_NATIVE_FPS),
                             true,
                         ),
@@ -2366,8 +2371,8 @@ impl Engine {
                     PlannedInput {
                         input: a.key,
                         encoder: a.enc,
-                        width: size.0.min(a.max.0),
-                        height: size.1.min(a.max.1),
+                        width: size.width.min(a.max.width),
+                        height: size.height.min(a.max.height),
                         fps: a.fps,
                         native: a.native,
                         load_pct: (a.load * 100.0).round() as u32,
@@ -2545,8 +2550,8 @@ impl Engine {
         &self,
         plan: &Plan,
         key: InputKey,
-        cfr: (i32, i32),
-        limit: (i32, i32),
+        cfr: Fraction,
+        limit: Size,
     ) -> Result<(VideoEncoder, recorder::VideoTarget), String> {
         let a = plan
             .get(key)
@@ -2575,7 +2580,10 @@ impl Engine {
             a.enc,
             recorder::VideoTarget {
                 rate,
-                max: (limit.0.min(a.max.0), limit.1.min(a.max.1)),
+                max: Size {
+                    width: limit.width.min(a.max.width),
+                    height: limit.height.min(a.max.height),
+                },
             },
         ))
     }
@@ -2620,7 +2628,10 @@ impl Engine {
                     plan,
                     key,
                     mode.output_fps(),
-                    (devices::CAMERA_MAX_W, devices::CAMERA_MAX_H),
+                    Size {
+                        width: devices::CAMERA_MAX_W,
+                        height: devices::CAMERA_MAX_H,
+                    },
                 )?;
                 recorder::build_video(
                     &name,
@@ -2657,9 +2668,19 @@ impl Engine {
                         }
                     }
                 };
-                let cfr = (s.info.frame_rate.cfr_fps().unwrap_or(self.screen_fps), 1);
-                let (enc, target) =
-                    self.video_target(plan, key, cfr, (stamp::MAX_W, stamp::MAX_H))?;
+                let cfr = Fraction {
+                    num: s.info.frame_rate.cfr_fps().unwrap_or(self.screen_fps),
+                    den: 1,
+                };
+                let (enc, target) = self.video_target(
+                    plan,
+                    key,
+                    cfr,
+                    Size {
+                        width: stamp::MAX_W,
+                        height: stamp::MAX_H,
+                    },
+                )?;
                 recorder::build_video(
                     &name,
                     source,
@@ -3302,10 +3323,10 @@ impl Engine {
                     c.fd = Some(fd);
                 }
                 let mut ids = Vec::new();
-                for (node, kind, size) in streams {
+                for stream in streams {
                     let id = SourceId(self.next_source);
                     self.next_source += 1;
-                    let kind = match kind {
+                    let kind = match stream.source_type {
                         Some(ashpd::desktop::screencast::SourceType::Window) => SourceKind::Window,
                         Some(ashpd::desktop::screencast::SourceType::Virtual) => {
                             SourceKind::Virtual
@@ -3334,13 +3355,13 @@ impl Engine {
                             capture: Some(capture),
                             kind,
                             label,
-                            logical_size: size,
+                            logical_size: stream.logical_size,
                             state,
                             frame_rate: self.frame_rate_default,
                             refresh: None,
                             size: None,
                         },
-                        node: Some(node),
+                        node: Some(stream.node),
                         convert: None,
                         gl_retry: false,
                     });
