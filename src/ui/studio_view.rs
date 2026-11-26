@@ -72,7 +72,7 @@ pub enum CloseIntent {
 /// Emitted when a pending `CloseWindow` may proceed; `AppShell` removes the window.
 pub struct CloseWindowNow;
 
-/// The vocabulary panel's text fields, and the toolbar's new-video name.
+/// The vocabulary panel's text fields, and the new-video dialog's name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Field {
     Term,
@@ -134,7 +134,6 @@ pub struct StudioView {
     rule_from: Draft,
     rule_to: Draft,
     video_name: Draft,
-    /// The toolbar shows the new-video name field instead of the New video button.
     naming_video: bool,
     /// The startup choice: continue the video the last run left open, or start a new one.
     /// Asked once per window, on the first Snapshot that has a reopened video.
@@ -338,10 +337,12 @@ impl StudioView {
         window.focus(&handle, cx);
     }
 
-    fn start_naming_video(&mut self, window: &mut Window, cx: &mut App) {
+    fn start_naming_video(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.startup_choice = StartupChoice::Done;
         self.naming_video = true;
         self.video_name.text.clear();
         self.focus_field(Field::VideoName, window, cx);
+        cx.notify();
     }
 
     fn stop_naming_video(&mut self, window: &mut Window, cx: &mut App) {
@@ -357,13 +358,6 @@ impl StudioView {
         cx.notify();
     }
 
-    /// Opens the New video name field; Esc there keeps the reopened video.
-    fn start_new_video(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.startup_choice = StartupChoice::Done;
-        self.start_naming_video(window, cx);
-        cx.notify();
-    }
-
     fn startup_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.startup_choice != StartupChoice::Asking {
             return;
@@ -374,7 +368,7 @@ impl StudioView {
         }
         match ks.key.as_str() {
             "enter" | "escape" => self.continue_video(window, cx),
-            "n" => self.start_new_video(window, cx),
+            "n" => self.start_naming_video(window, cx),
             // Swallow everything else (r, c, …) until a choice is made.
             _ => {}
         }
@@ -413,7 +407,7 @@ impl StudioView {
         match field {
             Field::VideoName => {
                 let name = self.video_name.text.trim().to_string();
-                if !name.is_empty() {
+                if self.phase() == Some(&Phase::Idle) && !name.is_empty() {
                     self.engine.send(EngineCommand::NewVideo { name });
                     self.stop_naming_video(window, cx);
                 }
@@ -638,7 +632,7 @@ impl StudioView {
         )
     }
 
-    fn transport(&self, snap: &Snapshot, window: &Window, cx: &mut Context<Self>) -> Div {
+    fn transport(&self, snap: &Snapshot, cx: &mut Context<Self>) -> Div {
         let (dot, label, elapsed, segment) = match &snap.phase {
             Phase::Idle => (0x4f5661, "IDLE", None, None),
             Phase::Starting { segment } => (AMBER, "STARTING", None, Some(*segment)),
@@ -682,52 +676,9 @@ impl StudioView {
             ButtonStyle::Secondary,
             recording.then(|| self.send_on_click(EngineCommand::Cut, cx)),
         );
-        // New video: a name field with Create/Cancel replaces the button until Enter or Esc.
-        let new_video =
-            if self.naming_video {
-                let create: OnClick = Box::new(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.submit(Field::VideoName, window, cx)
-                }));
-                let cancel: OnClick = Box::new(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.stop_naming_video(window, cx)
-                }));
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .w(px(360.0))
-                    .child(self.field(
-                        Field::VideoName,
-                        "Video name, e.g. Kubernetes Services 101",
-                        window,
-                        cx,
-                    ))
-                    .child(button(
-                        "new-video-create",
-                        "Create",
-                        None,
-                        ButtonStyle::Primary,
-                        (idle && !self.video_name.text.trim().is_empty()).then_some(create),
-                    ))
-                    .child(button(
-                        "new-video-cancel",
-                        "Cancel",
-                        None,
-                        ButtonStyle::Secondary,
-                        Some(cancel),
-                    ))
-            } else {
-                let start: OnClick = Box::new(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.start_naming_video(window, cx)
-                }));
-                div().child(button(
-                    "new-video",
-                    "New video…",
-                    None,
-                    ButtonStyle::Secondary,
-                    idle.then_some(start),
-                ))
-            };
+        let new_video: OnClick = Box::new(cx.listener(|this, _: &ClickEvent, window, cx| {
+            this.start_naming_video(window, cx);
+        }));
         let video_title = match &snap.session {
             Some(session) => session.name.clone(),
             None => "New video on Record".to_string(),
@@ -848,19 +799,22 @@ impl StudioView {
                             )))
                             .child(record_hint),
                     )
-                    // Hidden while naming a video, where the toolbar needs the room (Ctrl+O still works).
-                    .when(!self.naming_video, |d| {
-                        d.child(button(
-                            "open-video-folder",
-                            "Open folder",
-                            Some("Ctrl+O"),
-                            ButtonStyle::Secondary,
-                            Some(Box::new(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.open_video_folder(cx)
-                            }))),
-                        ))
-                    })
-                    .child(new_video)
+                    .child(button(
+                        "open-video-folder",
+                        "Open folder",
+                        Some("Ctrl+O"),
+                        ButtonStyle::Secondary,
+                        Some(Box::new(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.open_video_folder(cx)
+                        }))),
+                    ))
+                    .child(button(
+                        "new-video",
+                        "New video…",
+                        None,
+                        ButtonStyle::Secondary,
+                        idle.then_some(new_video),
+                    ))
                     .child(cut_button)
                     .child(record_button),
             )
@@ -2139,100 +2093,161 @@ impl StudioView {
             cx.listener(|this, _: &ClickEvent, window, cx| this.continue_video(window, cx)),
         );
         let new: OnClick = Box::new(
-            cx.listener(|this, _: &ClickEvent, window, cx| this.start_new_video(window, cx)),
+            cx.listener(|this, _: &ClickEvent, window, cx| this.start_naming_video(window, cx)),
         );
         let open: OnClick =
             Box::new(cx.listener(|this, _: &ClickEvent, _, cx| this.open_video_folder(cx)));
-        Some(
+        Some(Self::video_dialog(
             div()
-                .id("startup-dialog")
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(gpui::rgba(0x0d0f14d9))
-                .occlude()
                 .child(
                     div()
                         .flex()
                         .flex_col()
-                        .gap_4()
-                        .w(px(520.0))
-                        .rounded_xl()
-                        .border_1()
-                        .border_color(rgb(0x303646))
-                        .bg(rgb(PANEL_RAISED))
-                        .px_6()
-                        .py_5()
+                        .gap_1()
                         .child(
                             div()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .text_color(rgb(MUTED))
-                                        .child("Continue where you left off?"),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(16.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .whitespace_nowrap()
-                                        .overflow_hidden()
-                                        .text_ellipsis()
-                                        .child(session.name.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .text_color(rgb(SECONDARY))
-                                        .child(detail),
-                                ),
+                                .text_size(px(11.0))
+                                .text_color(rgb(MUTED))
+                                .child("Continue where you left off?"),
                         )
+                        .child(
+                            div()
+                                .text_size(px(16.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(session.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgb(SECONDARY))
+                                .child(detail),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(button(
+                            "startup-open-folder",
+                            "Open folder",
+                            Some("Ctrl+O"),
+                            ButtonStyle::Secondary,
+                            Some(open),
+                        ))
                         .child(
                             div()
                                 .flex()
                                 .items_center()
-                                .justify_between()
+                                .gap_2()
                                 .child(button(
-                                    "startup-open-folder",
-                                    "Open folder",
-                                    Some("Ctrl+O"),
+                                    "startup-new-video",
+                                    "New video…",
+                                    Some("N"),
                                     ButtonStyle::Secondary,
-                                    Some(open),
+                                    Some(new),
                                 ))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(button(
-                                            "startup-new-video",
-                                            "New video…",
-                                            Some("N"),
-                                            ButtonStyle::Secondary,
-                                            Some(new),
-                                        ))
-                                        .child(button(
-                                            "startup-continue",
-                                            "Continue",
-                                            Some("Enter"),
-                                            ButtonStyle::Primary,
-                                            Some(keep),
-                                        )),
-                                ),
+                                .child(button(
+                                    "startup-continue",
+                                    "Continue",
+                                    Some("Enter"),
+                                    ButtonStyle::Primary,
+                                    Some(keep),
+                                )),
                         ),
                 ),
+        ))
+    }
+
+    fn name_dialog(
+        &self,
+        snap: &Snapshot,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let create: OnClick = Box::new(cx.listener(|this, _: &ClickEvent, window, cx| {
+            this.submit(Field::VideoName, window, cx);
+            cx.notify();
+        }));
+        let cancel: OnClick = Box::new(cx.listener(|this, _: &ClickEvent, window, cx| {
+            this.stop_naming_video(window, cx);
+            cx.notify();
+        }));
+        Self::video_dialog(
+            div()
+                .child(
+                    div()
+                        .text_size(px(16.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child("Name your new video"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .child(self.field(Field::VideoName, "Video name", window, cx)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(button(
+                            "new-video-cancel",
+                            "Cancel",
+                            Some("Esc"),
+                            ButtonStyle::Secondary,
+                            Some(cancel),
+                        ))
+                        .child(button(
+                            "new-video-create",
+                            "Create",
+                            Some("Enter"),
+                            ButtonStyle::Primary,
+                            (snap.phase == Phase::Idle && !self.video_name.text.trim().is_empty())
+                                .then_some(create),
+                        )),
+                ),
         )
+    }
+
+    fn video_dialog(content: Div) -> Stateful<Div> {
+        div()
+            .id("video-dialog")
+            .absolute()
+            .inset_0()
+            .px_4()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(gpui::rgba(0x0d0f14d9))
+            .occlude()
+            .child(
+                content
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .w_full()
+                    .max_w(px(520.0))
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(rgb(0x303646))
+                    .bg(rgb(PANEL_RAISED))
+                    .px_6()
+                    .py_5(),
+            )
     }
 }
 
 impl Focusable for StudioView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
+        if self.naming_video {
+            self.video_name.focus.clone()
+        } else {
+            self.focus_handle.clone()
+        }
     }
 }
 
@@ -2242,12 +2257,12 @@ impl Render for StudioView {
             .key_context("Studio")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &ToggleRecord, _, _| {
-                if this.startup_choice != StartupChoice::Asking {
+                if this.startup_choice != StartupChoice::Asking && !this.naming_video {
                     this.engine.send(EngineCommand::ToggleRecord)
                 }
             }))
             .on_action(cx.listener(|this, _: &Cut, _, _| {
-                if this.startup_choice != StartupChoice::Asking {
+                if this.startup_choice != StartupChoice::Asking && !this.naming_video {
                     this.engine.send(EngineCommand::Cut)
                 }
             }))
@@ -2294,7 +2309,7 @@ impl Render for StudioView {
             .child(self.vocabulary_section(&snap, window, cx));
 
         root.when_some(self.banner(&snap), |d, b| d.child(b))
-            .child(self.transport(&snap, window, cx))
+            .child(self.transport(&snap, cx))
             .child(
                 div()
                     .flex_1()
@@ -2305,6 +2320,9 @@ impl Render for StudioView {
                     .child(self.notices_panel(cx)),
             )
             .when_some(self.startup_dialog(&snap, cx), |d, dialog| d.child(dialog))
+            .when(self.naming_video, |d| {
+                d.child(self.name_dialog(&snap, window, cx))
+            })
             .when(self.close_pending.is_some(), |d| {
                 d.child(
                     div()
