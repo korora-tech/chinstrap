@@ -12,7 +12,7 @@ use std::time::Duration;
 use gpui::{App, Bounds, KeyBinding, WindowBounds, WindowOptions, prelude::*, px, size};
 use gpui_platform::application;
 
-use ui::{Cut, Quit, ShowExplorer, ShowStudio, ToggleRecord};
+use ui::{Cut, OpenVideoFolder, Quit, ShowExplorer, ShowStudio, ToggleRecord};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -78,6 +78,7 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("r", ToggleRecord, Some("Studio && !TextField")),
             KeyBinding::new("c", Cut, Some("Studio && !TextField")),
+            KeyBinding::new("ctrl-o", OpenVideoFolder, Some("Studio")),
             KeyBinding::new("ctrl-q", Quit, None),
             KeyBinding::new("ctrl-1", ShowStudio, None),
             KeyBinding::new("ctrl-2", ShowExplorer, None),

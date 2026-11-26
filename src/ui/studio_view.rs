@@ -20,12 +20,12 @@ use super::widgets::{
     level_meter, notice_row, preview_tile, progress_bar, radio_row, record_hint_color, segment_row,
     segmented, source_row, text_field,
 };
-use super::{Cut, ToggleRecord};
+use super::{Cut, OpenVideoFolder, ToggleRecord};
 use crate::studio::{
     CaptureId, DeviceId, DeviceInfo, DeviceKind, EngineCommand, EngineEvent, EngineHandle,
     FrameRateMode, InputKey, InputStatus, ModelState, Notice, Phase, PlannedInput,
-    PortalAvailability, PreviewFrame, Previews, SegmentStatus, SegmentSummary, Snapshot, SourceId,
-    SourceInfo, SourceKind, SourceState, TranscriptStatus, WhisperBackend,
+    PortalAvailability, PreviewFrame, Previews, SegmentStatus, SegmentSummary, Severity, Snapshot,
+    SourceId, SourceInfo, SourceKind, SourceState, TranscriptStatus, WhisperBackend,
 };
 
 const NOTICE_CAP: usize = 50;
@@ -110,6 +110,16 @@ impl Draft {
     }
 }
 
+/// Whether the window still has to ask what to do with the video the last run left open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupChoice {
+    /// No Snapshot yet.
+    Pending,
+    /// The dialog is on screen.
+    Asking,
+    Done,
+}
+
 pub struct StudioView {
     engine: EngineHandle,
     snap: Option<Snapshot>,
@@ -126,6 +136,9 @@ pub struct StudioView {
     video_name: Draft,
     /// The toolbar shows the new-video name field instead of the New video button.
     naming_video: bool,
+    /// The startup choice: continue the video the last run left open, or start a new one.
+    /// Asked once per window, on the first Snapshot that has a reopened video.
+    startup_choice: StartupChoice,
     previews: Previews,
     shown: HashMap<InputKey, Shown>,
     _events: Task<()>,
@@ -185,6 +198,7 @@ impl StudioView {
             rule_to: Draft::new(cx),
             video_name: Draft::new(cx),
             naming_video: false,
+            startup_choice: StartupChoice::Pending,
             previews,
             shown: HashMap::new(),
             _events,
@@ -264,6 +278,15 @@ impl StudioView {
                     self.level = None;
                 }
                 let idle = snap.phase == Phase::Idle;
+                if self.startup_choice == StartupChoice::Pending {
+                    // Only a video reopened from an earlier run is worth asking about; without
+                    // one, Record (or New video…) already starts a new video.
+                    self.startup_choice = if idle && snap.session.is_some() {
+                        StartupChoice::Asking
+                    } else {
+                        StartupChoice::Done
+                    };
+                }
                 self.snap = Some(snap);
                 if idle {
                     self.stop_sent_for = None;
@@ -275,12 +298,7 @@ impl StudioView {
                     self.send_close_stop();
                 }
             }
-            EngineEvent::Notice(notice) => {
-                if self.notices.len() >= NOTICE_CAP {
-                    self.notices.remove(0);
-                }
-                self.notices.push(notice);
-            }
+            EngineEvent::Notice(notice) => self.push_notice(notice),
             EngineEvent::Level { rms_db, peak_db } => {
                 self.level = Some((rms_db, peak_db));
             }
@@ -330,6 +348,64 @@ impl StudioView {
         self.naming_video = false;
         self.video_name.text.clear();
         window.focus(&self.focus_handle, cx);
+    }
+
+    /// Keeps the reopened video: Record continues after its last segment.
+    fn continue_video(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.startup_choice = StartupChoice::Done;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Opens the New video name field; Esc there keeps the reopened video.
+    fn start_new_video(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.startup_choice = StartupChoice::Done;
+        self.start_naming_video(window, cx);
+        cx.notify();
+    }
+
+    fn startup_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.startup_choice != StartupChoice::Asking {
+            return;
+        }
+        let ks = &ev.keystroke;
+        if ks.modifiers.control || ks.modifiers.alt || ks.modifiers.platform {
+            return;
+        }
+        match ks.key.as_str() {
+            "enter" | "escape" => self.continue_video(window, cx),
+            "n" => self.start_new_video(window, cx),
+            // Swallow everything else (r, c, …) until a choice is made.
+            _ => {}
+        }
+        cx.stop_propagation();
+    }
+
+    /// The open video's folder in the system file manager; before any video, the output folder.
+    fn open_video_folder(&mut self, cx: &mut Context<Self>) {
+        let Some(snap) = &self.snap else { return };
+        let dir = match &snap.session {
+            Some(session) => session.dir.clone(),
+            None => snap.output_root.clone(),
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.push_notice(Notice {
+                severity: Severity::Error,
+                input: None,
+                message: format!("Cannot open {}: {e}", dir.display()),
+                detail: None,
+            });
+            cx.notify();
+            return;
+        }
+        cx.open_with_system(&dir);
+    }
+
+    fn push_notice(&mut self, notice: Notice) {
+        if self.notices.len() >= NOTICE_CAP {
+            self.notices.remove(0);
+        }
+        self.notices.push(notice);
     }
 
     /// Sends what the field holds. Rules need both halves; Enter in "from" moves to "to".
@@ -772,6 +848,18 @@ impl StudioView {
                             )))
                             .child(record_hint),
                     )
+                    // Hidden while naming a video, where the toolbar needs the room (Ctrl+O still works).
+                    .when(!self.naming_video, |d| {
+                        d.child(button(
+                            "open-video-folder",
+                            "Open folder",
+                            Some("Ctrl+O"),
+                            ButtonStyle::Secondary,
+                            Some(Box::new(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.open_video_folder(cx)
+                            }))),
+                        ))
+                    })
                     .child(new_video)
                     .child(cut_button)
                     .child(record_button),
@@ -2031,6 +2119,117 @@ impl StudioView {
     }
 }
 
+impl StudioView {
+    /// "Continue this video or start a new one?", shown when a window opens on a reopened video.
+    fn startup_dialog(&self, snap: &Snapshot, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.startup_choice != StartupChoice::Asking {
+            return None;
+        }
+        let session = snap.session.as_ref()?;
+        let recorded = session.earlier_segments as usize + session.segments.len();
+        let detail = match recorded {
+            0 => "No segments recorded yet.".to_string(),
+            1 => "1 segment recorded. Record continues with segment 2.".to_string(),
+            n => format!(
+                "{n} segments recorded. Record continues with segment {}.",
+                n + 1
+            ),
+        };
+        let keep: OnClick = Box::new(
+            cx.listener(|this, _: &ClickEvent, window, cx| this.continue_video(window, cx)),
+        );
+        let new: OnClick = Box::new(
+            cx.listener(|this, _: &ClickEvent, window, cx| this.start_new_video(window, cx)),
+        );
+        let open: OnClick =
+            Box::new(cx.listener(|this, _: &ClickEvent, _, cx| this.open_video_folder(cx)));
+        Some(
+            div()
+                .id("startup-dialog")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x0d0f14d9))
+                .occlude()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .w(px(520.0))
+                        .rounded_xl()
+                        .border_1()
+                        .border_color(rgb(0x303646))
+                        .bg(rgb(PANEL_RAISED))
+                        .px_6()
+                        .py_5()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(MUTED))
+                                        .child("Continue where you left off?"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(16.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .whitespace_nowrap()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .child(session.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(SECONDARY))
+                                        .child(detail),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(button(
+                                    "startup-open-folder",
+                                    "Open folder",
+                                    Some("Ctrl+O"),
+                                    ButtonStyle::Secondary,
+                                    Some(open),
+                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(button(
+                                            "startup-new-video",
+                                            "New video…",
+                                            Some("N"),
+                                            ButtonStyle::Secondary,
+                                            Some(new),
+                                        ))
+                                        .child(button(
+                                            "startup-continue",
+                                            "Continue",
+                                            Some("Enter"),
+                                            ButtonStyle::Primary,
+                                            Some(keep),
+                                        )),
+                                ),
+                        ),
+                ),
+        )
+    }
+}
+
 impl Focusable for StudioView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -2043,9 +2242,17 @@ impl Render for StudioView {
             .key_context("Studio")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(|this, _: &ToggleRecord, _, _| {
-                this.engine.send(EngineCommand::ToggleRecord)
+                if this.startup_choice != StartupChoice::Asking {
+                    this.engine.send(EngineCommand::ToggleRecord)
+                }
             }))
-            .on_action(cx.listener(|this, _: &Cut, _, _| this.engine.send(EngineCommand::Cut)))
+            .on_action(cx.listener(|this, _: &Cut, _, _| {
+                if this.startup_choice != StartupChoice::Asking {
+                    this.engine.send(EngineCommand::Cut)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenVideoFolder, _, cx| this.open_video_folder(cx)))
+            .capture_key_down(cx.listener(Self::startup_key))
             .relative()
             .size_full()
             .flex()
@@ -2097,6 +2304,7 @@ impl Render for StudioView {
                     .child(main)
                     .child(self.notices_panel(cx)),
             )
+            .when_some(self.startup_dialog(&snap, cx), |d, dialog| d.child(dialog))
             .when(self.close_pending.is_some(), |d| {
                 d.child(
                     div()
