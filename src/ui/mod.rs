@@ -9,5 +9,12 @@ use gpui::actions;
 
 actions!(
     chinstrap,
-    [ToggleRecord, Cut, Quit, ShowStudio, ShowExplorer]
+    [
+        ToggleRecord,
+        Cut,
+        Quit,
+        ShowStudio,
+        ShowExplorer,
+        OpenVideoFolder
+    ]
 );
